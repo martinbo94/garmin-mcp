@@ -198,7 +198,7 @@ class WorkoutGenerator:
                     "day": day_name.capitalize(),
                     "week": week_num,
                     "workout_type": "strength",
-                    "sport_type": "other",
+                    "sport_type": "strength_training",
                     "duration_min": part.duration_min
                 })
 

@@ -329,6 +329,7 @@ class GarminClient:
             "running": "running",
             "treadmill_running": "running",
             "ski_erg": "cardio",
+            "strength_training": "strength_training",
             "other": "other"
         }
         garmin_sport_key = garmin_sport_key_map.get(sport_type_key, "other")
@@ -336,6 +337,7 @@ class GarminClient:
         # Sport type IDs for Garmin API
         sport_type_id_map = {
             "running": 1,
+            "strength_training": 5,
             "cardio": 6,
             "other": 0
         }
