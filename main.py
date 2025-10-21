@@ -127,6 +127,18 @@ def schedule_current_week():
             print(f"  [REST DAY]\n")
             continue
 
+        # Delete ALL old workouts for this day ONCE (before uploading any)
+        # This prevents deleting workouts we just uploaded when there are multiple per day
+        import re
+        first_workout_name = workouts[0]['workout_name']
+        match = re.match(r'^(Week \d+ - \w+ - )', first_workout_name)
+        if match:
+            prefix = match.group(1)
+            deleted = client.delete_workout_by_name(prefix, prefix_match=True)
+            if deleted > 0:
+                print(f"  [CLEANUP] Removed {deleted} old workout(s) for this day\n")
+
+        # Now upload all workouts for this day (without per-workout deletion)
         for workout in workouts:
             total_workouts += 1
             workout_name = workout['workout_name']
@@ -139,8 +151,8 @@ def schedule_current_week():
 
             print(f"  {workout_name}{type_indicator}")
 
-            # Upload and schedule
-            if client.upload_and_schedule_workout(workout, date_str):
+            # Upload and schedule (replace_existing=False since we already cleaned up above)
+            if client.upload_and_schedule_workout(workout, date_str, replace_existing=False):
                 successful_uploads += 1
                 print(f"    ✓ Scheduled for {date_str}")
             else:
