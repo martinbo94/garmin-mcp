@@ -68,19 +68,20 @@ class WorkoutGenerator:
             return "A"
         return "B"
 
-    def _get_duration_for_phase(self, week_num: int, base_duration: int) -> int:
+    def _get_duration_for_phase(self, week_num: int, base_duration: int, workout_type: str) -> int:
         """Get workout duration based on periodization phase if applicable.
 
         Args:
             week_num: Week number (1-12)
             base_duration: Base duration from day_workout
+            workout_type: Type of workout (e.g., 'long_run', 'easy_endurance')
 
         Returns:
             Duration in minutes (from periodization if long_run, else base)
         """
         # Check if this workout type uses periodization-based duration
         # Currently only long_run has phase-specific durations
-        if hasattr(self.program.periodization, 'phase_1') and hasattr(self.program.periodization.phase_1, 'long_run_duration_min'):
+        if workout_type == "long_run" and hasattr(self.program.periodization, 'phase_1') and hasattr(self.program.periodization.phase_1, 'long_run_duration_min'):
             if week_num <= 4:
                 return self.program.periodization.phase_1.long_run_duration_min
             elif week_num <= 8:
@@ -176,18 +177,18 @@ class WorkoutGenerator:
                     "variant": variant_letter,
                     "warmup": {
                         "duration_min": part.structure.warmup_duration_min,
-                        "hr_range": self.hr_zones[part.structure.warmup_intensity_zone]
+                        # "hr_range": self.hr_zones[part.structure.warmup_intensity_zone]
                     },
                     "main_set": {
                         "intervals": variant.intervals,
                         "work_duration_min": variant.work_duration_min,
                         "rest_duration_min": variant.rest_duration_min,
-                        "work_hr_range": self._get_zone_range(part.structure.work_intensity_zones),
-                        "rest_hr_range": self._get_zone_range(part.structure.rest_intensity_zones)
+                        # "work_hr_range": self._get_zone_range(part.structure.work_intensity_zones),
+                        # "rest_hr_range": self._get_zone_range(part.structure.rest_intensity_zones)
                     },
                     "cooldown": {
                         "duration_min": part.structure.cooldown_duration_min,
-                        "hr_range": self._get_zone_range(part.structure.cooldown_intensity_zones)
+                        # "hr_range": self._get_zone_range(part.structure.cooldown_intensity_zones)
                     }
                 })
 
@@ -223,10 +224,13 @@ class WorkoutGenerator:
         workout_type = day_workout.workout_type
 
         # Get duration (check periodization for phase-based adjustments like long runs)
-        duration = self._get_duration_for_phase(week_num, day_workout.duration_min)
+        duration = self._get_duration_for_phase(week_num, day_workout.duration_min, workout_type)
 
         # Check for optional duration_display field (e.g., "45-60min")
-        duration_display = getattr(day_workout, 'duration_display', None) or f"{duration}min"
+        # If not provided, use actual duration
+        duration_display = getattr(day_workout, 'duration_display', None)
+        if not duration_display:
+            duration_display = f"{duration}min"
 
         # Get zones and format zone string
         zones = day_workout.intensity_zones if day_workout.intensity_zones else [2]
@@ -255,7 +259,7 @@ class WorkoutGenerator:
             "sport_type": "running",  # Use running for calendar display
             "duration_min": duration,
             "intensity_zones": zones,
-            "hr_range": hr_range,
+            # "hr_range": hr_range,
             "modality": "running"
         }
 
@@ -296,18 +300,18 @@ class WorkoutGenerator:
             "variant": variant_letter,
             "warmup": {
                 "duration_min": structure.warmup_duration_min,
-                "hr_range": self.hr_zones[structure.warmup_intensity_zone]
+                # "hr_range": self.hr_zones[structure.warmup_intensity_zone]
             },
             "main_set": {
                 "intervals": variant.intervals,
                 "work_duration_min": variant.work_duration_min,
                 "rest_duration_min": variant.rest_duration_min,
-                "work_hr_range": self._get_zone_range(structure.work_intensity_zones),
-                "rest_hr_range": self._get_zone_range(structure.rest_intensity_zones)
+                # "work_hr_range": self._get_zone_range(structure.work_intensity_zones),
+                # "rest_hr_range": self._get_zone_range(structure.rest_intensity_zones)
             },
             "cooldown": {
                 "duration_min": structure.cooldown_duration_min,
-                "hr_range": self._get_zone_range(structure.cooldown_intensity_zones)
+                # "hr_range": self._get_zone_range(structure.cooldown_intensity_zones)
             },
             "modality": day_workout.modality
         }

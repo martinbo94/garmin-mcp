@@ -59,7 +59,6 @@
     "wednesday": {
       "workout_type": "easy_endurance",
       "duration_min": 55,
-      "duration_display": "45-60min",
       "intensity_zones": [1, 2],
       "modality": "running"
     },
@@ -130,13 +129,13 @@
             "variant": "A",
             "intervals": 3,
             "work_duration_min": 8,
-            "rest_duration_min": 3
+            "rest_duration_min": 2
           },
           {
             "variant": "B",
             "intervals": 4,
             "work_duration_min": 8,
-            "rest_duration_min": 3
+            "rest_duration_min": 2
           }
         ],
         "work_intensity_zones": [3, 4],
@@ -148,7 +147,6 @@
     "sunday": {
       "workout_type": "long_run",
       "duration_min": 85,
-      "duration_display": "60-120min",
       "intensity_zones": [1, 2],
       "modality": "running"
     }

@@ -399,7 +399,7 @@ class GarminClient:
 
         # Warmup step
         warmup = workout_data.get("warmup", {})
-        all_steps.append({
+        warmup_step = {
             "type": "ExecutableStepDTO",
             "stepOrder": step_order,
             "stepType": {
@@ -415,13 +415,12 @@ class GarminClient:
             },
             "endConditionValue": float(warmup.get("duration_min", 15) * 60),
             "targetType": {
-                "workoutTargetTypeId": 4,
-                "workoutTargetTypeKey": "heart.rate.zone",
-                "displayOrder": 4
-            },
-            "targetValueOne": float(warmup.get("hr_range", {}).get("min", 120)),
-            "targetValueTwo": float(warmup.get("hr_range", {}).get("max", 140))
-        })
+                "workoutTargetTypeId": 1,
+                "workoutTargetTypeKey": "no.target",
+                "displayOrder": 1
+            }
+        }
+        all_steps.append(warmup_step)
         step_order += 1
 
         # Main set - repeat group
@@ -453,12 +452,10 @@ class GarminClient:
             },
             "endConditionValue": float(work_duration * 60),
             "targetType": {
-                "workoutTargetTypeId": 4,
-                "workoutTargetTypeKey": "heart.rate.zone",
-                "displayOrder": 4
-            },
-            "targetValueOne": float(work_hr.get("min", 160)),
-            "targetValueTwo": float(work_hr.get("max", 180))
+                "workoutTargetTypeId": 1,
+                "workoutTargetTypeKey": "no.target",
+                "displayOrder": 1
+            }
         })
 
         # Recovery interval
@@ -479,12 +476,10 @@ class GarminClient:
             },
             "endConditionValue": float(rest_duration * 60),
             "targetType": {
-                "workoutTargetTypeId": 4,
-                "workoutTargetTypeKey": "heart.rate.zone",
-                "displayOrder": 4
-            },
-            "targetValueOne": float(rest_hr.get("min", 110)),
-            "targetValueTwo": float(rest_hr.get("max", 140))
+                "workoutTargetTypeId": 1,
+                "workoutTargetTypeKey": "no.target",
+                "displayOrder": 1
+            }
         })
 
         # Add repeat group
@@ -505,7 +500,7 @@ class GarminClient:
 
         # Cooldown step
         cooldown = workout_data.get("cooldown", {})
-        all_steps.append({
+        cooldown_step = {
             "type": "ExecutableStepDTO",
             "stepOrder": step_order,
             "stepType": {
@@ -521,13 +516,12 @@ class GarminClient:
             },
             "endConditionValue": float(cooldown.get("duration_min", 10) * 60),
             "targetType": {
-                "workoutTargetTypeId": 4,
-                "workoutTargetTypeKey": "heart.rate.zone",
-                "displayOrder": 4
-            },
-            "targetValueOne": float(cooldown.get("hr_range", {}).get("min", 110)),
-            "targetValueTwo": float(cooldown.get("hr_range", {}).get("max", 140))
-        })
+                "workoutTargetTypeId": 1,
+                "workoutTargetTypeKey": "no.target",
+                "displayOrder": 1
+            }
+        }
+        all_steps.append(cooldown_step)
 
         return [{
             "segmentOrder": 1,
@@ -539,13 +533,12 @@ class GarminClient:
         """Build segments for simple duration-based workouts.
 
         Args:
-            workout_data: Workout data with duration and HR range
+            workout_data: Workout data with duration
 
         Returns:
             List of Garmin workout segments
         """
         duration_min = workout_data.get("duration_min", 30)
-        hr_range = workout_data.get("hr_range", {"min": 120, "max": 140})
 
         # Get sport type with proper structure
         sport_type_key = workout_data.get("sport_type", "running")
@@ -570,12 +563,10 @@ class GarminClient:
                 },
                 "endConditionValue": float(duration_min * 60),
                 "targetType": {
-                    "workoutTargetTypeId": 4,
-                    "workoutTargetTypeKey": "heart.rate.zone",
-                    "displayOrder": 4
-                },
-                "targetValueOne": float(hr_range.get("min", 120)),
-                "targetValueTwo": float(hr_range.get("max", 140))
+                    "workoutTargetTypeId": 1,
+                    "workoutTargetTypeKey": "no.target",
+                    "displayOrder": 1
+                }
             }]
         }]
 
