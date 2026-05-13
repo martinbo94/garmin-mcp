@@ -1,0 +1,103 @@
+{
+  "_comment": "Sample 1-week Bakken-style template. Copy and extend to a full 12-week block. Adjust dates, names, distances, and target descriptions to your own benchmarks. The `continuous` and `interval` blocks map 1:1 to create_continuous_run and create_interval_workout tool inputs.",
+  "block_name": "Example block — Norwegian Singles intro week",
+  "start_date": "2026-01-05",
+  "weeks": 1,
+  "workouts": [
+    {
+      "date": "2026-01-05",
+      "type": "easy",
+      "name": "Easy 6km",
+      "description": "Z2 aerobic. Cap at your LT1.",
+      "continuous": { "distance_m": 6000 },
+      "estimated_distance_m": 6000
+    },
+    {
+      "date": "2026-01-06",
+      "type": "threshold",
+      "name": "Terskel 5x6min",
+      "description": "Sub-threshold (your derived band). 1 min jog rest. Should feel controlled, not hard.",
+      "interval": {
+        "warmup": {
+          "end_condition": { "type": "time", "value": 900 },
+          "description": "Z2 easy warmup"
+        },
+        "sets": [
+          {
+            "repeats": 5,
+            "work": {
+              "end_condition": { "type": "time", "value": 360 },
+              "description": "Sub-threshold HR (see user_profile)"
+            },
+            "recovery": {
+              "end_condition": { "type": "time", "value": 60 },
+              "description": "Easy jog"
+            }
+          }
+        ],
+        "cooldown": {
+          "end_condition": { "type": "time", "value": 600 },
+          "description": "Z2 easy cooldown"
+        }
+      },
+      "estimated_distance_m": 10500
+    },
+    {
+      "date": "2026-01-07",
+      "type": "easy",
+      "name": "Easy 6km",
+      "description": "Recovery between thresholds. Truly easy.",
+      "continuous": { "distance_m": 6000 },
+      "estimated_distance_m": 6000
+    },
+    {
+      "date": "2026-01-08",
+      "type": "threshold",
+      "name": "Terskel 10x1km",
+      "description": "Sub-threshold short-rep variation. 60s jog rest. Same HR target as long reps; pace is faster because of short rests.",
+      "interval": {
+        "warmup": {
+          "end_condition": { "type": "time", "value": 900 },
+          "description": "Z2 easy warmup"
+        },
+        "sets": [
+          {
+            "repeats": 10,
+            "work": {
+              "end_condition": { "type": "distance", "value": 1000 },
+              "description": "Sub-threshold HR"
+            },
+            "recovery": {
+              "end_condition": { "type": "time", "value": 60 },
+              "description": "Easy jog"
+            }
+          }
+        ],
+        "cooldown": {
+          "end_condition": { "type": "time", "value": 600 },
+          "description": "Z2 easy cooldown"
+        }
+      },
+      "estimated_distance_m": 14000
+    },
+    {
+      "date": "2026-01-09",
+      "type": "rest",
+      "name": "Rest"
+    },
+    {
+      "date": "2026-01-10",
+      "type": "strength",
+      "name": "Strength session",
+      "description": "30-40 min general strength — core, glutes, mobility."
+    },
+    {
+      "date": "2026-01-11",
+      "type": "long",
+      "name": "Long 14km",
+      "description": "All easy pace. No fast finishes. Aerobic base only.",
+      "continuous": { "distance_m": 14000 },
+      "estimated_distance_m": 14000
+    }
+  ]
+}

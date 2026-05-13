@@ -8,3 +8,6 @@ __pycache__/
 .venv/
 venv/
 ENV/
+coach_data/cache.db
+coach_data/user_profile.md
+coach_data/plan.json
