@@ -724,7 +724,7 @@ def delete_workout_template(workout_id: int) -> str:
 
 # ─── Strava sync + weekly summary (reads local cache) ──────────────────
 @mcp.tool()
-def sync_activities(force_full: bool = False) -> dict:
+def sync_activities(force_full: bool = False, weeks_back: Optional[int] = None) -> dict:
     """Pull new activities + HR streams from Strava into the local cache.
 
     Runs incrementally since the last sync. First-time sync backfills the
@@ -732,26 +732,36 @@ def sync_activities(force_full: bool = False) -> dict:
     what's new.
 
     Args:
-        force_full: If True, re-pull the full 12-week backfill window.
+        force_full: If True, re-pull the default 12-week backfill window.
             Default False — just pick up new activities since last sync.
+        weeks_back: Optional explicit backfill window (e.g. 26 or 52) to
+            pull deeper history than the 12-week default. Use when the
+            agent needs year-long trajectory data (`weekly_summary` will
+            return `gap_warning=True` when the requested range is older
+            than what's cached).
 
     Returns dict with new_activities count, streams_fetched count,
     last_sync timestamp, and any per-activity errors encountered.
     """
-    return strava_sync.run_sync(force_full=force_full)
+    return strava_sync.run_sync(force_full=force_full, weeks_back=weeks_back)
 
 
 @mcp.tool()
-def weekly_summary(start_date: str, end_date: str) -> list[dict]:
+def weekly_summary(start_date: str, end_date: str) -> dict:
     """Per-week training summary from the local Strava cache.
 
-    Each returned entry covers one Monday-Sunday week in the range and
-    contains: total distance, run count, time in each HR zone (computed
-    from raw streams using current bpm boundaries from coach://user_profile),
-    and the list of activities with names, descriptions, distance, HR, and
-    a `classification_hint` derived from naming patterns. The hint is the
-    deterministic 90% case — Claude should refine ambiguous cases using
-    coach://classification.
+    Returns `{"weeks": [...], "coverage": {...}}`. Each week entry covers
+    one Monday-Sunday week and contains total distance, run count, time
+    in each HR zone (computed from raw streams using current bpm
+    boundaries from coach://user_profile), and the list of activities
+    with names, descriptions, distance, HR, and a `classification_hint`
+    derived from naming patterns.
+
+    The `coverage` field reports cache extent and a `gap_warning` flag
+    when the requested range extends before the oldest cached activity —
+    use it to distinguish "no runs that week" from "we don't have data
+    that far back" (the local cache holds 12 weeks by default; call
+    `sync_activities(weeks_back=N)` to extend it).
 
     Args:
         start_date: 'YYYY-MM-DD' (inclusive)
@@ -780,37 +790,88 @@ def get_plan() -> dict:
 
 
 @mcp.tool()
-def validate_plan(plan_data: dict) -> dict:
-    """Check a draft plan dict for structural issues before save_plan.
+def _resolve_plan_input(
+    plan_data: Optional[dict], draft_path: Optional[str]
+) -> dict:
+    """Return the plan dict from either an inline argument or a JSON file.
+
+    Resolution order:
+    1. `plan_data` if explicitly provided
+    2. `draft_path` if explicitly provided (read JSON from disk)
+    3. Default draft path `coach_data/plan.draft.json` if it exists
+
+    Multi-week plans serialize to 20-40 KB of JSON, which is expensive to
+    inline into a tool call. The recommended workflow is to Write the
+    draft JSON to disk first, then call these tools with `draft_path` (or
+    rely on the default `plan.draft.json` location).
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    if plan_data is not None:
+        return plan_data
+
+    if draft_path is not None:
+        p = _Path(draft_path)
+    else:
+        p = _Path(__file__).parent / "coach_data" / "plan.draft.json"
+
+    if not p.exists():
+        raise FileNotFoundError(
+            f"No plan provided and {p} does not exist. Either pass "
+            f"plan_data directly, write the draft JSON to {p} first, or "
+            f"pass an explicit draft_path."
+        )
+    return _json.loads(p.read_text(encoding="utf-8"))
+
+
+def validate_plan(
+    plan_data: Optional[dict] = None, draft_path: Optional[str] = None
+) -> dict:
+    """Check a draft plan for structural issues before save_plan.
 
     Validates required fields, ISO date format, type enum values, and the
     shape of continuous / interval blocks. Returns {ok, errors, warnings,
     workout_count}.
 
+    Pass either `plan_data` (an in-flight dict, best for short plans) or
+    `draft_path` (a path to a JSON file on disk, best for multi-week
+    plans where inlining 20-40 KB of JSON into a tool call is expensive).
+    With neither argument, reads `coach_data/plan.draft.json` by default.
+
     Use this BEFORE save_plan to catch issues that would otherwise only
-    surface at materialize_plan time. Operates on an in-flight dict — does
-    NOT read plan.json.
+    surface at materialize_plan time.
     """
-    return plan_mod.validate_plan(plan_data)
+    return plan_mod.validate_plan(_resolve_plan_input(plan_data, draft_path))
 
 
 @mcp.tool()
-def summarize_plan(plan_data: dict) -> dict:
-    """Preview the weekly structure of a draft plan dict before saving.
+def summarize_plan(
+    plan_data: Optional[dict] = None, draft_path: Optional[str] = None
+) -> dict:
+    """Preview the weekly structure of a draft plan before saving.
 
     Groups workouts by Mon-Sun week. Per week: session count, distribution
     (quality / easy / long / strength / rest), total estimated km. Plus
-    block-level totals. Operates on the in-flight plan dict — does NOT
-    read plan.json.
+    block-level totals.
+
+    Pass either `plan_data` (in-flight dict) or `draft_path` (JSON file on
+    disk). With neither argument, reads `coach_data/plan.draft.json`.
 
     Use this BEFORE save_plan as a sanity check on what you've drafted.
     """
-    return plan_mod.summarize_plan(plan_data)
+    return plan_mod.summarize_plan(_resolve_plan_input(plan_data, draft_path))
 
 
 @mcp.tool()
-def save_plan(plan_data: dict) -> str:
+def save_plan(
+    plan_data: Optional[dict] = None, draft_path: Optional[str] = None
+) -> str:
     """Save a training plan to coach_data/plan.json (overwrites any existing).
+
+    Pass either `plan_data` (in-flight dict, best for short plans) or
+    `draft_path` (a path to a JSON file on disk, best for multi-week
+    plans). With neither argument, reads `coach_data/plan.draft.json`.
 
     Expected shape:
         {
@@ -824,8 +885,9 @@ def save_plan(plan_data: dict) -> str:
           ]
         }
     """
-    plan_mod.save_plan(plan_data)
-    return f"Saved: {plan_data.get('block_name', '(unnamed)')} with {len(plan_data.get('workouts', []))} workouts."
+    plan = _resolve_plan_input(plan_data, draft_path)
+    plan_mod.save_plan(plan)
+    return f"Saved: {plan.get('block_name', '(unnamed)')} with {len(plan.get('workouts', []))} workouts."
 
 
 @mcp.tool()
@@ -1088,11 +1150,13 @@ def weekly_retrospective(week_start: str) -> dict:
     from datetime import date as _date, timedelta as _td
     start = _date.fromisoformat(week_start)
     end = start + _td(days=6)
-    weeks = strava_sync.weekly_summary(start.isoformat(), end.isoformat())
+    result = strava_sync.weekly_summary(start.isoformat(), end.isoformat())
+    weeks = result["weeks"]
     return {
         "week_start": week_start,
         "week_end": end.isoformat(),
         "summary": weeks[0] if weeks else None,
+        "coverage": result["coverage"],
         "plan_compliance": plan_mod.compare_plan_vs_actual(
             start.isoformat(), end.isoformat()
         ),

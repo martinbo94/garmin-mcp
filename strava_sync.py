@@ -207,11 +207,21 @@ def _get_activity_streams(activity_id: int) -> Optional[dict]:
 
 
 # ─── Sync ─────────────────────────────────────────────────────────────
-def run_sync(force_full: bool = False) -> dict:
-    """Pull new activities + streams. Incremental unless force_full=True."""
+def run_sync(force_full: bool = False, weeks_back: Optional[int] = None) -> dict:
+    """Pull new activities + streams. Incremental unless force_full=True.
+
+    Args:
+        force_full: If True, re-pull the default 12-week backfill window.
+        weeks_back: Optional explicit backfill window in weeks. When set,
+            overrides the incremental path and pulls the last N weeks
+            (used to extend history beyond the default 12 weeks, e.g. for
+            year-long trajectory analysis). Implies force_full behavior.
+    """
     _init_db()
 
-    if force_full or _get_last_sync() is None:
+    if weeks_back is not None:
+        after = datetime.now(timezone.utc) - timedelta(weeks=weeks_back)
+    elif force_full or _get_last_sync() is None:
         after = datetime.now(timezone.utc) - timedelta(weeks=INITIAL_BACKFILL_WEEKS)
     else:
         after = _get_last_sync()  # type: ignore[assignment]
@@ -335,11 +345,18 @@ def _parse_zones() -> list[tuple[int, int, str]]:
 
 
 # ─── Weekly summary query ─────────────────────────────────────────────
-def weekly_summary(start_date: str, end_date: str) -> list[dict]:
+def weekly_summary(start_date: str, end_date: str) -> dict:
     """Per-week aggregates from the local cache.
 
     Weeks are Mon-Sun. Zone time uses current bpm boundaries from
     coach://user_profile at query time, so retests automatically apply.
+
+    Returns a dict with:
+    - `weeks`: list of per-week aggregates (only weeks with activities).
+    - `coverage`: cache extent metadata (oldest/newest activity dates,
+      requested range, and `gap_warning` True if the request extends
+      before the cache's oldest record). Use this to distinguish "no
+      runs that week" from "we don't have data that far back."
     """
     _init_db()
     zones = _parse_zones()
@@ -357,6 +374,11 @@ def weekly_summary(start_date: str, end_date: str) -> list[dict]:
             """,
             (start_date, end_date),
         ).fetchall()
+
+        extent = conn.execute(
+            "SELECT MIN(date(start_date_local)) AS oldest, "
+            "MAX(date(start_date_local)) AS newest FROM activities"
+        ).fetchone()
 
     weeks: dict[str, dict] = {}
     for r in rows:
@@ -411,7 +433,22 @@ def weekly_summary(start_date: str, end_date: str) -> list[dict]:
             bucket["total_moving_time_s"] += r["moving_time_s"] or 0
         bucket["session_count"] += 1
 
-    return list(weeks.values())
+    oldest = extent["oldest"] if extent else None
+    gap_warning = bool(oldest and start_date < oldest)
+    return {
+        "weeks": list(weeks.values()),
+        "coverage": {
+            "cache_oldest_activity": oldest,
+            "cache_newest_activity": extent["newest"] if extent else None,
+            "requested_start": start_date,
+            "requested_end": end_date,
+            "gap_warning": gap_warning,
+            "gap_hint": (
+                f"Requested range starts {start_date} but cache only goes back to "
+                f"{oldest}. Call sync_activities(weeks_back=N) for deeper history."
+            ) if gap_warning else None,
+        },
+    }
 
 
 # ─── Wellness history (HRV, RHR, sleep, stress, body battery) ────────
