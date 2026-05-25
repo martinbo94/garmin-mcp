@@ -908,27 +908,32 @@ def _session_category(
     drag_laps: list[dict],
     zones: list[tuple[int, int, str]],
 ) -> str:
-    """Heuristic session classification, anchored to the Bakken framework.
+    """Heuristic session classification anchored to the Bakken framework.
 
-    Returns 'easy' | 'sub-threshold' | 'at-threshold' | 'vo2'. The
-    decisive signal is the median DRAG-lap avg HR vs Bakken's hard cap
-    (a few bpm below LT2). Aggregate Z4% on its own can rise just from
-    HR ramp-up within reps even when each rep's avg sits cleanly in the
-    sub-threshold band, so it's used only as fallback for continuous
-    sessions without distinct drag structure.
+    Returns 'easy' | 'sub-threshold' | 'at-threshold' | 'vo2'.
+
+    Uses both drag AVG (Bakken-discipline signal) AND drag MAX (true
+    within-rep intensity). Drag avg alone hides VO2-style sessions where
+    each rep spikes briefly into Z5 — the time at Z5 is short, but the
+    stimulus IS top-end. Drag max captures that.
 
     Decision order:
-    1. Z5 share >= 5% → 'vo2' (deliberate top-end work).
-    2. Drag structure present and median drag avg HR > hard_cap (≈ LT2-4):
-       → 'at-threshold'. Reps crossed Bakken's golden-zone ceiling.
-    3. Drag structure present and any drag avg in Z3 (sub-threshold band):
-       → 'sub-threshold'.
-    4. No drag structure, but aggregate Z4 share >= 25%: → 'at-threshold'
-       (continuous tempo-style session). Threshold raised from 20% so
-       a long-rep sub-threshold workout isn't misclassified just from
-       ramp-up.
-    5. No drag structure, Z3 share >= 10%: → 'sub-threshold'.
-    6. Else: → 'easy'.
+    1. Z5 share >= 5% → 'vo2' (sustained top-end work).
+    2. Drag count >= 3 and >= 50% of drags peak in Z5 → 'vo2' (short-rep
+       VO2 style where peaks are brief but cover most reps).
+    3. Drag count >= 3 and >= 50% of drags peak >= LT2 → 'at-threshold'
+       (reps consistently broke into Z4 by the end — beyond Bakken
+       sub-threshold discipline).
+    4. Drags exist and median drag avg HR > hard_cap (≈ LT2-4) →
+       'at-threshold' (drag avg itself crossed Bakken's hard cap).
+    5. Drags exist and median drag avg in Z3+ → 'sub-threshold'.
+    6. No drag signal, but Z4 share >= 25% → 'at-threshold' (continuous
+       tempo-style session without distinct rep structure).
+    7. No drag signal, Z3 share >= 10% → 'sub-threshold'.
+    8. Else → 'easy'.
+
+    The 50% drag-max thresholds require >= 3 drags to be meaningful;
+    sessions with only 1-2 drags fall through to the avg-based rules.
     """
     z3 = zone_pcts.get("Z3", 0)
     z4 = zone_pcts.get("Z4", 0)
@@ -937,24 +942,34 @@ def _session_category(
     if z5 >= 5:
         return "vo2"
 
-    # Bakken hard cap = a few bpm below LT2, beyond which a rep has
-    # drifted into at-threshold territory. Z4_low + 2 approximates this
-    # cleanly (e.g. user Z4_low = 188 → hard_cap = 190, matching the
-    # user_profile's documented cap).
-    hard_cap = (zones[3][0] + 2) if len(zones) >= 4 else 190
+    z3_low = zones[2][0] if len(zones) >= 3 else 178
+    z4_low = zones[3][0] if len(zones) >= 4 else 188
+    z5_low = zones[4][0] if len(zones) >= 5 else 198
+    hard_cap = z4_low + 2  # Bakken's documented hard cap ≈ LT2 - 4
+    lt2_est = z4_low + 6   # LT2 ≈ Z4 midpoint for typical user zones
 
-    drag_avgs = sorted(
-        lap["average_heartrate"]
-        for lap in drag_laps
-        if lap.get("average_heartrate") is not None
-    )
-    if drag_avgs:
-        median_drag = drag_avgs[len(drag_avgs) // 2]
-        if median_drag > hard_cap:
+    avgs = [lap["average_heartrate"] for lap in drag_laps if lap.get("average_heartrate") is not None]
+    maxes = [lap["max_heartrate"] for lap in drag_laps if lap.get("max_heartrate") is not None]
+
+    # Within-rep peak signals (need >= 3 drags for the share to be meaningful).
+    if len(maxes) >= 3:
+        peaks_in_z5 = sum(1 for m in maxes if m >= z5_low)
+        if peaks_in_z5 / len(maxes) >= 0.5:
+            return "vo2"
+        peaks_at_lt2 = sum(1 for m in maxes if m >= lt2_est)
+        if peaks_at_lt2 / len(maxes) >= 0.5:
             return "at-threshold"
-        return "sub-threshold"
 
-    # No identified drag structure — fall back to aggregate zone share.
+    if avgs:
+        sorted_avgs = sorted(avgs)
+        median_avg = sorted_avgs[len(sorted_avgs) // 2]
+        if median_avg > hard_cap:
+            return "at-threshold"
+        if median_avg >= z3_low:
+            return "sub-threshold"
+        # Median drag avg is in Z2 — drags are likely noisy false-positives.
+        # Fall through to aggregate-zone fallback below.
+
     if z4 >= 25:
         return "at-threshold"
     if z3 >= 10:
