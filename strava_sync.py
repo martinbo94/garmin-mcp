@@ -903,20 +903,59 @@ def _summarize_laps(laps: list[dict]) -> list[dict]:
     return summary
 
 
-def _session_category(zone_pcts: dict) -> str:
-    """Heuristic session classification from zone distribution.
+def _session_category(
+    zone_pcts: dict,
+    drag_laps: list[dict],
+    zones: list[tuple[int, int, str]],
+) -> str:
+    """Heuristic session classification, anchored to the Bakken framework.
 
-    Anchored to the Bakken framework (Z3 = sub-threshold Golden Zone,
-    Z4 = at-threshold, Z5 = VO2). Returns 'easy' | 'sub-threshold' |
-    'at-threshold' | 'vo2'. Claude should refine ambiguous edges using
-    coach://classification.
+    Returns 'easy' | 'sub-threshold' | 'at-threshold' | 'vo2'. The
+    decisive signal is the median DRAG-lap avg HR vs Bakken's hard cap
+    (a few bpm below LT2). Aggregate Z4% on its own can rise just from
+    HR ramp-up within reps even when each rep's avg sits cleanly in the
+    sub-threshold band, so it's used only as fallback for continuous
+    sessions without distinct drag structure.
+
+    Decision order:
+    1. Z5 share >= 5% → 'vo2' (deliberate top-end work).
+    2. Drag structure present and median drag avg HR > hard_cap (≈ LT2-4):
+       → 'at-threshold'. Reps crossed Bakken's golden-zone ceiling.
+    3. Drag structure present and any drag avg in Z3 (sub-threshold band):
+       → 'sub-threshold'.
+    4. No drag structure, but aggregate Z4 share >= 25%: → 'at-threshold'
+       (continuous tempo-style session). Threshold raised from 20% so
+       a long-rep sub-threshold workout isn't misclassified just from
+       ramp-up.
+    5. No drag structure, Z3 share >= 10%: → 'sub-threshold'.
+    6. Else: → 'easy'.
     """
     z3 = zone_pcts.get("Z3", 0)
     z4 = zone_pcts.get("Z4", 0)
     z5 = zone_pcts.get("Z5", 0)
+
     if z5 >= 5:
         return "vo2"
-    if z4 >= 20:
+
+    # Bakken hard cap = a few bpm below LT2, beyond which a rep has
+    # drifted into at-threshold territory. Z4_low + 2 approximates this
+    # cleanly (e.g. user Z4_low = 188 → hard_cap = 190, matching the
+    # user_profile's documented cap).
+    hard_cap = (zones[3][0] + 2) if len(zones) >= 4 else 190
+
+    drag_avgs = sorted(
+        lap["average_heartrate"]
+        for lap in drag_laps
+        if lap.get("average_heartrate") is not None
+    )
+    if drag_avgs:
+        median_drag = drag_avgs[len(drag_avgs) // 2]
+        if median_drag > hard_cap:
+            return "at-threshold"
+        return "sub-threshold"
+
+    # No identified drag structure — fall back to aggregate zone share.
+    if z4 >= 25:
         return "at-threshold"
     if z3 >= 10:
         return "sub-threshold"
@@ -991,7 +1030,8 @@ def activity_breakdown(activity_id: int) -> dict:
 
     classified = _classify_laps(laps_raw, zones)
     lap_summary = _summarize_laps(classified)
-    session_category = _session_category(zone_pcts)
+    drag_laps = [lap for lap in classified if lap.get("lap_type") == "drag"]
+    session_category = _session_category(zone_pcts, drag_laps, zones)
 
     return {
         "id": row["id"],
