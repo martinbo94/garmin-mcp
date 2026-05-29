@@ -1359,10 +1359,16 @@ def get_wellness_history(
     Returns dict with:
       - range: start/end/days
       - daily: list of {date, resting_hr, hrv_overnight_avg, hrv_status,
-        hrv_baseline_low/upper, sleep_seconds, avg_stress, body_battery_*}
+        hrv_baseline_low/upper, sleep_seconds, sleep_score, sleep stage
+        durations, avg_stress, body_battery_*, respiration_avg, spo2_avg,
+        recovery_time_hours}
       - rolling: list of {date, rhr_7d_mean, hrv_7d_geomean}
       - summary: min/max/mean for RHR and HRV across the range, plus the
         most recent Garmin "balanced HRV" baseline band for context
+
+    Note: rows cached before a field was added to the schema will return
+    null for that field. Call with `force_refetch=True` for the relevant
+    range to backfill.
     """
     sync_result = strava_sync.sync_wellness_range(
         _client(), start_date, end_date, force_refetch=force_refetch
@@ -1390,7 +1396,12 @@ def _extract_training_summary(readiness, status) -> dict:
         out["readiness_score"] = r.get("score")
         out["readiness_level"] = r.get("level")
         out["readiness_feedback"] = r.get("feedbackLong") or r.get("feedbackShort")
-        out["recovery_time_hours"] = r.get("recoveryTime")
+        # Garmin's recoveryTime is in MINUTES, not hours, despite the
+        # watch display showing hours. Convert before reporting.
+        raw_rt_min = r.get("recoveryTime")
+        out["recovery_time_hours"] = (
+            round(raw_rt_min / 60) if raw_rt_min is not None else None
+        )
         out["acute_load"] = r.get("acuteLoad")
         # Garmin doesn't expose a raw ACWR number — only the factor (0-100)
         # and a verbal feedback like "VERY_GOOD" / "POOR".

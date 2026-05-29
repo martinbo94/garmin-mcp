@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS wellness_daily (
     body_battery_at_wake INTEGER,
     respiration_avg INTEGER,
     spo2_avg INTEGER,
+    recovery_time_hours INTEGER,
     synced_at TEXT NOT NULL
 );
 """
@@ -140,6 +141,7 @@ _WELLNESS_MIGRATION_COLUMNS = {
     "sleep_awake_s": "INTEGER",
     "respiration_avg": "INTEGER",
     "spo2_avg": "INTEGER",
+    "recovery_time_hours": "INTEGER",
 }
 
 
@@ -575,6 +577,33 @@ def _fetch_wellness_day(garmin_client, date_str: str) -> dict:
     except Exception:
         pass
 
+    # Recovery time from training readiness. Two extraction nuances:
+    #
+    # 1. The endpoint returns a list of readings throughout the day,
+    #    including any late-evening reading from the previous day. For
+    #    a historical training-stress signal we want the PEAK recovery
+    #    time on the calendar day — that's the estimate right after the
+    #    day's hardest workout, before overnight decay normalizes it.
+    #    A morning snapshot would lose race-day stress (Garmin
+    #    overnight-resets aggressively after big efforts).
+    # 2. Garmin's `recoveryTime` field is in MINUTES, not hours, despite
+    #    being displayed on the watch as hours. Convert before storing.
+    try:
+        tr = garmin_client.get_training_readiness(date_str)
+        if tr and isinstance(tr, list):
+            same_day = [
+                e for e in tr
+                if isinstance(e.get("timestamp"), str)
+                and e["timestamp"].startswith(date_str)
+            ]
+            if same_day:
+                peak = max(same_day, key=lambda e: e.get("recoveryTime") or 0)
+                raw_minutes = peak.get("recoveryTime")
+                if raw_minutes is not None:
+                    out["recovery_time_hours"] = round(raw_minutes / 60)
+    except Exception:
+        pass
+
     return out
 
 
@@ -596,6 +625,7 @@ def _save_wellness_day(row: dict) -> None:
         "avg_stress",
         "body_battery_high", "body_battery_low", "body_battery_at_wake",
         "respiration_avg", "spo2_avg",
+        "recovery_time_hours",
         "synced_at",
     ]
     vals = [row.get(c) for c in cols[:-1]] + [datetime.now(timezone.utc).isoformat()]
