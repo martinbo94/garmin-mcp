@@ -3,8 +3,9 @@
     "allow": [
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "mcp__strava__get-activity-streams",
-      "WebFetch(domain:www.mariusbakken.com)"
+      "WebFetch(domain:www.mariusbakken.com)",
+      "Bash(python *)",
+      "Bash(python3 *)"
     ],
     "deny": [],
     "ask": []

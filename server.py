@@ -18,17 +18,98 @@ from pydantic import BaseModel, Field
 
 load_dotenv(Path(__file__).parent / ".env")
 
-import strava_sync  # noqa: E402  (must load after dotenv so token refresh works)
+import garmin_sync  # noqa: E402  (must load after dotenv so token refresh works)
 import plan as plan_mod  # noqa: E402
 
-mcp = FastMCP("garmin-coach")
+SERVER_INSTRUCTIONS = """
+This server is a personal running coach MCP. It connects to Garmin
+Connect for workouts, activity history, and wellness data. It hosts
+`coach://` resources with training framework docs and the user's
+calibrated HR zones and profile.
+
+━━━ FIRST SESSION — NEW USER SETUP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+At the start of any session, call `user_profile_status` silently.
+
+If the profile is missing or has placeholder values:
+1. Tell the user the server is set up but needs a personal profile.
+2. Ask: "Do you want to use the Bakken Norwegian threshold framework
+   as your training philosophy, or would you prefer to use this mainly
+   for creating/editing workouts and tracking health data?"
+3. Based on their answer:
+   - **Bakken framework**: walk through the full profile setup
+     (`user_profile_status` → ask questions → `init_user_profile`),
+     then offer to sync activities and explain the weekly review flow.
+   - **Workouts + health only**: still run the minimal profile setup
+     (max HR is needed for zone computation) but skip the framework
+     discussion. Explain the core tools: create_continuous_run /
+     create_interval_workout for building sessions, morning_check_in
+     for daily readiness, activity_breakdown for reviewing a session.
+4. After setup, offer to sync activities: `sync_activities()`.
+
+If the profile exists and is filled in, proceed normally.
+
+━━━ ROUTING RULES ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. HR ZONES AND PACES come from `get_athlete_profile` (or
+   `coach://user_profile`). Never use zones from third-party apps —
+   they may use different calibration or be based on a race HR, not
+   the user's true max.
+
+2. ACTIVITY ANALYSIS: use `activity_breakdown(activity_id)` for any
+   completed session. Returns lap classification, per-lap zone time,
+   session category, and overall zone distribution in one call.
+
+3. RECOVERY / READINESS: `morning_check_in` returns HRV, RHR, sleep,
+   Garmin training_status, and 7-day trend deltas. Call it before
+   deciding whether to push a quality session.
+
+4. WEEKLY VOLUME / ZONE TIME: `weekly_summary`.
+
+━━━ WHEN THE USER USES THE BAKKEN FRAMEWORK ━━━━━━━━━━━━━━━━━━━━━━━━
+
+Pre-analysis protocol (race goal, weekly review, plan tweak):
+  a. `get_athlete_profile` — lock in zones, paces, PRs, profile A/B/C.
+  b. `morning_check_in` — current readiness.
+  c. `weekly_summary` for the relevant window.
+  d. `activity_breakdown` for specific reference sessions.
+  e. THEN reason — not before.
+
+Interpretation rules for interval sessions:
+- Use drag laps' `avg_hr` from `activity_breakdown.laps`, NEVER the
+  session-wide `avg_hr`. A 3×6 min sub-threshold session can show
+  session avg 165 bpm while the reps were at 184 — concluding "not
+  threshold" from session avg is the classic error.
+- HR-lag on the first rep: low-Z2 avg with Z3+ max still counts as a
+  working rep (the classifier rescues these via the pace co-signal).
+
+Athlete profile and race-goal estimation:
+- Profile A (VO2-strong, utilization-weak): Riegel/VDOT overestimate.
+  Bias goals slightly conservative.
+- Profile B (utilization-strong, VO2-weak): Riegel underestimates.
+- Profile C (balanced): Riegel/VDOT as-is.
+
+━━━ WHEN THE USER USES WORKOUTS + HEALTH ONLY ━━━━━━━━━━━━━━━━━━━━━━
+
+Core tools:
+- Build sessions: `create_continuous_run`, `create_interval_workout`
+- Schedule: `schedule_workout`, `reschedule_workout`, `swap_scheduled_workouts`
+- Review a session: `activity_breakdown`
+- Daily readiness: `morning_check_in`
+- Trends: `get_wellness_history`, `weekly_summary`
+
+Skip the Bakken-specific analysis (session_category, profile A/B/C,
+sub-threshold band) — just use HR zones and lap data directly.
+""".strip()
+
+mcp = FastMCP("garmin-coach", instructions=SERVER_INSTRUCTIONS)
 _COACH_DATA = Path(__file__).parent / "coach_data"
 
 
 # ─── Resources (markdown context for the coaching agent) ───────────────
 @mcp.resource("coach://classification")
 def classification_rules() -> str:
-    """How to classify Strava activities (easy / threshold / VO2 / long / race).
+    """How to classify activities (easy / threshold / VO2 / long / race).
 
     Read this before summarizing a week of training or analyzing a session.
     """
@@ -36,7 +117,6 @@ def classification_rules() -> str:
 
 
 _USER_PROFILE_PATH = _COACH_DATA / "user_profile.md"
-_USER_PROFILE_EXAMPLE_PATH = _COACH_DATA / "examples" / "user_profile.example.md"
 
 
 # ─── Resource-equivalent tools (for clients that don't auto-load resources)
@@ -198,6 +278,189 @@ def user_profile_status() -> dict:
     return result
 
 
+def _split_markdown_sections(text: str) -> dict[str, str]:
+    """Split a markdown doc by H2 headings into a {heading: body} dict."""
+    out: dict[str, str] = {}
+    current_heading: Optional[str] = None
+    buf: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if current_heading is not None:
+                out[current_heading] = "\n".join(buf)
+            current_heading = line[3:].strip()
+            buf = []
+        else:
+            buf.append(line)
+    if current_heading is not None:
+        out[current_heading] = "\n".join(buf)
+    return out
+
+
+def _parse_athlete_profile() -> dict:
+    """Parse coach_data/user_profile.md into a structured dict.
+
+    Section-scoped: race PRs only parsed from the Race PRs section, pace
+    estimates only from the Session pace estimates section, etc. Tolerant
+    of missing fields — returns None for anything it can't extract, plus
+    the raw markdown so the agent can fall back when needed.
+    """
+    import re as _re
+    if not _USER_PROFILE_PATH.exists():
+        return {
+            "exists": False,
+            "path": str(_USER_PROFILE_PATH),
+            "next_step": "Run init_user_profile() to create the profile.",
+        }
+
+    text = _USER_PROFILE_PATH.read_text(encoding="utf-8")
+    sections = _split_markdown_sections(text)
+
+    def grep_section(section_key_substr: str, pattern: str, group: int = 1, cast=str):
+        for key, body in sections.items():
+            if section_key_substr.lower() in key.lower():
+                m = _re.search(pattern, body, _re.IGNORECASE)
+                if m:
+                    try:
+                        return cast(m.group(group))
+                    except (ValueError, TypeError):
+                        return None
+        return None
+
+    max_hr = grep_section("Max HR", r"\*\*(\d+)\s*bpm\*\*", cast=int)
+
+    vo2_section = next((b for k, b in sections.items() if "VO2max" in k), "")
+    vo2max = _re.search(r"VO2max\s*\|\s*\*?\*?(\d+(?:\.\d+)?)\s*ml/min/kg", vo2_section)
+    weight = _re.search(r"Weight\s*\|\s*(\d+(?:\.\d+)?)\s*kg", vo2_section)
+    lt2 = _re.search(r"\*\*LT2 HR\*\*[^|]*\|\s*\*?\*?(\d+)\s*bpm", vo2_section)
+    lt1 = _re.search(r"\*\*LT1 HR\*\*[^|]*\|\s*\*?\*?(\d+)\s*bpm", vo2_section)
+    util = _re.search(r"Utilization at LT2\s*\|\s*\*?\*?(\d+)%", vo2_section)
+
+    # Sub-threshold training target band, e.g. "training target: 178-188".
+    st = _re.search(
+        r"sub-threshold[^|]*\|.*?training target:\s*(\d+)\s*-\s*(\d+)",
+        vo2_section, _re.IGNORECASE,
+    )
+    if not st:
+        st = _re.search(
+            r"sub-threshold[^|]*\|\s*~?(\d+)\s*-\s*(\d+)\s*bpm",
+            vo2_section, _re.IGNORECASE,
+        )
+    sub_threshold_band = (
+        {"low": int(st.group(1)), "high": int(st.group(2))} if st else None
+    )
+
+    # Athlete profile A/B/C — looks like "**Profile A: ...**"
+    profile_section = next((b for k, b in sections.items() if "Athlete profile" in k), "")
+    profile_match = _re.search(r"\*\*Profile\s+([A-C])\s*:\s*([^*]+?)\*\*", profile_section)
+    athlete_profile = (
+        {
+            "label": profile_match.group(1),
+            "description": profile_match.group(2).strip().rstrip(",").strip(),
+        }
+        if profile_match
+        else None
+    )
+
+    # HR zones — reuse the existing parser (reads the whole doc; zones table
+    # is the only place its pattern matches).
+    zones = []
+    try:
+        for low, high, name in garmin_sync._parse_zones():
+            zones.append({"name": name, "low": low, "high": None if high >= 9999 else high})
+    except Exception:
+        pass
+
+    # Race PRs — parse the Race PRs section, table rows only.
+    race_prs = []
+    race_section = next((b for k, b in sections.items() if "Race PRs" in k), "")
+    for line in race_section.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.replace("**", "").strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        dist, time_s, pace_s = cells[0], cells[1], cells[2]
+        if not _re.match(r"^\d+\s*(?:k|km|HM|hm|Marathon|marathon)$", dist):
+            continue
+        if not _re.match(r"^\d+:\d+(?::\d+)?$", time_s):
+            continue
+        if not _re.match(r"^\d+:\d+/km$", pace_s):
+            continue
+        date_field = cells[3] if len(cells) > 3 else ""
+        race_prs.append({
+            "distance": dist,
+            "time": time_s,
+            "pace": pace_s,
+            "date": date_field if date_field and date_field not in ("—", "-", "older", "") else None,
+        })
+
+    # Pace estimates — parse the Session pace estimates section.
+    pace_estimates = {}
+    pace_section = next(
+        (b for k, b in sections.items() if "pace estimate" in k.lower()), ""
+    )
+    for line in pace_section.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [c.replace("**", "").strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        effort, pace = cells[0], cells[1]
+        if not _re.search(r"\d+:\d+", pace) or "km" not in pace.lower():
+            continue
+        if effort.lower() in {"effort", "outdoor pace"} or effort.startswith("-"):
+            continue
+        pace_estimates[effort] = pace
+
+    def _f(m, idx=1, cast=float):
+        if not m:
+            return None
+        try:
+            return cast(m.group(idx))
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "exists": True,
+        "max_hr_bpm": max_hr,
+        "lt1_hr": _f(lt1, cast=int),
+        "lt2_hr": _f(lt2, cast=int),
+        "sub_threshold_band_bpm": sub_threshold_band,
+        "vo2max_ml_min_kg": _f(vo2max),
+        "weight_kg": _f(weight),
+        "utilization_at_lt2_pct": _f(util, cast=int),
+        "zones": zones,
+        "athlete_profile": athlete_profile,
+        "race_prs": race_prs,
+        "pace_estimates": pace_estimates,
+    }
+
+
+@mcp.tool()
+def get_athlete_profile() -> dict:
+    """**Authoritative source for HR zones, paces, athlete profile, and race
+    PRs.** Use this before any analytical task — race goal estimation,
+    weekly review, session interpretation, plan drafting.
+
+    Returns a structured dict parsed from `coach://user_profile`:
+    - `max_hr_bpm`, `lt1_hr`, `lt2_hr` (lab-calibrated thresholds)
+    - `zones`: [{name, low, high}] for Z1-Z5 (verbatim from Garmin Connect)
+    - `sub_threshold_band_bpm`: Bakken Golden Zone training target
+    - `vo2max_ml_min_kg`, `weight_kg`, `utilization_at_lt2_pct`
+    - `athlete_profile`: {label: A/B/C, description} — drives race-goal
+      bias (Profile A: bias conservative; Profile B: Riegel underestimates;
+      Profile C: as-is)
+    - `race_prs`: list of {distance, time, pace, date}
+    - `pace_estimates`: {effort_name: pace_string} (easy, sub-threshold, etc.)
+
+    NEVER substitute zones from third-party apps for these values — they
+    may use different calibration methods or be based on a recent race HR
+    rather than the user's true max. Always anchor zone
+    reasoning to this tool's output.
+    """
+    return _parse_athlete_profile()
+
+
 @mcp.tool()
 def init_user_profile(
     max_hr: int,
@@ -342,7 +605,7 @@ def user_profile() -> str:
     test data, race PRs, derived HR target bands, and pace ↔ HR mappings.
 
     Read this before any HR zone analysis or workout-prescription work —
-    these values override whatever Strava has cached.
+    these values are the source of truth for HR zones.
     """
     return (_COACH_DATA / "user_profile.md").read_text(encoding="utf-8")
 
@@ -722,42 +985,53 @@ def delete_workout_template(workout_id: int) -> str:
     return f"Deleted workout {workout_id}."
 
 
-# ─── Strava sync + weekly summary (reads local cache) ──────────────────
+# ─── Activity sync + weekly summary (reads local cache) ────────────────
 @mcp.tool()
-def sync_activities(force_full: bool = False) -> dict:
-    """Pull new activities + HR streams from Strava into the local cache.
+def sync_activities(force_full: bool = False, weeks_back: Optional[int] = None) -> dict:
+    """Pull new activities + HR streams + laps from Garmin into the local cache.
 
     Runs incrementally since the last sync. First-time sync backfills the
     last 12 weeks of activities; subsequent runs are cheap and just fetch
     what's new.
 
     Args:
-        force_full: If True, re-pull the full 12-week backfill window.
+        force_full: If True, re-pull the default 12-week backfill window.
             Default False — just pick up new activities since last sync.
+        weeks_back: Optional explicit backfill window (e.g. 26 or 52) to
+            pull deeper history than the 12-week default. Use when the
+            agent needs year-long trajectory data (`weekly_summary` will
+            return `gap_warning=True` when the requested range is older
+            than what's cached).
 
     Returns dict with new_activities count, streams_fetched count,
-    last_sync timestamp, and any per-activity errors encountered.
+    laps_fetched count, last_sync timestamp, and any per-activity errors.
     """
-    return strava_sync.run_sync(force_full=force_full)
+    return garmin_sync.run_sync(_client(), force_full=force_full, weeks_back=weeks_back)
 
 
 @mcp.tool()
-def weekly_summary(start_date: str, end_date: str) -> list[dict]:
-    """Per-week training summary from the local Strava cache.
+def weekly_summary(start_date: str, end_date: str) -> dict:
+    """Per-week training summary from the local Garmin cache.
 
-    Each returned entry covers one Monday-Sunday week in the range and
-    contains: total distance, run count, time in each HR zone (computed
-    from raw streams using current bpm boundaries from coach://user_profile),
-    and the list of activities with names, descriptions, distance, HR, and
-    a `classification_hint` derived from naming patterns. The hint is the
-    deterministic 90% case — Claude should refine ambiguous cases using
-    coach://classification.
+    Returns `{"weeks": [...], "coverage": {...}}`. Each week entry covers
+    one Monday-Sunday week and contains total distance, run count, time
+    in each HR zone (computed from raw streams using current bpm
+    boundaries from `get_athlete_profile` / coach://user_profile — NOT
+    the local cache zones), and the list of activities with names,
+    descriptions, distance, HR, and a `classification_hint` derived
+    from naming patterns.
+
+    The `coverage` field reports cache extent and a `gap_warning` flag
+    when the requested range extends before the oldest cached activity —
+    use it to distinguish "no runs that week" from "we don't have data
+    that far back" (the local cache holds 12 weeks by default; call
+    `sync_activities(weeks_back=N)` to extend it).
 
     Args:
         start_date: 'YYYY-MM-DD' (inclusive)
         end_date:   'YYYY-MM-DD' (inclusive)
     """
-    return strava_sync.weekly_summary(start_date, end_date)
+    return garmin_sync.weekly_summary(start_date, end_date)
 
 
 # ─── Training plan: load, save, materialize, compare ──────────────────
@@ -780,37 +1054,88 @@ def get_plan() -> dict:
 
 
 @mcp.tool()
-def validate_plan(plan_data: dict) -> dict:
-    """Check a draft plan dict for structural issues before save_plan.
+def _resolve_plan_input(
+    plan_data: Optional[dict], draft_path: Optional[str]
+) -> dict:
+    """Return the plan dict from either an inline argument or a JSON file.
+
+    Resolution order:
+    1. `plan_data` if explicitly provided
+    2. `draft_path` if explicitly provided (read JSON from disk)
+    3. Default draft path `coach_data/plan.draft.json` if it exists
+
+    Multi-week plans serialize to 20-40 KB of JSON, which is expensive to
+    inline into a tool call. The recommended workflow is to Write the
+    draft JSON to disk first, then call these tools with `draft_path` (or
+    rely on the default `plan.draft.json` location).
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    if plan_data is not None:
+        return plan_data
+
+    if draft_path is not None:
+        p = _Path(draft_path)
+    else:
+        p = _Path(__file__).parent / "coach_data" / "plan.draft.json"
+
+    if not p.exists():
+        raise FileNotFoundError(
+            f"No plan provided and {p} does not exist. Either pass "
+            f"plan_data directly, write the draft JSON to {p} first, or "
+            f"pass an explicit draft_path."
+        )
+    return _json.loads(p.read_text(encoding="utf-8"))
+
+
+def validate_plan(
+    plan_data: Optional[dict] = None, draft_path: Optional[str] = None
+) -> dict:
+    """Check a draft plan for structural issues before save_plan.
 
     Validates required fields, ISO date format, type enum values, and the
     shape of continuous / interval blocks. Returns {ok, errors, warnings,
     workout_count}.
 
+    Pass either `plan_data` (an in-flight dict, best for short plans) or
+    `draft_path` (a path to a JSON file on disk, best for multi-week
+    plans where inlining 20-40 KB of JSON into a tool call is expensive).
+    With neither argument, reads `coach_data/plan.draft.json` by default.
+
     Use this BEFORE save_plan to catch issues that would otherwise only
-    surface at materialize_plan time. Operates on an in-flight dict — does
-    NOT read plan.json.
+    surface at materialize_plan time.
     """
-    return plan_mod.validate_plan(plan_data)
+    return plan_mod.validate_plan(_resolve_plan_input(plan_data, draft_path))
 
 
 @mcp.tool()
-def summarize_plan(plan_data: dict) -> dict:
-    """Preview the weekly structure of a draft plan dict before saving.
+def summarize_plan(
+    plan_data: Optional[dict] = None, draft_path: Optional[str] = None
+) -> dict:
+    """Preview the weekly structure of a draft plan before saving.
 
     Groups workouts by Mon-Sun week. Per week: session count, distribution
     (quality / easy / long / strength / rest), total estimated km. Plus
-    block-level totals. Operates on the in-flight plan dict — does NOT
-    read plan.json.
+    block-level totals.
+
+    Pass either `plan_data` (in-flight dict) or `draft_path` (JSON file on
+    disk). With neither argument, reads `coach_data/plan.draft.json`.
 
     Use this BEFORE save_plan as a sanity check on what you've drafted.
     """
-    return plan_mod.summarize_plan(plan_data)
+    return plan_mod.summarize_plan(_resolve_plan_input(plan_data, draft_path))
 
 
 @mcp.tool()
-def save_plan(plan_data: dict) -> str:
+def save_plan(
+    plan_data: Optional[dict] = None, draft_path: Optional[str] = None
+) -> str:
     """Save a training plan to coach_data/plan.json (overwrites any existing).
+
+    Pass either `plan_data` (in-flight dict, best for short plans) or
+    `draft_path` (a path to a JSON file on disk, best for multi-week
+    plans). With neither argument, reads `coach_data/plan.draft.json`.
 
     Expected shape:
         {
@@ -824,8 +1149,9 @@ def save_plan(plan_data: dict) -> str:
           ]
         }
     """
-    plan_mod.save_plan(plan_data)
-    return f"Saved: {plan_data.get('block_name', '(unnamed)')} with {len(plan_data.get('workouts', []))} workouts."
+    plan = _resolve_plan_input(plan_data, draft_path)
+    plan_mod.save_plan(plan)
+    return f"Saved: {plan.get('block_name', '(unnamed)')} with {len(plan.get('workouts', []))} workouts."
 
 
 @mcp.tool()
@@ -913,7 +1239,7 @@ def compare_plan_vs_actual(start_date: str, end_date: str) -> dict:
     """Compare planned workouts against actual cached activities.
 
     Matches each planned workout on its date with the actual activity from
-    Strava (via the local cache). Medium strictness: type must match
+    Garmin (via the local cache). Medium strictness: type must match
     (via classification_hint), distance within ±15%. Returns per-workout
     status plus a summary count.
 
@@ -975,10 +1301,9 @@ def get_gear_for_activity(activity_id: int) -> dict:
     shoes were on yesterday's run?", "which shoe has the most threshold
     work on it?").
 
-    NOTE: takes a **Garmin** activity_id, not the Strava ID used elsewhere
-    in this MCP. Find it in the Garmin Connect URL
-    (`connect.garmin.com/modern/activity/<id>`) or via python-garminconnect's
-    `get_activities()`. Passing a Strava ID will 403.
+    Takes a Garmin activity_id — find it in the Garmin Connect URL
+    (`connect.garmin.com/modern/activity/<id>`) or via
+    `sync_activities` + `weekly_summary`.
     """
     return _client().get_activity_gear(activity_id)
 
@@ -986,16 +1311,34 @@ def get_gear_for_activity(activity_id: int) -> dict:
 # ─── Drill-in / recovery / retrospective ──────────────────────────────
 @mcp.tool()
 def activity_breakdown(activity_id: int) -> dict:
-    """Detailed breakdown of a single cached activity.
+    """**First-line tool for analyzing a single completed activity.** Use
+    this before reaching for raw activity data — it returns the lap
+    structure, HR-zone distribution, and a heuristic session category in
+    one call, all anchored to the user's current HR zones from
+    `get_athlete_profile` / coach://user_profile.
 
-    Returns name, description, distance, moving time, avg/max HR,
-    classification hint, and time in each HR zone (Z1-Z5) as both seconds
-    and percentages. Useful for drilling into a specific session ("how did
-    Tuesday's threshold go?") without pulling the full weekly summary.
+    Returns:
+    - Metadata: id, date, name, description, distance_m, moving_time_s,
+      avg_hr, max_hr, sport_type
+    - `laps`: list of {lap_index, type, distance_m, moving_time_s,
+      pace_s_per_km, avg_hr, max_hr}. `type` is auto-classified as
+      "drag" (work rep, Z3+ avg HR ≥30s), "pause" (recovery between
+      drags), "wu" (warmup before first drag), "cd" (cooldown after
+      last drag), or "easy" (continuous easy run, no drags found).
+    - `zone_secs` + `zone_pcts`: time in each HR zone (Z1-Z5).
+    - `session_category`: heuristic "easy" | "sub-threshold" |
+      "at-threshold" | "vo2" — useful for compliance scoring against
+      the plan. Refine ambiguous edges via coach://classification.
+    - `classification_hint`: name-pattern hint (deterministic 90% case).
 
-    If the activity isn't in the cache, run `sync_activities` first.
+    The activity must be in the local cache. If `error` is
+    returned with `next_steps`, call `sync_activities()` (or
+    `sync_activities(weeks_back=N)` for older activities) and retry.
+    Laps are cached from Garmin at sync time.
+
+    Garmin activity_id.
     """
-    return strava_sync.activity_breakdown(activity_id)
+    return garmin_sync.activity_breakdown(activity_id)
 
 
 @mcp.tool()
@@ -1025,35 +1368,118 @@ def get_wellness_history(
     Returns dict with:
       - range: start/end/days
       - daily: list of {date, resting_hr, hrv_overnight_avg, hrv_status,
-        hrv_baseline_low/upper, sleep_seconds, avg_stress, body_battery_*}
+        hrv_baseline_low/upper, sleep_seconds, sleep_score, sleep stage
+        durations, avg_stress, body_battery_*, respiration_avg, spo2_avg,
+        recovery_time_hours}
       - rolling: list of {date, rhr_7d_mean, hrv_7d_geomean}
       - summary: min/max/mean for RHR and HRV across the range, plus the
         most recent Garmin "balanced HRV" baseline band for context
+
+    Note: rows cached before a field was added to the schema will return
+    null for that field. Call with `force_refetch=True` for the relevant
+    range to backfill.
     """
-    sync_result = strava_sync.sync_wellness_range(
+    sync_result = garmin_sync.sync_wellness_range(
         _client(), start_date, end_date, force_refetch=force_refetch
     )
-    data = strava_sync.wellness_history(start_date, end_date)
+    data = garmin_sync.wellness_history(start_date, end_date)
     data["sync"] = sync_result
     return data
 
 
+def _extract_training_summary(readiness, status) -> dict:
+    """Flatten the key fields out of Garmin's verbose readiness + status payloads.
+
+    Returns a single-level dict of the things a coach actually checks:
+    readiness score/level/feedback, recovery time, ACWR, acute load,
+    training status verbal label (PRODUCTIVE / MAINTAINING / etc.) and
+    current VO2max estimate. Missing fields are silently None; the raw
+    payloads are still returned alongside for anything not extracted.
+    """
+    out: dict = {}
+
+    r = readiness[0] if isinstance(readiness, list) and readiness else (
+        readiness if isinstance(readiness, dict) else {}
+    )
+    if r and "error" not in r:
+        out["readiness_score"] = r.get("score")
+        out["readiness_level"] = r.get("level")
+        out["readiness_feedback"] = r.get("feedbackLong") or r.get("feedbackShort")
+        # Garmin's recoveryTime is in MINUTES, not hours, despite the
+        # watch display showing hours. Convert before reporting.
+        raw_rt_min = r.get("recoveryTime")
+        out["recovery_time_hours"] = (
+            round(raw_rt_min / 60) if raw_rt_min is not None else None
+        )
+        out["acute_load"] = r.get("acuteLoad")
+        # Garmin doesn't expose a raw ACWR number — only the factor (0-100)
+        # and a verbal feedback like "VERY_GOOD" / "POOR".
+        out["acwr_factor_percent"] = r.get("acwrFactorPercent")
+        out["acwr_factor_feedback"] = r.get("acwrFactorFeedback")
+        out["hrv_factor_percent"] = r.get("hrvFactorPercent")
+        out["hrv_factor_feedback"] = r.get("hrvFactorFeedback")
+        out["sleep_score_factor_percent"] = r.get("sleepScoreFactorPercent")
+        out["sleep_score_factor_feedback"] = r.get("sleepScoreFactorFeedback")
+        out["sleep_history_factor_percent"] = r.get("sleepHistoryFactorPercent")
+        out["sleep_history_factor_feedback"] = r.get("sleepHistoryFactorFeedback")
+        out["stress_history_factor_percent"] = r.get("stressHistoryFactorPercent")
+        out["stress_history_factor_feedback"] = r.get("stressHistoryFactorFeedback")
+        out["recovery_time_factor_percent"] = r.get("recoveryTimeFactorPercent")
+        out["recovery_time_factor_feedback"] = r.get("recoveryTimeFactorFeedback")
+
+    if isinstance(status, dict) and "error" not in status:
+        # VO2max lives under mostRecentVO2Max, not the training status block.
+        vo2 = (status.get("mostRecentVO2Max") or {}).get("generic") or {}
+        out["vo2max"] = vo2.get("vo2MaxValue")
+        out["vo2max_precise"] = vo2.get("vo2MaxPreciseValue")
+        out["fitness_age"] = vo2.get("fitnessAge")
+
+        ts = status.get("mostRecentTrainingStatus") or {}
+        latest = ts.get("latestTrainingStatusData") or {}
+        # latestTrainingStatusData is keyed by deviceId — grab the first device.
+        device_data = next(iter(latest.values()), {}) if isinstance(latest, dict) else {}
+        if device_data:
+            out["training_status_code"] = device_data.get("trainingStatus")
+            out["training_status"] = device_data.get("trainingStatusFeedbackPhrase")
+            out["weekly_training_load"] = device_data.get("weeklyTrainingLoad")
+            out["load_tunnel_min"] = device_data.get("loadTunnelMin")
+            out["load_tunnel_max"] = device_data.get("loadTunnelMax")
+            out["fitness_trend"] = device_data.get("fitnessTrend")
+            out["load_level_trend"] = device_data.get("loadLevelTrend")
+
+    return out
+
+
 @mcp.tool()
 def morning_check_in() -> dict:
-    """Today's recovery / readiness metrics from Garmin.
+    """Today's recovery snapshot — flattened metrics, 7-day trend deltas,
+    and Garmin's readiness/status assessments. All in one call.
 
-    Pulls training readiness, sleep (last night), HRV, body battery,
-    training status, and resting HR. Each endpoint is fetched
-    independently — partial results are returned with per-field errors if
-    individual calls fail.
+    Returns:
+    - `wellness.today`: flat HRV (overnight, weekly avg, baseline band,
+      status), RHR, sleep (duration, score, deep/REM/light/awake),
+      stress, body battery (high/low/at-wake), respiration, SpO2.
+    - `wellness.trends`: prior 7-day mean + delta + stdev + deviation
+      flag for each metric. Flag fires when today is >1σ outside the
+      trailing mean in the "bad" direction (HRV ↓, RHR ↑, sleep ↓,
+      stress ↑).
+    - `training_summary`: flat readiness score/level/feedback, ACWR,
+      acute load, recovery time, training status verbal (PRODUCTIVE /
+      MAINTAINING / etc.), VO2max, weekly load.
+    - `training_readiness_raw`, `training_status_raw`, `body_battery`:
+      the full Garmin payloads for anything not flattened above.
 
     Use to decide whether to do a planned quality session today or shift
-    it (e.g., low training readiness → defer threshold to tomorrow).
+    it (e.g., HRV deviation_low + elevated RHR + low readiness → defer
+    threshold). For multi-day trends beyond 7 days, use
+    `get_wellness_history`.
     """
-    from datetime import date as _date, timedelta as _td
+    from datetime import date as _date, datetime as _dt, timedelta as _td, timezone as _tz
     g = _client()
-    today = _date.today().isoformat()
-    yesterday = (_date.today() - _td(days=1)).isoformat()
+    today = _date.today()
+    yesterday = today - _td(days=1)
+    history_start = (today - _td(days=8)).isoformat()
+    history_end = yesterday.isoformat()
 
     def safe(fn, *args):
         try:
@@ -1061,15 +1487,25 @@ def morning_check_in() -> dict:
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
 
+    wellness = garmin_sync.morning_check_in_data(
+        g, today.isoformat(), yesterday.isoformat(), history_start, history_end,
+    )
+
+    training_readiness_raw = safe(g.get_training_readiness, today.isoformat())
+    training_status_raw = safe(g.get_training_status, today.isoformat())
+    body_battery = safe(g.get_body_battery, today.isoformat())
+    training_summary = _extract_training_summary(
+        training_readiness_raw, training_status_raw
+    )
+
     return {
-        "date": today,
-        "training_readiness": safe(g.get_training_readiness, today),
-        "morning_readiness": safe(g.get_morning_training_readiness, today),
-        "training_status": safe(g.get_training_status, today),
-        "sleep_last_night": safe(g.get_sleep_data, yesterday),
-        "hrv": safe(g.get_hrv_data, today),
-        "body_battery": safe(g.get_body_battery, today),
-        "resting_hr": safe(g.get_rhr_day, today),
+        "date": today.isoformat(),
+        "captured_at": _dt.now(_tz.utc).isoformat(),
+        "wellness": wellness,
+        "training_summary": training_summary,
+        "training_readiness_raw": training_readiness_raw,
+        "training_status_raw": training_status_raw,
+        "body_battery": body_battery,
     }
 
 
@@ -1088,11 +1524,13 @@ def weekly_retrospective(week_start: str) -> dict:
     from datetime import date as _date, timedelta as _td
     start = _date.fromisoformat(week_start)
     end = start + _td(days=6)
-    weeks = strava_sync.weekly_summary(start.isoformat(), end.isoformat())
+    result = garmin_sync.weekly_summary(start.isoformat(), end.isoformat())
+    weeks = result["weeks"]
     return {
         "week_start": week_start,
         "week_end": end.isoformat(),
         "summary": weeks[0] if weeks else None,
+        "coverage": result["coverage"],
         "plan_compliance": plan_mod.compare_plan_vs_actual(
             start.isoformat(), end.isoformat()
         ),
@@ -1102,11 +1540,12 @@ def weekly_retrospective(week_start: str) -> dict:
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
-        result = strava_sync.run_sync()
+        result = garmin_sync.run_sync(_client())
         if result.get("new_activities") or result.get("errors"):
             print(
                 f"[startup-sync] {result.get('new_activities', 0)} new, "
                 f"{result.get('streams_fetched', 0)} streams, "
+                f"{result.get('laps_fetched', 0)} laps, "
                 f"{len(result.get('errors', []))} errors",
                 file=sys.stderr,
             )

@@ -322,7 +322,50 @@ slightly lower starting point than where the block was when it broke.
 
 ## Drafting the plan — practical checklist
 
-When using this doc to draft a `plan.json`:
+### Step 0 — Ground the draft in actual data (do this FIRST)
+
+Before proposing any structure, weekly volume, or starting point, load
+the user's real recent training. Numbers self-reported in chat ("I run
+about 40 km/wk") are anchoring guesses — verify against the cache.
+Skipping this step is how plans get prescribed that don't match the
+runner.
+
+Mandatory pre-draft calls (in order):
+
+1. **`sync_activities()`** — ensure the local cache is current. The
+   cache holds the last ~12 weeks by default. For year-long trajectory
+   analysis call `sync_activities(weeks_back=52)` to extend it.
+2. **`weekly_summary(start, end)`** for the last 12 weeks — returns
+   `{"weeks": [...], "coverage": {...}}`. Inspect `coverage.gap_warning`
+   first: if True, the requested range is older than the cache holds —
+   call `sync_activities(weeks_back=N)` and retry. Then look at:
+   - Weekly total km (median, trend, max).
+   - Longest run per week (this anchors where the long run should
+     start).
+   - Number of quality sessions per week (the runner's current Bakken
+     compliance, if any).
+   - Zone distribution (is the easy/threshold/VO2 mix already in the
+     60-65 / 20-30 / 5-10 band, or skewed gray-zone?).
+3. **`get_wellness_history(days=30)`** — HRV trend, RHR baseline, sleep
+   consistency, training readiness pattern. A draft that ignores a
+   declining HRV trend will pile load onto an under-recovering athlete.
+4. **`read_coach_doc('user_profile')`** — current HR zones, paces, race
+   PRs, athlete profile (A/B/C). The plan's quality-session HR bands
+   come from here.
+5. **`read_coach_doc('training_philosophy')`** — confirm framework
+   constraints (easy cap at LT1, sub-threshold band, X-økt rules).
+
+Only after these calls should you propose a structure. When you do,
+**state the data the structure is anchored to** ("starting at 45 km
+because that's the median of the last 8 weeks; long run starts at 14 km
+because that's what you've already been doing on Sundays") — don't pull
+starting numbers from the user's chat estimate alone.
+
+Re-plan trigger: at each phase boundary (or every 4 weeks in a flat
+block), re-run Step 0 before adjusting the next phase. Reality drifts;
+plans get re-anchored.
+
+### Step 1 — Structure
 
 1. **Pick the structural archetype** (flat / block / progressive X-økt).
 2. **Set the horizon** (weeks count, deload cadence if blocks).
@@ -333,8 +376,11 @@ When using this doc to draft a `plan.json`:
 6. **Account for the goal race date** — taper in final week, race-specific
    work in weeks before.
 7. **Verify intensity distribution** roughly matches 60-65 / 20-30 / 5-10.
-8. **Validate via `summarize_plan` + `validate_plan` tools** before
-   `save_plan`.
+8. **Write the draft to `coach_data/plan.draft.json`** via the Write
+   tool (multi-week plans serialize to 20-40 KB of JSON — inlining that
+   into MCP tool calls is expensive and error-prone). Then run
+   `summarize_plan()` + `validate_plan()` with no arguments — they read
+   the draft file by default. Only call `save_plan()` once both pass.
 
 When this doc gets out of date: revise as the user's training history
 accumulates and patterns emerge that the chapter 7 template doesn't
