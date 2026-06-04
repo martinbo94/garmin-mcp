@@ -18,40 +18,38 @@ from pydantic import BaseModel, Field
 
 load_dotenv(Path(__file__).parent / ".env")
 
-import strava_sync  # noqa: E402  (must load after dotenv so token refresh works)
+import garmin_sync as strava_sync  # noqa: E402  (must load after dotenv so token refresh works)
 import plan as plan_mod  # noqa: E402
 
 SERVER_INSTRUCTIONS = """
-This server is the user's personal running coach setup. It hosts:
+This server is a personal running coach MCP. It hosts:
 - `coach://` resources: training_philosophy (Bakken Norwegian threshold
-  framework), user_profile (lab-calibrated zones, paces, race PRs,
-  athlete profile A/B/C), plan_design, classification.
-- Tools for Garmin activity/wellness data, Strava sync, plan management.
+  framework), user_profile (calibrated zones, paces, race PRs, athlete
+  profile A/B/C), plan_design, classification.
+- Tools for Garmin activity/wellness data, plan management, and gear.
 
 ROUTING RULES — read before any analytical task:
 
 1. HR ZONES, PACES, ATHLETE PROFILE come from `get_athlete_profile`
-   (or `coach://user_profile`). NEVER use Strava's athlete zones — they
-   reflect Strava settings, not the user's lab-calibrated thresholds.
-   Strava's max HR is typically a recent race HR, not the user's true
-   max, so its zones are systematically shifted 5-10 bpm low.
+   (or `coach://user_profile`). NEVER use zones from third-party apps —
+   they may reflect stale settings or a different calibration method.
 
-2. ACTIVITY ANALYSIS: prefer `activity_breakdown(strava_id)` over raw
-   Strava streams. It returns lap classification (drag/pause/wu/cd),
-   zone time, and session category in one call, anchored to the user's
-   actual zones.
+2. ACTIVITY ANALYSIS: use `activity_breakdown(activity_id)` for any
+   single session. It returns lap classification (drag/pause/wu/cd),
+   per-lap zone_secs, session category, and overall zone distribution —
+   all anchored to the user's actual zones.
 
-3. RECOVERY / READINESS: `morning_check_in` returns flat HRV, RHR, sleep
+3. RECOVERY / READINESS: `morning_check_in` returns HRV, RHR, sleep
    score + stages, Garmin training_status (PEAKING / PRODUCTIVE / etc.),
    training_summary, and 7-day trend deltas with deviation flags. Pull
    this BEFORE setting race goals or deciding whether to push a quality
    session.
 
 4. WEEKLY VOLUME / ZONE TIME: `weekly_summary` (this server, anchored to
-   user_profile zones), not Strava's raw activity list.
+   user_profile zones).
 
-5. STRAVA is SECONDARY — useful for segments, GPS detail, social, or
-   activities outside the local cache window.
+5. STRAVA (if connected) is useful for segments, GPS routes, and social
+   features — not needed for activity analysis or zone computation.
 
 PRE-ANALYSIS PROTOCOL (race goal, weekly review, plan tweak):
   a. `get_athlete_profile` — lock in zones, paces, PRs, profile A/B/C.
@@ -67,27 +65,20 @@ INTERPRETATION RULES (apply when reasoning over activity data):
   session average is diluted by warmup, cooldown, and recovery jogs, so
   it systematically understates working HR. A 3×6 min sub-threshold
   session can show session avg 165 bpm while the reps themselves were
-  at 184. Conclude "not a threshold session" from session avg = a
+  at 184 — concluding "not a threshold session" from session avg is a
   classic error.
 - When a rep's `avg_hr` lands on a zone boundary, check its `max_hr`
   too. HR-lag often produces low-Z2 avg with mid-Z3+ max on the first
-  rep — that's still a working rep (the `activity_breakdown`
-  classifier already rescues these into `drag` via the pace co-signal).
-- The `session_category` field is heuristic from aggregate zones; it
-  can read "easy" for sessions whose reps WERE threshold-level if the
-  rep fraction was small. Always inspect `laps` for sessions with
-  interval-style names (Intervaller, Tempo, etc.).
+  rep — that's still a working rep (the classifier rescues these via
+  the pace co-signal).
+- The `session_category` field is heuristic; inspect `laps` directly for
+  sessions with interval-style names.
 
 ATHLETE PROFILE matters for race-goal estimation:
 - Profile A (VO2-strong, utilization-weak): Riegel/VDOT tend to
-  OVERESTIMATE. Hitting-the-wall history common — bias goals slightly
-  conservative.
+  OVERESTIMATE. Bias goals slightly conservative.
 - Profile B (utilization-strong, VO2-weak): Riegel tends to underestimate.
 - Profile C (balanced): Riegel/VDOT as-is.
-
-If a value seems off (HR zone, max HR, race PR), VERIFY via
-`get_athlete_profile` before reasoning further. Never carry forward a
-Strava-derived zone into a coaching recommendation.
 """.strip()
 
 mcp = FastMCP("garmin-coach", instructions=SERVER_INSTRUCTIONS)
@@ -97,7 +88,7 @@ _COACH_DATA = Path(__file__).parent / "coach_data"
 # ─── Resources (markdown context for the coaching agent) ───────────────
 @mcp.resource("coach://classification")
 def classification_rules() -> str:
-    """How to classify Strava activities (easy / threshold / VO2 / long / race).
+    """How to classify activities (easy / threshold / VO2 / long / race).
 
     Read this before summarizing a week of training or analyzing a session.
     """

@@ -1,14 +1,14 @@
 # Workout Classification Rules
 
-How to read a Strava activity and decide what kind of session it was. The
+How to read an activity and decide what kind of session it was. The
 workout **name** is the primary signal — HR, pace, and lap structure are
 fallback hints when the name is ambiguous.
 
 ## Naming conventions (source of truth)
 
-The agent assumes Strava activities are named according to a personal
-convention: default Strava titles for easy runs, intentional custom names
-for quality sessions. The exact wording below is one user's setup (in
+The agent assumes activities are named according to a personal convention:
+default names (from the Garmin/Strava app) for easy runs, intentional custom
+names for quality sessions. The exact wording below is one user's setup (in
 Norwegian) — **replace the labels with whatever convention you use** in
 your own copy of this file.
 
@@ -30,7 +30,7 @@ regardless of distance**. The athlete labels intentionally — a quality
 session would have been renamed.
 
 The patterns above also match the `classification_hint` regexes in
-`strava_sync.py:name_hint()`. If you change naming conventions, update
+`garmin_sync.py:name_hint()`. If you change naming conventions, update
 both this file and the regex patterns there.
 
 ## Quality vs. easy (Marius Bakken framework)
@@ -82,18 +82,13 @@ return:
 
 ### Heart rate zones — how to compute time in zone
 
-The user uses the **Olympiatoppen 5-zone system** (% of max HR). Always read
-`coach://user_profile` for the current max HR and bpm boundaries — do NOT use
-whatever Strava has cached for zones (the user is on the free tier and can't
-edit Strava's stored zones, so they may be stale).
+Always read `coach://user_profile` (or call `get_athlete_profile`) for the
+current max HR and bpm boundaries — do NOT use zone values from any third-party
+app, which may be stale or calibrated differently.
 
-To compute time in zone for an activity:
-1. Pull HR stream via `get-activity-streams` with
-   `types=["time","heartrate"]` and `resolution="low"` (≈100 points is plenty
-   for aggregates and keeps payloads small for multi-activity summaries).
-2. Apply the zone bpm boundaries from `coach://user_profile`.
-3. For each consecutive sample pair (t[i], hr[i]) → (t[i+1], hr[i+1]), add
-   (t[i+1] − t[i]) seconds to the zone hr[i] falls in.
+To compute time in zone for an activity, use `activity_breakdown(activity_id)`.
+It returns pre-computed `zone_secs` and `zone_pcts` for the whole session, plus
+per-lap `zone_secs` for structured workouts — no manual stream processing needed.
 
 ## Target weekly zone distribution (rough guidance)
 
