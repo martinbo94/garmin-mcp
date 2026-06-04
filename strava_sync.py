@@ -1,72 +1,54 @@
-"""Strava sync + local cache.
+"""Garmin activity sync + local cache.
 
 On server startup (and via explicit `sync_activities` tool call) pulls new
-activities from Strava since the last sync, including HR streams for runs.
-Data lives in `coach_data/cache.db` so weekly summaries don't hit Strava
-on every query.
+activities from Garmin Connect since the last sync, including HR streams and
+lap data for runs. Data lives in `coach_data/cache.db` so weekly summaries
+and activity breakdowns don't hit the API on every query.
 """
 import json
 import os
 import re
 import sqlite3
-import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import httpx
-
 ROOT = Path(__file__).parent
-TOKEN_FILE = Path.home() / ".config" / "strava-mcp" / "config.json"
 DB_PATH = ROOT / "coach_data" / "cache.db"
 USER_PROFILE_PATH = ROOT / "coach_data" / "user_profile.md"
-STRAVA_API = "https://www.strava.com/api/v3"
-STRAVA_OAUTH = "https://www.strava.com/oauth/token"
 INITIAL_BACKFILL_WEEKS = 12
 
+# Garmin typeKey → sport_type label used in the cache and name_hint.
+_GARMIN_TYPE_MAP: dict[str, str] = {
+    "running": "Run",
+    "indoor_running": "Run",
+    "treadmill_running": "Run",
+    "trail_running": "Run",
+    "strength_training": "WeightTraining",
+    "indoor_cycling": "Ride",
+    "cycling": "Ride",
+    "mountain_biking": "Ride",
+    "hiking": "Hike",
+    "walking": "Walk",
+    "elliptical": "Workout",
+    "yoga": "Workout",
+    "swimming": "Swim",
+    "open_water_swimming": "Swim",
+    "skate_skiing_ws": "NordicSki",
+    "cross_country_skiing_ws": "NordicSki",
+    "resort_skiing_snowboarding_ws": "AlpineSki",
+    "rowing": "Rowing",
+}
 
-# ─── Token management ─────────────────────────────────────────────────
-def _load_tokens() -> dict:
-    if not TOKEN_FILE.exists():
-        raise RuntimeError(
-            f"Strava token file not found at {TOKEN_FILE}. "
-            "Run 'connect-strava' via the Strava MCP first."
-        )
-    return json.loads(TOKEN_FILE.read_text())
-
-
-def _save_tokens(tokens: dict) -> None:
-    TOKEN_FILE.write_text(json.dumps(tokens, indent=2))
-
-
-def _refresh_if_needed(tokens: dict) -> dict:
-    if tokens.get("expiresAt", 0) > time.time() + 60:
-        return tokens
-    client_id = os.environ.get("STRAVA_CLIENT_ID")
-    client_secret = os.environ.get("STRAVA_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise RuntimeError(
-            "Set STRAVA_CLIENT_ID and STRAVA_CLIENT_SECRET in .env for token refresh."
-        )
-    resp = httpx.post(STRAVA_OAUTH, data={
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "grant_type": "refresh_token",
-        "refresh_token": tokens["refreshToken"],
-    }, timeout=30)
-    resp.raise_for_status()
-    new = resp.json()
-    tokens.update({
-        "accessToken": new["access_token"],
-        "refreshToken": new["refresh_token"],
-        "expiresAt": new["expires_at"],
-    })
-    _save_tokens(tokens)
-    return tokens
-
-
-def _access_token() -> str:
-    return _refresh_if_needed(_load_tokens())["accessToken"]
+# Garmin intensityType → our lap_type tag.
+_INTENSITY_TYPE_MAP: dict[str, str] = {
+    "WARMUP": "wu",
+    "ACTIVE": "drag",
+    "INTERVAL": "drag",
+    "REST": "pause",
+    "RECOVERY": "pause",
+    "COOLDOWN": "cd",
+}
 
 
 # ─── SQLite cache ─────────────────────────────────────────────────────
@@ -178,50 +160,95 @@ def _activity_exists(act_id: int) -> bool:
         ).fetchone() is not None
 
 
-# ─── Strava API ───────────────────────────────────────────────────────
-def _strava_get(path: str, params: Optional[dict] = None, timeout: float = 30) -> Any:
-    resp = httpx.get(
-        f"{STRAVA_API}{path}",
-        headers={"Authorization": f"Bearer {_access_token()}"},
-        params=params or {},
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()
+# ─── Garmin activity API ──────────────────────────────────────────────
 
-
-def _list_activities_since(after: datetime) -> list[dict]:
-    """Paginate through activities with start_date > after."""
-    activities: list[dict] = []
-    page = 1
+def _garmin_list_activities(garmin_client, since: datetime) -> list[dict]:
+    """Return all activities newer than `since`, newest-first from Garmin."""
+    all_acts: list[dict] = []
+    since_ts = since.timestamp()
+    start = 0
+    batch_size = 100
     while True:
-        batch = _strava_get("/athlete/activities", {
-            "after": int(after.timestamp()),
-            "page": page,
-            "per_page": 100,
-        })
+        batch = garmin_client.get_activities(start, batch_size)
         if not batch:
             break
-        activities.extend(batch)
-        if len(batch) < 100:
+        done = False
+        for act in batch:
+            gmt = act.get("startTimeGMT", "")
+            try:
+                ts = datetime.strptime(gmt, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                ).timestamp()
+            except ValueError:
+                continue
+            if ts < since_ts:
+                done = True
+                break
+            all_acts.append(act)
+        if done or len(batch) < batch_size:
             break
-        page += 1
-    return activities
+        start += batch_size
+    return all_acts
 
 
-def _get_activity_detail(activity_id: int) -> dict:
-    return _strava_get(f"/activities/{activity_id}")
+def _garmin_get_stream(garmin_client, activity_id: int) -> Optional[dict]:
+    """Fetch ~2s-resolution HR+elapsed stream from Garmin activity details.
 
-
-def _get_activity_laps(activity_id: int) -> list[dict]:
-    """Fetch lap segments from Strava. Empty list if the activity has no laps."""
+    Returns {"time": [...elapsed_s...], "heartrate": [...bpm...]} or None.
+    maxchart=6000 covers ~3.3 hours at 2s/sample.
+    """
     try:
-        data = _strava_get(f"/activities/{activity_id}/laps")
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return []
-        raise
-    return data if isinstance(data, list) else []
+        details = garmin_client.get_activity_details(str(activity_id), maxchart=6000)
+    except Exception:
+        return None
+    descriptors = {
+        d["key"]: d["metricsIndex"]
+        for d in (details.get("metricDescriptors") or [])
+    }
+    metrics = details.get("activityDetailMetrics") or []
+    hr_idx = descriptors.get("directHeartRate")
+    elapsed_idx = descriptors.get("sumElapsedDuration")
+    if hr_idx is None or elapsed_idx is None or not metrics:
+        return None
+    elapsed_list: list[float] = []
+    hr_list: list[float] = []
+    for m in metrics:
+        vals = m.get("metrics", [])
+        hr = vals[hr_idx] if hr_idx < len(vals) else None
+        elapsed = vals[elapsed_idx] if elapsed_idx < len(vals) else None
+        if hr is not None and elapsed is not None:
+            elapsed_list.append(elapsed)
+            hr_list.append(hr)
+    return {"time": elapsed_list, "heartrate": hr_list} if hr_list else None
+
+
+def _garmin_get_laps(garmin_client, activity_id: int) -> list[dict]:
+    """Fetch lapDTOs from Garmin and normalise to our internal field names.
+
+    Normalised lap dict:
+      lap_index, average_heartrate, max_heartrate, distance, elapsed_time,
+      moving_time, average_speed, start_date_local, intensityType.
+    """
+    try:
+        splits = garmin_client.get_activity_splits(str(activity_id))
+        raw_laps = splits.get("lapDTOs") or []
+    except Exception:
+        return []
+    out = []
+    for lap in raw_laps:
+        speed = lap.get("averageMovingSpeed") or lap.get("averageSpeed") or 0
+        out.append({
+            "lap_index": lap.get("lapIndex"),
+            "average_heartrate": lap.get("averageHR"),
+            "max_heartrate": lap.get("maxHR"),
+            "distance": lap.get("distance"),
+            "elapsed_time": lap.get("elapsedDuration"),
+            "moving_time": lap.get("movingDuration") or lap.get("elapsedDuration"),
+            "average_speed": speed,
+            "start_date_local": (lap.get("startTimeGMT") or "").replace(".0", ""),
+            "intensityType": lap.get("intensityType"),
+        })
+    return out
 
 
 def _cached_laps(activity_id: int) -> Optional[list[dict]]:
@@ -243,40 +270,18 @@ def _store_laps(activity_id: int, laps: list[dict]) -> None:
         )
 
 
-def _get_activity_streams(activity_id: int) -> Optional[dict]:
-    """Time + heartrate at low resolution. None if no HR stream available."""
-    try:
-        data = _strava_get(
-            f"/activities/{activity_id}/streams",
-            {
-                "keys": "time,heartrate",
-                "key_by_type": "true",
-                "resolution": "low",
-                "series_type": "distance",
-            },
-        )
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 404:
-            return None
-        raise
-    if "heartrate" not in data:
-        return None
-    return {
-        "time": data["time"]["data"],
-        "heartrate": data["heartrate"]["data"],
-    }
-
-
 # ─── Sync ─────────────────────────────────────────────────────────────
-def run_sync(force_full: bool = False, weeks_back: Optional[int] = None) -> dict:
-    """Pull new activities + streams. Incremental unless force_full=True.
+def run_sync(
+    garmin_client,
+    force_full: bool = False,
+    weeks_back: Optional[int] = None,
+) -> dict:
+    """Pull new activities + streams + laps from Garmin into the local cache.
 
     Args:
+        garmin_client: Authenticated garminconnect.Garmin instance.
         force_full: If True, re-pull the default 12-week backfill window.
-        weeks_back: Optional explicit backfill window in weeks. When set,
-            overrides the incremental path and pulls the last N weeks
-            (used to extend history beyond the default 12 weeks, e.g. for
-            year-long trajectory analysis). Implies force_full behavior.
+        weeks_back: Optional explicit backfill window in weeks.
     """
     _init_db()
 
@@ -290,64 +295,83 @@ def run_sync(force_full: bool = False, weeks_back: Optional[int] = None) -> dict
     sync_start = datetime.now(timezone.utc)
 
     try:
-        activities = _list_activities_since(after)
+        activities = _garmin_list_activities(garmin_client, after)
     except Exception as e:
         return {"error": f"Failed to fetch activity list: {type(e).__name__}: {e}"}
 
     new_count = 0
     streams_count = 0
+    laps_count = 0
     errors: list[str] = []
 
     for act in activities:
-        if _activity_exists(act["id"]):
+        act_id = act["activityId"]
+        if _activity_exists(act_id):
             continue
-        try:
-            detail = _get_activity_detail(act["id"])
-        except Exception as e:
-            errors.append(f"detail {act['id']}: {e}")
-            continue
+
+        type_key = (act.get("activityType") or {}).get("typeKey", "")
+        sport_type = _GARMIN_TYPE_MAP.get(type_key, type_key)
+        # startTimeLocal: "2026-06-02 07:32:21" → store as ISO with T
+        local_str = (act.get("startTimeLocal") or "").replace(" ", "T")
 
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 """
-                INSERT INTO activities (
+                INSERT OR IGNORE INTO activities (
                     id, start_date_local, name, description, type, sport_type,
                     distance_m, moving_time_s, elapsed_time_s, avg_hr, max_hr,
                     total_elevation_gain, synced_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    act["id"], act["start_date_local"], act["name"],
-                    detail.get("description"),
-                    act.get("type"), act.get("sport_type"),
-                    act.get("distance"), act.get("moving_time"),
-                    act.get("elapsed_time"),
-                    act.get("average_heartrate"), act.get("max_heartrate"),
-                    act.get("total_elevation_gain"),
+                    act_id, local_str,
+                    act.get("activityName") or "",
+                    None,  # Garmin list API has no description; acceptable
+                    sport_type, sport_type,
+                    act.get("distance"),
+                    act.get("movingDuration"),
+                    act.get("duration"),
+                    act.get("averageHR"),
+                    act.get("maxHR"),
+                    act.get("elevationGain"),
                     sync_start.isoformat(),
                 ),
             )
         new_count += 1
 
-        if act.get("type") == "Run" and act.get("has_heartrate"):
+        is_run = sport_type == "Run"
+        has_hr = bool(act.get("averageHR"))
+
+        if is_run and has_hr:
             try:
-                streams = _get_activity_streams(act["id"])
+                stream = _garmin_get_stream(garmin_client, act_id)
             except Exception as e:
-                errors.append(f"stream {act['id']}: {e}")
-                continue
-            if streams:
+                errors.append(f"stream {act_id}: {e}")
+                stream = None
+            if stream:
                 with sqlite3.connect(DB_PATH) as conn:
                     conn.execute(
-                        "INSERT INTO streams (activity_id, time_json, hr_json) VALUES (?, ?, ?)",
-                        (act["id"], json.dumps(streams["time"]), json.dumps(streams["heartrate"])),
+                        "INSERT OR IGNORE INTO streams (activity_id, time_json, hr_json) VALUES (?, ?, ?)",
+                        (act_id, json.dumps(stream["time"]), json.dumps(stream["heartrate"])),
                     )
                 streams_count += 1
+
+        if is_run:
+            try:
+                laps = _garmin_get_laps(garmin_client, act_id)
+            except Exception as e:
+                errors.append(f"laps {act_id}: {e}")
+                laps = []
+            if laps:
+                _store_laps(act_id, laps)
+                laps_count += 1
 
     _set_last_sync(sync_start)
 
     return {
         "new_activities": new_count,
         "streams_fetched": streams_count,
+        "laps_fetched": laps_count,
         "errors": errors,
         "last_sync": sync_start.isoformat(),
         "since": after.isoformat(),
@@ -853,6 +877,9 @@ def _classify_laps(
 ) -> list[dict]:
     """Tag each lap with type: drag, pause, wu, cd, or easy.
 
+    Garmin laps: uses intensityType directly (WARMUP→wu, ACTIVE/INTERVAL→drag,
+    REST/RECOVERY→pause, COOLDOWN→cd). Falls back to heuristic when absent.
+
     Heuristic (two-pass):
     - Primary: a lap is a "drag" if avg_hr is in Z3+ AND moving_time >= 30s.
     - HR-lag rescue: if a lap has max_hr in Z3+ AND its pace is within
@@ -864,6 +891,19 @@ def _classify_laps(
     - Otherwise: laps before first drag = "wu", after last drag = "cd",
       between drags = "pause".
     """
+    # Fast path: Garmin structured laps with intensityType.
+    # Only use when the workout has structural diversity (at least one
+    # non-ACTIVE lap), which confirms it's a programmed session, not a
+    # continuous easy run where every lap is just ACTIVE/INTERVAL.
+    non_active = {"WARMUP", "COOLDOWN", "REST", "RECOVERY"}
+    if laps and all(lap.get("intensityType") for lap in laps) and any(
+        lap["intensityType"] in non_active for lap in laps
+    ):
+        out = []
+        for lap in laps:
+            t = _INTENSITY_TYPE_MAP.get(lap["intensityType"], "easy")
+            out.append({**lap, "lap_type": t})
+        return out
     if not laps:
         return []
 
@@ -959,13 +999,24 @@ def _lap_zone_secs(
 def _summarize_laps(
     laps: list[dict],
     activity_start_s: Optional[float] = None,
-    times: Optional[list[int]] = None,
-    hrs: Optional[list[int]] = None,
+    times: Optional[list] = None,
+    hrs: Optional[list] = None,
     zones: Optional[list[tuple[int, int, str]]] = None,
 ) -> list[dict]:
     """Compact lap summary for the report (only fields a coach needs)."""
-    summary = []
+    # Precompute cumulative elapsed offsets for zone-window slicing.
+    # Garmin streams use elapsed-from-zero, so we can slice by lap duration
+    # without relying on timestamps. Strava streams also start at t=0.
+    cumulative = 0.0
+    lap_offsets: list[tuple[float, float]] = []
     for lap in laps:
+        start = cumulative
+        dur = lap.get("elapsed_time") or 0
+        cumulative += dur
+        lap_offsets.append((start, start + dur))
+
+    summary = []
+    for lap, (offset_start, offset_end) in zip(laps, lap_offsets):
         moving = lap.get("moving_time") or 0
         dist = lap.get("distance") or 0
         avg_speed = lap.get("average_speed") or 0
@@ -979,10 +1030,36 @@ def _summarize_laps(
             "avg_hr": lap.get("average_heartrate"),
             "max_hr": lap.get("max_heartrate"),
         }
-        if activity_start_s is not None and times is not None and hrs is not None and zones is not None:
-            entry["zone_secs"] = _lap_zone_secs(lap, activity_start_s, times, hrs, zones)
+        if times is not None and hrs is not None and zones is not None:
+            entry["zone_secs"] = _lap_zone_secs_by_offset(
+                offset_start, offset_end, times, hrs, zones
+            )
         summary.append(entry)
     return summary
+
+
+def _lap_zone_secs_by_offset(
+    offset_start: float,
+    offset_end: float,
+    times: list,
+    hrs: list,
+    zones: list[tuple[int, int, str]],
+) -> dict:
+    """Slice per-zone seconds from a stream using elapsed-time offsets."""
+    secs = {z[2]: 0 for z in zones}
+    for i in range(len(times) - 1):
+        t = times[i]
+        if t < offset_start:
+            continue
+        if t >= offset_end:
+            break
+        dt = times[i + 1] - t
+        hr = hrs[i]
+        for low, high, zname in zones:
+            if low <= hr <= high:
+                secs[zname] += dt
+                break
+    return secs
 
 
 def _session_category(
@@ -1116,29 +1193,13 @@ def activity_breakdown(activity_id: int) -> dict:
 
     laps_raw = _cached_laps(activity_id)
     if laps_raw is None:
-        try:
-            laps_raw = _get_activity_laps(activity_id)
-            _store_laps(activity_id, laps_raw)
-        except Exception as e:
-            laps_raw = []
-            lap_fetch_error = f"{type(e).__name__}: {e}"
-        else:
-            lap_fetch_error = None
+        laps_raw = []
+        lap_fetch_error = "Laps not in cache — run sync_activities() to populate."
     else:
         lap_fetch_error = None
 
-    # Parse activity start as UTC epoch for lap time-window alignment.
-    activity_start_s: Optional[float] = None
-    try:
-        from datetime import datetime, timezone as tz
-        activity_start_s = datetime.strptime(
-            row["start_date_local"].replace("+00:00", "Z"), "%Y-%m-%dT%H:%M:%SZ"
-        ).replace(tzinfo=tz.utc).timestamp()
-    except Exception:
-        pass
-
     classified = _classify_laps(laps_raw, zones)
-    lap_summary = _summarize_laps(classified, activity_start_s, stream_times, stream_hrs, zones)
+    lap_summary = _summarize_laps(classified, None, stream_times, stream_hrs, zones)
     drag_laps = [lap for lap in classified if lap.get("lap_type") == "drag"]
     session_category = _session_category(zone_pcts, drag_laps, zones)
 
