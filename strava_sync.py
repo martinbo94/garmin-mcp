@@ -913,7 +913,56 @@ def _classify_laps(
     return out
 
 
-def _summarize_laps(laps: list[dict]) -> list[dict]:
+def _lap_zone_secs(
+    lap: dict,
+    activity_start_s: float,
+    times: list[int],
+    hrs: list[int],
+    zones: list[tuple[int, int, str]],
+) -> Optional[dict]:
+    """Compute per-zone seconds for one lap using elapsed-time windows.
+
+    Uses the lap's start_date + elapsed_time to find which stream samples
+    fall within the lap. Resolution-independent — works whether the stream
+    is downsampled (100 pts) or full per-second.
+    """
+    from datetime import datetime, timezone as tz
+    lap_start_str = lap.get("start_date_local") or lap.get("start_date")
+    elapsed = lap.get("elapsed_time")
+    if not lap_start_str or elapsed is None or not times or not hrs:
+        return None
+    try:
+        lap_start_utc = datetime.strptime(
+            lap_start_str.replace("+00:00", "Z"), "%Y-%m-%dT%H:%M:%SZ"
+        )
+        lap_offset_start = lap_start_utc.replace(tzinfo=tz.utc).timestamp() - activity_start_s
+    except Exception:
+        return None
+    lap_offset_end = lap_offset_start + elapsed
+
+    secs = {z[2]: 0 for z in zones}
+    for i in range(len(times) - 1):
+        t = times[i]
+        if t < lap_offset_start:
+            continue
+        if t >= lap_offset_end:
+            break
+        dt = times[i + 1] - t
+        hr = hrs[i]
+        for low, high, zname in zones:
+            if low <= hr <= high:
+                secs[zname] += dt
+                break
+    return secs
+
+
+def _summarize_laps(
+    laps: list[dict],
+    activity_start_s: Optional[float] = None,
+    times: Optional[list[int]] = None,
+    hrs: Optional[list[int]] = None,
+    zones: Optional[list[tuple[int, int, str]]] = None,
+) -> list[dict]:
     """Compact lap summary for the report (only fields a coach needs)."""
     summary = []
     for lap in laps:
@@ -921,7 +970,7 @@ def _summarize_laps(laps: list[dict]) -> list[dict]:
         dist = lap.get("distance") or 0
         avg_speed = lap.get("average_speed") or 0
         pace_s_per_km = round(1000 / avg_speed, 1) if avg_speed > 0 else None
-        summary.append({
+        entry: dict = {
             "lap_index": lap.get("lap_index"),
             "type": lap.get("lap_type"),
             "distance_m": round(dist),
@@ -929,7 +978,10 @@ def _summarize_laps(laps: list[dict]) -> list[dict]:
             "pace_s_per_km": pace_s_per_km,
             "avg_hr": lap.get("average_heartrate"),
             "max_hr": lap.get("max_heartrate"),
-        })
+        }
+        if activity_start_s is not None and times is not None and hrs is not None and zones is not None:
+            entry["zone_secs"] = _lap_zone_secs(lap, activity_start_s, times, hrs, zones)
+        summary.append(entry)
     return summary
 
 
@@ -1042,12 +1094,14 @@ def activity_breakdown(activity_id: int) -> dict:
 
     zone_secs = {z[2]: 0 for z in zones}
     below_z1 = 0
+    stream_times: Optional[list[int]] = None
+    stream_hrs: Optional[list[int]] = None
     if row["time_json"] and row["hr_json"]:
-        times = json.loads(row["time_json"])
-        hrs = json.loads(row["hr_json"])
-        for i in range(len(times) - 1):
-            dt = times[i + 1] - times[i]
-            hr = hrs[i]
+        stream_times = json.loads(row["time_json"])
+        stream_hrs = json.loads(row["hr_json"])
+        for i in range(len(stream_times) - 1):
+            dt = stream_times[i + 1] - stream_times[i]
+            hr = stream_hrs[i]
             placed = False
             for low, high, zname in zones:
                 if low <= hr <= high:
@@ -1073,8 +1127,18 @@ def activity_breakdown(activity_id: int) -> dict:
     else:
         lap_fetch_error = None
 
+    # Parse activity start as UTC epoch for lap time-window alignment.
+    activity_start_s: Optional[float] = None
+    try:
+        from datetime import datetime, timezone as tz
+        activity_start_s = datetime.strptime(
+            row["start_date_local"].replace("+00:00", "Z"), "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=tz.utc).timestamp()
+    except Exception:
+        pass
+
     classified = _classify_laps(laps_raw, zones)
-    lap_summary = _summarize_laps(classified)
+    lap_summary = _summarize_laps(classified, activity_start_s, stream_times, stream_hrs, zones)
     drag_laps = [lap for lap in classified if lap.get("lap_type") == "drag"]
     session_category = _session_category(zone_pcts, drag_laps, zones)
 
