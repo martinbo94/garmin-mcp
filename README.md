@@ -49,29 +49,61 @@ doesn't re-hit the API on every query.
 
 ### Requirements
 
-- Python 3.10+
+- Python 3.10+ ([download](https://www.python.org/downloads/))
 - Garmin Connect account — **no MFA** (see caveat below)
-- Claude Code CLI (`claude`)
+- Claude Desktop ([download](https://claude.ai/download)) **or** Claude Code CLI
 
-### Install
+### Quick setup (Mac)
+
+Open **Terminal** (search "Terminal" in Spotlight) and run these three commands,
+replacing the path in the last one with wherever you cloned the repo:
 
 ```bash
-git clone <this-repo> garmin-coach-mcp
+# 1. Install Git if you don't have it (opens Xcode tools installer)
+git --version
+
+# 2. Clone the repo
+git clone https://github.com/<owner>/garmin-coach-mcp.git
 cd garmin-coach-mcp
-python -m venv .venv
-.venv/bin/pip install -r requirements.txt
+
+# 3. Run the setup script — installs dependencies and registers with Claude Desktop
+bash setup.sh
 ```
 
-Create `.env` from the example:
+The script:
+- Installs Python dependencies into a local `.venv` folder
+- Creates a `.env` file for your credentials
+- Adds the server to Claude Desktop's config automatically
+
+After it finishes:
+1. Open `.env` in any text editor and fill in your Garmin email and password
+2. Restart Claude Desktop
+3. Start a new chat and say **"Let's set up my profile"**
+
+### Manual setup (Claude Code or Windows)
 
 ```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 cp .env.example .env
-# edit .env — fill in your Garmin email and password
+# edit .env with your Garmin credentials
 ```
 
-### Register the MCP with Claude Code
+**Claude Desktop** — add to
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
 
-Replace `<repo>` with the absolute path to your clone:
+```json
+{
+  "mcpServers": {
+    "garmin-coach": {
+      "command": "/absolute/path/to/garmin-coach-mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/garmin-coach-mcp/server.py"]
+    }
+  }
+}
+```
+
+**Claude Code** — run once:
 
 ```bash
 claude mcp add -s user garmin-coach -- \
