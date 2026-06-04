@@ -973,10 +973,10 @@ def delete_workout_template(workout_id: int) -> str:
     return f"Deleted workout {workout_id}."
 
 
-# ─── Strava sync + weekly summary (reads local cache) ──────────────────
+# ─── Activity sync + weekly summary (reads local cache) ────────────────
 @mcp.tool()
 def sync_activities(force_full: bool = False, weeks_back: Optional[int] = None) -> dict:
-    """Pull new activities + HR streams from Strava into the local cache.
+    """Pull new activities + HR streams + laps from Garmin into the local cache.
 
     Runs incrementally since the last sync. First-time sync backfills the
     last 12 weeks of activities; subsequent runs are cheap and just fetch
@@ -992,9 +992,9 @@ def sync_activities(force_full: bool = False, weeks_back: Optional[int] = None) 
             than what's cached).
 
     Returns dict with new_activities count, streams_fetched count,
-    last_sync timestamp, and any per-activity errors encountered.
+    laps_fetched count, last_sync timestamp, and any per-activity errors.
     """
-    return strava_sync.run_sync(force_full=force_full, weeks_back=weeks_back)
+    return strava_sync.run_sync(_client(), force_full=force_full, weeks_back=weeks_back)
 
 
 @mcp.tool()
@@ -1531,11 +1531,12 @@ def weekly_retrospective(week_start: str) -> dict:
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
-        result = strava_sync.run_sync()
+        result = strava_sync.run_sync(_client())
         if result.get("new_activities") or result.get("errors"):
             print(
                 f"[startup-sync] {result.get('new_activities', 0)} new, "
                 f"{result.get('streams_fetched', 0)} streams, "
+                f"{result.get('laps_fetched', 0)} laps, "
                 f"{len(result.get('errors', []))} errors",
                 file=sys.stderr,
             )
