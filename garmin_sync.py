@@ -292,7 +292,7 @@ def clear_activity_cache() -> None:
     """Drop and recreate activities, streams, and laps tables.
 
     Wellness data is preserved. Call before a full Garmin re-sync to remove
-    stale Strava-sourced rows or duplicate entries.
+    stale or duplicate entries from previous syncs.
     """
     _init_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -1044,7 +1044,7 @@ def _summarize_laps(
     """Compact lap summary for the report (only fields a coach needs)."""
     # Precompute cumulative elapsed offsets for zone-window slicing.
     # Garmin streams use elapsed-from-zero, so we can slice by lap duration
-    # without relying on timestamps. Strava streams also start at t=0.
+    # without relying on timestamps. Both Garmin and Strava elapsed arrays start at t=0.
     cumulative = 0.0
     lap_offsets: list[tuple[float, float]] = []
     for lap in laps:
@@ -1180,7 +1180,7 @@ def activity_breakdown(activity_id: int) -> dict:
     Returns metadata, per-lap classification (drag/pause/wu/cd/easy),
     HR-zone time/percent, and a heuristic session_category.
 
-    Laps are fetched from Strava on first call and cached locally.
+    Laps are fetched from Garmin at sync time and cached locally.
     """
     _init_db()
     zones = _parse_zones()

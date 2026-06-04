@@ -10,7 +10,7 @@ workouts) that maps 1:1 to the `create_continuous_run` /
 
 Materialization (pushing the plan to Garmin) lives in server.py since it
 needs the Garmin client + workout builders. This module handles plan I/O
-and plan-vs-actual comparison against the Strava cache.
+and plan-vs-actual comparison against the Garmin cache.
 """
 import json
 import sqlite3
@@ -261,7 +261,7 @@ def _estimated_km(workout: dict) -> Optional[float]:
 def _get_actuals_in_range(start_date: str, end_date: str) -> list[dict]:
     """Pull cached activities (with classification hint) in a date range."""
     # Imported here to avoid a top-level circular import with server.py.
-    from strava_sync import name_hint
+    from garmin_sync import name_hint
 
     if not DB_PATH.exists():
         return []

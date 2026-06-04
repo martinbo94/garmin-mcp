@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv(Path(__file__).parent / ".env")
 
-import garmin_sync as strava_sync  # noqa: E402  (must load after dotenv so token refresh works)
+import garmin_sync  # noqa: E402  (must load after dotenv so token refresh works)
 import plan as plan_mod  # noqa: E402
 
 SERVER_INSTRUCTIONS = """
@@ -344,7 +344,7 @@ def _parse_athlete_profile() -> dict:
     # is the only place its pattern matches).
     zones = []
     try:
-        for low, high, name in strava_sync._parse_zones():
+        for low, high, name in garmin_sync._parse_zones():
             zones.append({"name": name, "low": low, "high": None if high >= 9999 else high})
     except Exception:
         pass
@@ -432,9 +432,9 @@ def get_athlete_profile() -> dict:
     - `race_prs`: list of {distance, time, pace, date}
     - `pace_estimates`: {effort_name: pace_string} (easy, sub-threshold, etc.)
 
-    NEVER substitute Strava's athlete zones for these values. Strava's max
-    HR is typically a recent race HR (not the user's true max), so its
-    zone boundaries are systematically 5-10 bpm low. Always anchor zone
+    NEVER substitute zones from third-party apps for these values — they
+    may use different calibration methods or be based on a recent race HR
+    rather than the user's true max. Always anchor zone
     reasoning to this tool's output.
     """
     return _parse_athlete_profile()
@@ -584,7 +584,7 @@ def user_profile() -> str:
     test data, race PRs, derived HR target bands, and pace ↔ HR mappings.
 
     Read this before any HR zone analysis or workout-prescription work —
-    these values override whatever Strava has cached.
+    these values are the source of truth for HR zones.
     """
     return (_COACH_DATA / "user_profile.md").read_text(encoding="utf-8")
 
@@ -985,18 +985,18 @@ def sync_activities(force_full: bool = False, weeks_back: Optional[int] = None) 
     Returns dict with new_activities count, streams_fetched count,
     laps_fetched count, last_sync timestamp, and any per-activity errors.
     """
-    return strava_sync.run_sync(_client(), force_full=force_full, weeks_back=weeks_back)
+    return garmin_sync.run_sync(_client(), force_full=force_full, weeks_back=weeks_back)
 
 
 @mcp.tool()
 def weekly_summary(start_date: str, end_date: str) -> dict:
-    """Per-week training summary from the local Strava cache.
+    """Per-week training summary from the local Garmin cache.
 
     Returns `{"weeks": [...], "coverage": {...}}`. Each week entry covers
     one Monday-Sunday week and contains total distance, run count, time
     in each HR zone (computed from raw streams using current bpm
     boundaries from `get_athlete_profile` / coach://user_profile — NOT
-    Strava's athlete zones), and the list of activities with names,
+    the local cache zones), and the list of activities with names,
     descriptions, distance, HR, and a `classification_hint` derived
     from naming patterns.
 
@@ -1010,7 +1010,7 @@ def weekly_summary(start_date: str, end_date: str) -> dict:
         start_date: 'YYYY-MM-DD' (inclusive)
         end_date:   'YYYY-MM-DD' (inclusive)
     """
-    return strava_sync.weekly_summary(start_date, end_date)
+    return garmin_sync.weekly_summary(start_date, end_date)
 
 
 # ─── Training plan: load, save, materialize, compare ──────────────────
@@ -1218,7 +1218,7 @@ def compare_plan_vs_actual(start_date: str, end_date: str) -> dict:
     """Compare planned workouts against actual cached activities.
 
     Matches each planned workout on its date with the actual activity from
-    Strava (via the local cache). Medium strictness: type must match
+    Garmin (via the local cache). Medium strictness: type must match
     (via classification_hint), distance within ±15%. Returns per-workout
     status plus a summary count.
 
@@ -1280,10 +1280,10 @@ def get_gear_for_activity(activity_id: int) -> dict:
     shoes were on yesterday's run?", "which shoe has the most threshold
     work on it?").
 
-    NOTE: takes a **Garmin** activity_id, not the Strava ID used elsewhere
+    NOTE: takes a Garmin activity_id
     in this MCP. Find it in the Garmin Connect URL
     (`connect.garmin.com/modern/activity/<id>`) or via python-garminconnect's
-    `get_activities()`. Passing a Strava ID will 403.
+    `get_activities()`.
     """
     return _client().get_activity_gear(activity_id)
 
@@ -1292,11 +1292,11 @@ def get_gear_for_activity(activity_id: int) -> dict:
 @mcp.tool()
 def activity_breakdown(activity_id: int) -> dict:
     """**First-line tool for analyzing a single completed activity.** Use
-    this before reaching for raw Strava streams — it returns the lap
+    this before reaching for raw activity data — it returns the lap
     structure, HR-zone distribution, and a heuristic session category in
     one call, all anchored to the user's current HR zones from
-    `get_athlete_profile` / coach://user_profile (NOT Strava's zones,
-    which are systematically shifted because Strava's max HR is a recent
+    `get_athlete_profile` / coach://user_profile (NOT zones from third-party apps,
+    which may be stale or calibrated differently.
     race HR rather than the user's true max).
 
     Returns:
@@ -1313,14 +1313,14 @@ def activity_breakdown(activity_id: int) -> dict:
       the plan. Refine ambiguous edges via coach://classification.
     - `classification_hint`: name-pattern hint (deterministic 90% case).
 
-    The activity must be in the local Strava cache. If `error` is
+    The activity must be in the local cache. If `error` is
     returned with `next_steps`, call `sync_activities()` (or
     `sync_activities(weeks_back=N)` for older activities) and retry.
-    Laps are fetched lazily from Strava on first call and cached.
+    Laps are cached from Garmin at sync time.
 
-    Strava ID, not Garmin ID.
+    Garmin activity_id.
     """
-    return strava_sync.activity_breakdown(activity_id)
+    return garmin_sync.activity_breakdown(activity_id)
 
 
 @mcp.tool()
@@ -1361,10 +1361,10 @@ def get_wellness_history(
     null for that field. Call with `force_refetch=True` for the relevant
     range to backfill.
     """
-    sync_result = strava_sync.sync_wellness_range(
+    sync_result = garmin_sync.sync_wellness_range(
         _client(), start_date, end_date, force_refetch=force_refetch
     )
-    data = strava_sync.wellness_history(start_date, end_date)
+    data = garmin_sync.wellness_history(start_date, end_date)
     data["sync"] = sync_result
     return data
 
@@ -1469,7 +1469,7 @@ def morning_check_in() -> dict:
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
 
-    wellness = strava_sync.morning_check_in_data(
+    wellness = garmin_sync.morning_check_in_data(
         g, today.isoformat(), yesterday.isoformat(), history_start, history_end,
     )
 
@@ -1506,7 +1506,7 @@ def weekly_retrospective(week_start: str) -> dict:
     from datetime import date as _date, timedelta as _td
     start = _date.fromisoformat(week_start)
     end = start + _td(days=6)
-    result = strava_sync.weekly_summary(start.isoformat(), end.isoformat())
+    result = garmin_sync.weekly_summary(start.isoformat(), end.isoformat())
     weeks = result["weeks"]
     return {
         "week_start": week_start,
@@ -1522,7 +1522,7 @@ def weekly_retrospective(week_start: str) -> dict:
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
-        result = strava_sync.run_sync(_client())
+        result = garmin_sync.run_sync(_client())
         if result.get("new_activities") or result.get("errors"):
             print(
                 f"[startup-sync] {result.get('new_activities', 0)} new, "

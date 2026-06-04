@@ -16,13 +16,13 @@ Example convention:
 
 | Category | Naming pattern |
 |---|---|
-| Easy run | Default Strava names: "Morning Run", "Afternoon Run", "Lunch Run", "Evening Run" (often with 🏃‍♂️ / 🏃 emoji). Not renamed. |
+| Easy run | Default names from device/app: "Morning Run", "Afternoon Run", "Lunch Run", "Evening Run" (often with 🏃‍♂️ / 🏃 emoji). Not renamed. |
 | Long run | "Langtur" / "Long Run". Aerobic base — **NOT quality**. |
 | Progressive long run | "Progressiv langtur". **Counts as quality.** |
 | Threshold intervals | "Terskelintervaller" / "Terskel" / "Subterskel". **Cornerstone of the plan — Bakken method.** |
 | Tempo | "Tempo" or "Xkm tempo" (e.g. "4km tempo"). Sustained sub-threshold effort with no rests. **Counts as threshold work.** |
 | VO2max intervals | "Intervaller" / "Intervals" / "VO2" / "VO2max" (without a "terskel" qualifier). |
-| Strength | Strava activity type = WeightTraining, or name contains "styrke" / "weight training" / "strength". |
+| Strength | Activity type = WeightTraining, or name contains "styrke" / "weight training" / "strength". |
 | Other | Hike, Walk, Ride, etc. Log but exclude from running volume. |
 
 **If the name is default** ("Afternoon Run"), classify as **easy
