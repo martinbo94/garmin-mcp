@@ -1931,11 +1931,12 @@ def progress_report(
 ) -> dict:
     """Compare the same session type over time to track fitness progress.
 
-    Queries the local activity cache and filters sessions matching the
-    requested type via name-based classification. For each matching session
-    returns date, name, distance, avg HR, duration, and pace. Computes a
-    trend summary by comparing the first half vs second half of the range
-    — improving HR efficiency shows as pace improving at the same or lower HR.
+    For interval/threshold sessions, metrics are derived from work-rep
+    (drag) laps only — warmup, cooldown, and rest laps are excluded so
+    the comparison isn't diluted by session structure differences.
+
+    For continuous sessions (easy, long, tempo) the whole-session avg HR
+    and pace are used since there are no meaningful lap divisions.
 
     Args:
         session_type: One of 'threshold', 'intervals', 'long', 'easy', 'tempo'.
@@ -1943,150 +1944,170 @@ def progress_report(
         end_date:   'YYYY-MM-DD' (inclusive). Defaults to today.
 
     Returns:
-    - `sessions`: up to 50 most recent matching sessions (date, name,
-      distance_km, avg_hr, moving_time_s, pace_s_per_km, classification_hint).
-    - `trend`: first_half vs second_half comparison of avg_hr, avg_pace,
-      count, plus an `assessment` label: 'improving', 'stable', or 'declining'.
-    - `session_type`: the queried type.
-    - `date_range`: effective start/end dates used.
-    - `note`: human-readable summary.
-
-    This helps answer "is my threshold pace improving at the same HR over time?"
-    Requires activities in the local cache — call sync_activities() if data
-    appears to be missing.
+    - `sessions`: up to 50 matching sessions, chronologically ordered.
+      For intervals/threshold: `avg_hr` and `pace_s_per_km` are drag-lap
+      averages; `drag_count` shows how many reps were found.
+      For easy/long/tempo: whole-session values.
+    - `trend`: first_half vs second_half comparison with `assessment`
+      ('improving' / 'stable' / 'declining').
+    - `data_source`: 'drag_laps' or 'session_avg' — tells you which signal
+      the trend is based on.
+    - `note`: human-readable summary including pace-interpretation caveat
+      for interval sessions (pace varies with rep length, focus on HR trend).
     """
     import sqlite3 as _sqlite3
+    import json as _json
     from datetime import date as _date, timedelta as _td
+
+    _INTERVAL_TYPES = {"threshold", "intervals"}
+    _type_aliases = {
+        "threshold": {"threshold"},
+        "intervals": {"intervals"},
+        "long": {"long", "prog-long"},
+        "easy": {"easy"},
+        "tempo": {"tempo"},
+    }
 
     try:
         today = _date.today()
         effective_end = end_date or today.isoformat()
         effective_start = start_date or (today - _td(days=90)).isoformat()
-
-        # Aliases: 'tempo' maps to the same name_hint label
-        _type_aliases = {
-            "threshold": {"threshold"},
-            "intervals": {"intervals"},
-            "long": {"long", "prog-long"},
-            "easy": {"easy"},
-            "tempo": {"tempo"},
-        }
         target_hints = _type_aliases.get(session_type, {session_type})
+        use_drag_laps = session_type in _INTERVAL_TYPES
 
         with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
             conn.row_factory = _sqlite3.Row
             rows = conn.execute(
                 """
-                SELECT id, start_date_local, name, sport_type,
-                       distance_m, moving_time_s, avg_hr
-                FROM activities
-                WHERE date(start_date_local) BETWEEN ? AND ?
-                  AND sport_type = 'Run'
-                ORDER BY start_date_local DESC
+                SELECT a.id, a.start_date_local, a.name, a.sport_type,
+                       a.distance_m, a.moving_time_s, a.avg_hr,
+                       l.laps_json
+                FROM activities a
+                LEFT JOIN laps l ON l.activity_id = a.id
+                WHERE date(a.start_date_local) BETWEEN ? AND ?
+                  AND a.sport_type = 'Run'
+                ORDER BY a.start_date_local DESC
                 LIMIT 500
                 """,
                 (effective_start, effective_end),
             ).fetchall()
 
+        zones = garmin_sync._parse_zones()
         sessions = []
+
         for r in rows:
             hint = garmin_sync.name_hint(r["name"], r["sport_type"])
             if hint not in target_hints:
                 continue
+
             dist_m = r["distance_m"] or 0
-            dist_km = round(dist_m / 1000, 2) if dist_m else None
             time_s = r["moving_time_s"]
-            pace = (
-                round(time_s / (dist_m / 1000))
-                if (time_s and dist_m and dist_m > 0)
-                else None
-            )
-            sessions.append({
+
+            if use_drag_laps and r["laps_json"]:
+                # Use drag-lap averages — excludes wu/cd/pause
+                raw_laps = _json.loads(r["laps_json"])
+                classified = garmin_sync._classify_laps(raw_laps, zones)
+                drag_laps = [l for l in classified if l.get("lap_type") == "drag"]
+
+                if not drag_laps:
+                    # No drags found — fall back to session avg with a flag
+                    avg_hr = r["avg_hr"]
+                    pace = round(time_s / (dist_m / 1000)) if (time_s and dist_m) else None
+                    drag_count = 0
+                    source = "session_avg_fallback"
+                else:
+                    hrs = [l["average_heartrate"] for l in drag_laps if l.get("average_heartrate")]
+                    paces = [
+                        round(1000 / l["average_speed"])
+                        for l in drag_laps
+                        if (l.get("average_speed") or 0) > 0
+                    ]
+                    avg_hr = round(sum(hrs) / len(hrs), 1) if hrs else None
+                    pace = round(sum(paces) / len(paces)) if paces else None
+                    drag_count = len(drag_laps)
+                    source = "drag_laps"
+            else:
+                # Continuous session or no lap data
+                avg_hr = r["avg_hr"]
+                pace = round(time_s / (dist_m / 1000)) if (time_s and dist_m) else None
+                drag_count = None
+                source = "session_avg"
+
+            entry: dict = {
                 "date": r["start_date_local"][:10],
                 "name": r["name"],
-                "distance_km": dist_km,
-                "avg_hr": r["avg_hr"],
+                "distance_km": round(dist_m / 1000, 2) if dist_m else None,
+                "avg_hr": avg_hr,
                 "moving_time_s": time_s,
                 "pace_s_per_km": pace,
-                "classification_hint": hint,
-            })
+                "data_source": source,
+            }
+            if drag_count is not None:
+                entry["drag_count"] = drag_count
+            sessions.append(entry)
             if len(sessions) >= 50:
                 break
 
-        # Sessions are newest-first; reverse to chronological order for trend math
         sessions_chrono = list(reversed(sessions))
 
         def _halves_stats(items):
-            """Return (avg_hr, avg_pace, count) for a list of session dicts."""
-            hrs = [s["avg_hr"] for s in items if s["avg_hr"] is not None]
-            paces = [s["pace_s_per_km"] for s in items if s["pace_s_per_km"] is not None]
-            avg_hr = round(sum(hrs) / len(hrs), 1) if hrs else None
-            avg_pace = round(sum(paces) / len(paces)) if paces else None
-            return {"avg_hr": avg_hr, "avg_pace_s_per_km": avg_pace, "count": len(items)}
+            hrs = [s["avg_hr"] for s in items if s.get("avg_hr") is not None]
+            paces = [s["pace_s_per_km"] for s in items if s.get("pace_s_per_km") is not None]
+            return {
+                "avg_hr": round(sum(hrs) / len(hrs), 1) if hrs else None,
+                "avg_pace_s_per_km": round(sum(paces) / len(paces)) if paces else None,
+                "count": len(items),
+            }
 
         trend: dict = {}
         if len(sessions_chrono) >= 2:
             mid = len(sessions_chrono) // 2
-            first_half = sessions_chrono[:mid]
-            second_half = sessions_chrono[mid:]
-            first_stats = _halves_stats(first_half)
-            second_stats = _halves_stats(second_half)
+            fh = _halves_stats(sessions_chrono[:mid])
+            sh = _halves_stats(sessions_chrono[mid:])
 
-            # Assessment logic:
-            # Improving = pace got faster (lower s/km) AND HR stayed same or dropped
-            #           OR pace same/faster AND HR dropped meaningfully (>2 bpm)
-            # Declining = pace got slower AND/OR HR climbed
-            # Stable = minor changes within noise
             assessment = "stable"
-            if first_stats["avg_pace_s_per_km"] and second_stats["avg_pace_s_per_km"]:
-                pace_delta = second_stats["avg_pace_s_per_km"] - first_stats["avg_pace_s_per_km"]
-                hr_delta = (
-                    (second_stats["avg_hr"] or 0) - (first_stats["avg_hr"] or 0)
-                    if (first_stats["avg_hr"] and second_stats["avg_hr"])
-                    else 0.0
-                )
-                if pace_delta < -5 and hr_delta <= 2:
+            if fh["avg_pace_s_per_km"] and sh["avg_pace_s_per_km"]:
+                pace_d = sh["avg_pace_s_per_km"] - fh["avg_pace_s_per_km"]
+                hr_d = (sh["avg_hr"] - fh["avg_hr"]) if (fh["avg_hr"] and sh["avg_hr"]) else 0.0
+                if pace_d < -5 and hr_d <= 2:
                     assessment = "improving"
-                elif pace_delta > 5 and hr_delta >= -2:
+                elif hr_d < -2 and pace_d <= 5:
+                    assessment = "improving"
+                elif pace_d > 5 and hr_d >= -2:
                     assessment = "declining"
-                elif hr_delta < -2 and pace_delta <= 5:
-                    # HR dropped with similar or faster pace → improving efficiency
-                    assessment = "improving"
-                elif hr_delta > 3 and pace_delta >= -2:
+                elif hr_d > 3 and pace_d >= -2:
                     assessment = "declining"
 
             trend = {
-                "first_half": first_stats,
-                "second_half": second_stats,
-                "pace_delta_s_per_km": (
-                    second_stats["avg_pace_s_per_km"] - first_stats["avg_pace_s_per_km"]
-                    if (second_stats["avg_pace_s_per_km"] and first_stats["avg_pace_s_per_km"])
-                    else None
-                ),
-                "hr_delta_bpm": (
-                    round(second_stats["avg_hr"] - first_stats["avg_hr"], 1)
-                    if (second_stats["avg_hr"] and first_stats["avg_hr"])
-                    else None
-                ),
+                "first_half": fh,
+                "second_half": sh,
+                "pace_delta_s_per_km": (sh["avg_pace_s_per_km"] - fh["avg_pace_s_per_km"])
+                    if (fh["avg_pace_s_per_km"] and sh["avg_pace_s_per_km"]) else None,
+                "hr_delta_bpm": round(sh["avg_hr"] - fh["avg_hr"], 1)
+                    if (fh["avg_hr"] and sh["avg_hr"]) else None,
                 "assessment": assessment,
             }
         elif sessions_chrono:
-            trend = {"assessment": "insufficient_data", "note": "Need at least 2 sessions for trend analysis."}
+            trend = {"assessment": "insufficient_data"}
         else:
             trend = {"assessment": "no_data"}
 
         total = len(sessions)
-        note = (
-            f"Found {total} {session_type} session(s) between {effective_start} and {effective_end}."
-        )
+        data_source = "drag_laps" if use_drag_laps else "session_avg"
+        note = f"Found {total} {session_type} session(s) between {effective_start} and {effective_end}."
         if total == 0:
-            note += (
-                f" No sessions classified as '{session_type}' in this range. "
-                "Try sync_activities() or check session names match the classification patterns."
-            )
+            note += (f" No sessions classified as '{session_type}'. "
+                     "Try sync_activities() or check session names.")
+        elif use_drag_laps:
+            no_laps = sum(1 for s in sessions if s.get("data_source") == "session_avg_fallback")
+            note += f" HR/pace from work reps (drag laps) only — warmup, rest, and cooldown excluded."
+            if no_laps:
+                note += f" {no_laps} session(s) had no lap data and used session avg as fallback."
+            note += " Note: pace varies with rep length — focus on HR trend across sessions."
 
         return {
             "session_type": session_type,
+            "data_source": data_source,
             "date_range": {"start": effective_start, "end": effective_end},
             "sessions": sessions,
             "trend": trend,
