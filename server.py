@@ -1922,6 +1922,234 @@ def weekly_retrospective(week_start: str) -> dict:
     }
 
 
+@mcp.tool()
+def double_day_advisor(target_weekly_km: Optional[float] = None) -> dict:
+    """Advise whether today is a good candidate for a double training day (two sessions).
+
+    Double sessions (twice-a-day training) leverage glycogen depletion from
+    an AM session to enhance mitochondrial adaptation in the PM session.
+    Only beneficial for runners doing 50+ km/week who are well rested.
+
+    Eligibility criteria assessed:
+    - Weekly volume >= 50 km (or >= 300 min/week running)
+    - Today's body_battery_at_wake >= 70
+    - HRV not flagged as "poor" in wellness_daily
+    - Current week not already at or above target volume
+    - Not within 3 days of a planned race (recovery_time_hours elevated)
+
+    Args:
+        target_weekly_km: Target weekly km. If None, estimated from last
+            4 weeks × 1.05. Pass explicitly to override.
+
+    Returns:
+        - eligible (bool)
+        - reason (str): why eligible or not
+        - suggested_structure: if eligible, AM + PM session suggestions
+        - weekly_context: current week km, target, remaining
+        - caution (str): safety reminder about double-day load
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        today = _date.today()
+        # Current week: Mon to today
+        week_start = today - _td(days=today.weekday())
+        # Last 4 weeks window for volume baseline
+        four_weeks_ago = today - _td(weeks=4)
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+
+            # ── Last 4 weeks of runs for baseline volume ──────────────────
+            run_rows = conn.execute(
+                """
+                SELECT start_date_local, moving_time_s, distance_m
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) >= ?
+                  AND date(start_date_local) <= ?
+                ORDER BY start_date_local
+                """,
+                (four_weeks_ago.isoformat(), today.isoformat()),
+            ).fetchall()
+
+            # ── Current week's runs ───────────────────────────────────────
+            current_week_rows = conn.execute(
+                """
+                SELECT moving_time_s, distance_m
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) >= ?
+                  AND date(start_date_local) <= ?
+                """,
+                (week_start.isoformat(), today.isoformat()),
+            ).fetchall()
+
+            # ── Wellness for today ────────────────────────────────────────
+            wellness_row = conn.execute(
+                "SELECT body_battery_at_wake, hrv_status, recovery_time_hours "
+                "FROM wellness_daily WHERE date = ?",
+                (today.isoformat(),),
+            ).fetchone()
+
+        # ── Compute weekly volumes per week over last 4 weeks ─────────────
+        # Group into Mon-Sun buckets
+        weekly_km: dict[str, float] = {}
+        weekly_min: dict[str, float] = {}
+        for r in run_rows:
+            d = _date.fromisoformat(r["start_date_local"][:10])
+            wk = (d - _td(days=d.weekday())).isoformat()
+            weekly_km[wk] = weekly_km.get(wk, 0.0) + (r["distance_m"] or 0) / 1000
+            weekly_min[wk] = weekly_min.get(wk, 0.0) + (r["moving_time_s"] or 0) / 60
+
+        # Exclude current week from baseline (it's incomplete)
+        current_wk_key = week_start.isoformat()
+        baseline_km = [v for k, v in weekly_km.items() if k != current_wk_key]
+        baseline_min = [v for k, v in weekly_min.items() if k != current_wk_key]
+
+        avg_weekly_km = sum(baseline_km) / len(baseline_km) if baseline_km else 0.0
+        avg_weekly_min = sum(baseline_min) / len(baseline_min) if baseline_min else 0.0
+
+        if target_weekly_km is None:
+            target_weekly_km = round(avg_weekly_km * 1.05, 1) if avg_weekly_km > 0 else 50.0
+
+        # Current week so far
+        current_week_km = sum((r["distance_m"] or 0) for r in current_week_rows) / 1000
+        current_week_min = sum((r["moving_time_s"] or 0) for r in current_week_rows) / 60
+        remaining_km = max(0.0, target_weekly_km - current_week_km)
+
+        # ── Eligibility checks ─────────────────────────────────────────────
+        reasons_fail: list[str] = []
+
+        # 1. Volume threshold — need >= 50 km/week OR >= 300 min/week
+        volume_ok = avg_weekly_km >= 50.0 or avg_weekly_min >= 300.0
+        if not volume_ok:
+            reasons_fail.append(
+                f"4-week avg volume too low ({avg_weekly_km:.1f} km/week, "
+                f"{avg_weekly_min:.0f} min/week) — double days require 50+ km/week"
+            )
+
+        # 2. Body battery at wake >= 70
+        body_battery = wellness_row["body_battery_at_wake"] if wellness_row else None
+        battery_ok = body_battery is not None and body_battery >= 70
+        if not battery_ok:
+            if body_battery is None:
+                reasons_fail.append("Body battery at wake not available (sync wellness data)")
+            else:
+                reasons_fail.append(
+                    f"Body battery at wake too low ({body_battery}) — need >= 70"
+                )
+
+        # 3. HRV not poor
+        hrv_status = (wellness_row["hrv_status"] or "").lower() if wellness_row else ""
+        hrv_ok = hrv_status not in ("poor", "low", "unbalanced")
+        if not hrv_ok:
+            reasons_fail.append(
+                f"HRV status is '{hrv_status}' — double day inadvisable when HRV is suppressed"
+            )
+
+        # 4. Current week not already at or above target
+        week_not_full = current_week_km < target_weekly_km
+        if not week_not_full:
+            reasons_fail.append(
+                f"Already at/above target volume this week "
+                f"({current_week_km:.1f} km vs target {target_weekly_km:.1f} km)"
+            )
+
+        # 5. Not within 3 days of a planned race (recovery_time_hours elevated)
+        recovery_hours = wellness_row["recovery_time_hours"] if wellness_row else None
+        not_near_race = recovery_hours is None or recovery_hours <= 36
+        if not not_near_race:
+            reasons_fail.append(
+                f"Recovery time elevated ({recovery_hours}h) — likely post-race/hard effort. "
+                "Avoid double days within 3 days of a major effort"
+            )
+
+        eligible = len(reasons_fail) == 0
+
+        # ── Suggested structure when eligible ─────────────────────────────
+        suggested_structure: Optional[dict] = None
+        if eligible:
+            # Determine PM session quality based on weekly load position
+            fraction_done = current_week_km / target_weekly_km if target_weekly_km > 0 else 0
+            # If less than 40% of week done → PM can be quality (threshold)
+            # If 40–70% done → PM should be easy to avoid over-accumulation
+            if fraction_done < 0.4:
+                pm_type = "threshold"
+                pm_desc = (
+                    "Sub-threshold intervals or continuous tempo — "
+                    "glycogen depletion from AM primes mitochondrial signaling"
+                )
+            else:
+                pm_type = "easy"
+                pm_desc = (
+                    "Easy 30-40 min Z1/Z2 — week already has significant load; "
+                    "keep PM session purely aerobic"
+                )
+
+            suggested_structure = {
+                "am_session": {
+                    "type": "easy",
+                    "duration_min": "40-50",
+                    "description": (
+                        "Easy aerobic run — Z1/Z2, conversational pace. "
+                        "Goal is light glycogen depletion to prime the PM adaptation signal, "
+                        "not fitness stimulus. Keep HR below LT1."
+                    ),
+                },
+                "pm_session": {
+                    "type": pm_type,
+                    "description": pm_desc,
+                    "rest_between_sessions_h": "3-5",
+                },
+                "timing_note": (
+                    "Allow 3-5 hours between sessions. "
+                    "AM should finish before noon; PM before 19:00 to protect sleep."
+                ),
+            }
+
+        reason = (
+            "All eligibility criteria met — double day is appropriate today."
+            if eligible
+            else " | ".join(reasons_fail)
+        )
+
+        return {
+            "eligible": eligible,
+            "reason": reason,
+            "suggested_structure": suggested_structure,
+            "weekly_context": {
+                "current_week_km": round(current_week_km, 1),
+                "current_week_min": round(current_week_min, 0),
+                "target_weekly_km": target_weekly_km,
+                "remaining_km": round(remaining_km, 1),
+                "avg_4wk_km": round(avg_weekly_km, 1),
+                "avg_4wk_min": round(avg_weekly_min, 0),
+                "body_battery_at_wake": body_battery,
+                "hrv_status": wellness_row["hrv_status"] if wellness_row else None,
+                "recovery_time_hours": recovery_hours,
+            },
+            "caution": (
+                "Double days add significant load — only attempt if you've been "
+                "consistent for 4+ weeks and all eligibility criteria are met. "
+                "Skip or convert PM to easy if fatigue accumulates during the AM session."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "eligible": False,
+            "reason": f"Error assessing eligibility: {type(exc).__name__}: {exc}",
+            "suggested_structure": None,
+            "weekly_context": {},
+            "caution": (
+                "Double days add significant load — only attempt if you've been "
+                "consistent for 4+ weeks and all eligibility criteria are met."
+            ),
+        }
+
+
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
