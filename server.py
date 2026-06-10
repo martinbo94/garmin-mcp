@@ -970,6 +970,148 @@ def create_interval_workout(
 
 # ─── Schedule tools ────────────────────────────────────────────────────
 @mcp.tool()
+def plan_interval_session(
+    total_minutes: Optional[float] = None,
+    work_minutes: Optional[float] = None,
+    work_meters: Optional[float] = None,
+    rest_minutes: Optional[float] = None,
+    rest_meters: Optional[float] = None,
+    warmup_minutes: float = 10.0,
+    cooldown_minutes: float = 10.0,
+    reps: Optional[int] = None,
+) -> dict:
+    """Calculate interval session structure and estimate distances from user profile paces.
+
+    Solves for the missing variable given the others:
+    - Provide `total_minutes` + work/rest → calculates how many reps fit.
+    - Provide `reps` + work/rest → calculates total duration.
+    - Works with time-based (minutes) or distance-based (meters) intervals.
+
+    All durations are in minutes. Distances in meters.
+
+    Examples:
+      plan_interval_session(total_minutes=45, work_minutes=4, rest_minutes=2)
+      → "5×4 min with 2 min rest fits in 45 min (10 wu + 10 cd)"
+
+      plan_interval_session(reps=6, work_meters=1000, rest_minutes=90)
+      → total time estimate based on your sub-threshold pace
+
+    Returns a structured breakdown plus a `create_hint` with the exact
+    `create_interval_workout` call to use if you want to push it to Garmin.
+    """
+    # Load paces from user profile for distance→time conversion
+    pace_map: dict = {}
+    try:
+        profile = _parse_athlete_profile()
+        paces = profile.get("pace_estimates", {})
+        def _pace_to_s_per_m(pace_str: str) -> Optional[float]:
+            if not pace_str or "/" not in pace_str:
+                return None
+            try:
+                mins, secs = pace_str.replace("/km", "").strip().split(":")
+                return (int(mins) * 60 + int(secs)) / 1000
+            except Exception:
+                return None
+        pace_map = {k: _pace_to_s_per_m(v) for k, v in paces.items()}
+    except Exception:
+        pass
+
+    sub_thresh_s_per_m = pace_map.get("sub_threshold") or pace_map.get("sub-threshold")
+    easy_s_per_m = pace_map.get("easy")
+
+    def _work_duration_s() -> Optional[float]:
+        if work_minutes:
+            return work_minutes * 60
+        if work_meters and sub_thresh_s_per_m:
+            return work_meters * sub_thresh_s_per_m
+        if work_meters and not sub_thresh_s_per_m:
+            return None  # handled below with clear error
+        return None
+
+    def _rest_duration_s() -> Optional[float]:
+        if rest_minutes:
+            return rest_minutes * 60
+        if rest_meters and easy_s_per_m:
+            return rest_meters * easy_s_per_m
+        if rest_meters:
+            return rest_meters * (sub_thresh_s_per_m or 0.33)  # ~5 min/km fallback
+        return None
+
+    work_s = _work_duration_s()
+    rest_s = _rest_duration_s()
+    wu_s = warmup_minutes * 60
+    cd_s = cooldown_minutes * 60
+
+    if work_s is None:
+        if work_meters:
+            return {"error": "work_meters requires a sub-threshold pace in your profile. "
+                    "Set up your profile first, or use work_minutes instead."}
+        return {"error": "Provide work_minutes or work_meters."}
+    if rest_s is None:
+        if rest_meters:
+            return {"error": "rest_meters requires an easy pace in your profile. "
+                    "Set up your profile first, or use rest_minutes instead."}
+        return {"error": "Provide rest_minutes or rest_meters."}
+
+    if reps is None and total_minutes is not None:
+        available_s = total_minutes * 60 - wu_s - cd_s
+        if available_s <= 0:
+            return {"error": "total_minutes is too short for the warmup + cooldown alone."}
+        reps = max(1, int(available_s / (work_s + rest_s)))
+    elif reps is None:
+        return {"error": "Provide either total_minutes or reps."}
+
+    interval_block_s = reps * (work_s + rest_s) - rest_s  # last rep has no trailing rest
+    total_s = wu_s + interval_block_s + rest_s + cd_s
+    total_min = round(total_s / 60, 1)
+
+    # Distance estimates
+    def _dist(duration_s: float, s_per_m: Optional[float]) -> Optional[float]:
+        return round(duration_s / s_per_m / 1000, 2) if s_per_m else None
+
+    work_km = (work_meters / 1000) if work_meters else _dist(work_s, sub_thresh_s_per_m)
+    rest_km = (rest_meters / 1000) if rest_meters else _dist(rest_s, easy_s_per_m)
+    wu_km = _dist(wu_s, easy_s_per_m)
+    cd_km = _dist(cd_s, easy_s_per_m)
+    total_km = round(sum(x for x in [
+        wu_km, reps * (work_km or 0), (reps - 1) * (rest_km or 0), cd_km
+    ] if x), 2) if work_km else None
+
+    # Build create_interval_workout hint
+    work_ec = ({"type": "distance", "value": work_meters}
+               if work_meters else {"type": "time", "value": int(work_s)})
+    rest_ec = ({"type": "distance", "value": rest_meters}
+               if rest_meters else {"type": "time", "value": int(rest_s)})
+    wu_ec = {"type": "time", "value": int(wu_s)}
+    cd_ec = {"type": "time", "value": int(cd_s)}
+
+    work_label = f"{work_meters:.0f}m" if work_meters else f"{work_minutes:.0f} min"
+    rest_label = f"{rest_meters:.0f}m" if rest_meters else f"{rest_minutes:.0f} min"
+    summary = (f"{reps}×{work_label} / {rest_label} rest — "
+               f"{warmup_minutes:.0f} min wu + {cooldown_minutes:.0f} min cd = "
+               f"~{total_min} min total")
+    if total_km:
+        summary += f" (~{total_km} km)"
+
+    return {
+        "summary": summary,
+        "reps": reps,
+        "work": {"label": work_label, "duration_s": round(work_s), "distance_km": work_km},
+        "rest": {"label": rest_label, "duration_s": round(rest_s), "distance_km": rest_km},
+        "warmup": {"duration_min": warmup_minutes, "distance_km": wu_km},
+        "cooldown": {"duration_min": cooldown_minutes, "distance_km": cd_km},
+        "total_minutes": total_min,
+        "total_km": total_km,
+        "create_hint": {
+            "tool": "create_interval_workout",
+            "warmup": wu_ec,
+            "sets": [{"repeats": reps, "work": work_ec, "recovery": rest_ec}],
+            "cooldown": cd_ec,
+        },
+    }
+
+
+@mcp.tool()
 def schedule_workout(workout_id: int, on_date: str) -> dict:
     """Schedule an existing workout template on a date ('YYYY-MM-DD').
 
