@@ -1208,6 +1208,145 @@ def pace_calculator(
 
 
 @mcp.tool()
+def elevation_impact(
+    actual_pace_min_per_km: Optional[str] = None,
+    elevation_gain_m: Optional[float] = None,
+    distance_km: Optional[float] = None,
+    activity_id: Optional[int] = None,
+) -> dict:
+    """Estimate how elevation gain affects running effort using grade-adjusted pace (GAP).
+
+    Uses a simplified Strava-style GAP model:
+      GAP_factor = 1 + (avg_grade_pct * 0.033)
+      flat_equivalent_pace = actual_pace / GAP_factor
+
+    Call modes:
+    - Manual: provide actual_pace_min_per_km + elevation_gain_m + distance_km.
+    - Cache lookup: provide activity_id — distance and elevation are read from
+      the local cache (actual_pace_min_per_km is still required).
+    - Both: activity_id + actual_pace_min_per_km (cache supplies distance/elevation).
+
+    Args:
+        actual_pace_min_per_km: Pace string like "5:30" or "5:30/km".
+        elevation_gain_m: Total elevation gain in meters.
+        distance_km: Distance in kilometers.
+        activity_id: Optional Garmin activity ID to look up distance and elevation
+            from the local cache instead of passing them manually.
+
+    Returns:
+        - flat_equivalent_pace: What this run equals on flat terrain (e.g. "5:05/km").
+        - elevation_cost_seconds: How many seconds the climbing added to the total time.
+        - elevation_cost_formatted: Human-readable string like "3:20 added".
+        - avg_grade_pct: Average grade as a percentage.
+        - effort_level: "easy" / "moderate" / "significant" / "hilly" based on
+          m/km ratio (< 10 / 10-20 / 20-40 / > 40).
+        - note: Plain-English summary sentence.
+    """
+    try:
+        def _parse_pace(s: str) -> float:
+            """Return pace in seconds/km from 'M:SS' or 'M:SS/km'."""
+            s = s.replace("/km", "").strip()
+            parts = s.split(":")
+            return int(parts[0]) * 60 + int(parts[1])
+
+        def _fmt_pace(s_per_km: float) -> str:
+            m = int(s_per_km // 60)
+            s = int(round(s_per_km % 60))
+            return f"{m}:{s:02d}/km"
+
+        def _fmt_duration(seconds: float) -> str:
+            m = int(abs(seconds) // 60)
+            s = int(round(abs(seconds) % 60))
+            return f"{m}:{s:02d}"
+
+        # --- Optional cache lookup ---
+        if activity_id is not None:
+            import sqlite3 as _sqlite3
+            from garmin_sync import DB_PATH as _DB_PATH
+            try:
+                with _sqlite3.connect(_DB_PATH) as _conn:
+                    _row = _conn.execute(
+                        "SELECT distance_m, total_elevation_gain FROM activities WHERE id = ?",
+                        (activity_id,),
+                    ).fetchone()
+                if _row is None:
+                    return {
+                        "error": (
+                            f"Activity {activity_id} not found in local cache. "
+                            "Call sync_activities() first."
+                        )
+                    }
+                if distance_km is None and _row[0] is not None:
+                    distance_km = _row[0] / 1000.0
+                if elevation_gain_m is None and _row[1] is not None:
+                    elevation_gain_m = float(_row[1])
+            except Exception as e:
+                return {"error": f"Cache lookup failed: {type(e).__name__}: {e}"}
+
+        # --- Validate inputs ---
+        if actual_pace_min_per_km is None:
+            return {"error": "actual_pace_min_per_km is required."}
+        if elevation_gain_m is None:
+            return {"error": "elevation_gain_m is required (or pass activity_id to read from cache)."}
+        if distance_km is None:
+            return {"error": "distance_km is required (or pass activity_id to read from cache)."}
+        if distance_km <= 0:
+            return {"error": "distance_km must be greater than 0."}
+
+        try:
+            actual_pace_s = _parse_pace(actual_pace_min_per_km)
+        except Exception:
+            return {"error": f"Could not parse pace '{actual_pace_min_per_km}'. Use format like '5:30' or '5:30/km'."}
+
+        # --- GAP calculation ---
+        avg_grade_pct = (elevation_gain_m / (distance_km * 1000)) * 100
+        gap_factor = 1 + (avg_grade_pct * 0.033)
+        flat_pace_s = actual_pace_s / gap_factor
+
+        # Total time on actual course vs equivalent flat time
+        actual_total_s = actual_pace_s * distance_km
+        flat_total_s = flat_pace_s * distance_km
+        elevation_cost_s = actual_total_s - flat_total_s
+
+        # --- Effort level ---
+        m_per_km = elevation_gain_m / distance_km
+        if m_per_km < 10:
+            effort_level = "easy"
+        elif m_per_km < 20:
+            effort_level = "moderate"
+        elif m_per_km <= 40:
+            effort_level = "significant"
+        else:
+            effort_level = "hilly"
+
+        flat_pace_str = _fmt_pace(flat_pace_s)
+        cost_str = _fmt_duration(elevation_cost_s)
+        note = (
+            f"Your {actual_pace_min_per_km.replace('/km', '')}/km on this route "
+            f"= {flat_pace_str} on flat terrain"
+        )
+
+        return {
+            "flat_equivalent_pace": flat_pace_str,
+            "elevation_cost_seconds": round(elevation_cost_s),
+            "elevation_cost_formatted": f"{cost_str} added",
+            "avg_grade_pct": round(avg_grade_pct, 2),
+            "effort_level": effort_level,
+            "m_per_km": round(m_per_km, 1),
+            "gap_factor": round(gap_factor, 4),
+            "inputs": {
+                "actual_pace": actual_pace_min_per_km.replace("/km", ""),
+                "elevation_gain_m": elevation_gain_m,
+                "distance_km": distance_km,
+                "activity_id": activity_id,
+            },
+            "note": note,
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
 def schedule_workout(workout_id: int, on_date: str) -> dict:
     """Schedule an existing workout template on a date ('YYYY-MM-DD').
 
