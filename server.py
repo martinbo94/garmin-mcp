@@ -1922,6 +1922,158 @@ def weekly_retrospective(week_start: str) -> dict:
     }
 
 
+# ─── Taper planner ────────────────────────────────────────────────────
+@mcp.tool()
+def taper_plan(
+    race_date: str,
+    race_distance_km: float,
+    current_weekly_km: Optional[float] = None,
+) -> dict:
+    """Generate a race taper schedule from today to race day.
+
+    Applies standard percentage-based taper reductions:
+    - Marathon (>35 km):        3-week taper — Week -3: 80%, Week -2: 60%, Week -1: 40%
+    - Half/10k (10–35 km):      2-week taper — Week -2: 70%, Week -1: 40%
+    - 5k and shorter (<10 km):  1-week taper — Week -1: 60%
+
+    Args:
+        race_date: Race day in 'YYYY-MM-DD' format.
+        race_distance_km: Race distance in km (e.g. 10, 21.1, 42.2).
+        current_weekly_km: Your current weekly volume baseline. If omitted,
+            estimated from the last 4 weeks in the activity cache (run km
+            only). Pass explicitly when you want to override the estimate.
+
+    Returns:
+        - `taper_weeks`: ordered list of weekly targets from taper start
+          to race week. Each entry has `week_start`, `week_end`,
+          `target_km`, `sessions`, `key_sessions`, and `notes`.
+        - `race_week`: {date, distance_km, advice} for race day itself.
+        - `base_weekly_km`: the baseline volume used for calculations.
+        - `base_source`: 'provided' | 'cache_estimate' | 'default'.
+        - `warning`: set when the race is fewer than 7 days away (full
+          taper is not possible).
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        today = _date.today()
+        race = _date.fromisoformat(race_date)
+    except ValueError as e:
+        return {"error": f"Invalid race_date: {e}"}
+
+    days_until_race = (race - today).days
+    warning: Optional[str] = None
+    if days_until_race < 7:
+        warning = (
+            f"Race is only {days_until_race} day(s) away — a full taper is not possible. "
+            "Focus on rest, short easy runs at most, and race-day logistics."
+        )
+
+    # ── Determine base volume ─────────────────────────────────────────
+    base_source: str
+    if current_weekly_km is not None:
+        base_km = float(current_weekly_km)
+        base_source = "provided"
+    else:
+        # Estimate from last 4 weeks of run activities in cache.
+        try:
+            four_weeks_ago = (today - _td(weeks=4)).isoformat()
+            with _sqlite3.connect(garmin_sync.DB_PATH) as _conn:
+                rows = _conn.execute(
+                    """
+                    SELECT start_date_local, distance_m
+                    FROM activities
+                    WHERE start_date_local >= ?
+                      AND sport_type = 'Run'
+                      AND distance_m IS NOT NULL
+                    ORDER BY start_date_local
+                    """,
+                    (four_weeks_ago,),
+                ).fetchall()
+
+            if rows:
+                total_m = sum(r[1] for r in rows)
+                base_km = round(total_m / 4000, 1)  # 4 weeks, m → km
+                base_source = "cache_estimate"
+            else:
+                base_km = 40.0  # conservative default
+                base_source = "default"
+        except Exception:
+            base_km = 40.0
+            base_source = "default"
+
+    # ── Choose taper schedule ─────────────────────────────────────────
+    # Each entry: (week_offset_before_race, pct, sessions, key_session_note, notes)
+    if race_distance_km > 35:
+        # Marathon: 3-week taper
+        schedule = [
+            (3, 0.80, 5, "One sub-threshold session (shorter reps), one medium long run (13-15 km)",
+             "Reduce long run to ~13-15 km. Keep one quality sub-threshold session at normal pace but fewer reps. Eliminate second quality session."),
+            (2, 0.60, 4, "One short quality session (20-25 min of reps), long run ≤12 km",
+             "Drop long run to 12 km or less. Quality session: short reps only (e.g. 4-5 × 4 min). No tempo runs."),
+            (1, 0.40, 3, "2-3 short easy runs + 1 × 10-15 min strides session",
+             "Race week — all easy. Optional strides mid-week to keep legs sharp. No quality work after Thursday."),
+        ]
+    elif race_distance_km >= 10:
+        # Half marathon / 10k: 2-week taper
+        schedule = [
+            (2, 0.70, 4, "One quality session (sub-threshold, 60-70% of normal rep volume)",
+             "Reduce overall volume but maintain one quality session. Long run shortened by ~30%."),
+            (1, 0.40, 3, "2 easy runs + optional strides mid-week",
+             "Race week — mostly easy. Short strides 2 days before race if feeling flat. No hard efforts after Wednesday."),
+        ]
+    else:
+        # 5k and shorter: 1-week taper
+        schedule = [
+            (1, 0.60, 3, "1-2 easy runs + short strides 2 days before race",
+             "Race week — keep legs fresh. A single short quality session early in the week is optional. Race-pace strides are enough stimulus."),
+        ]
+
+    # ── Build week entries ────────────────────────────────────────────
+    def _monday(d: _date) -> _date:
+        return d - _td(days=d.weekday())
+
+    race_monday = _monday(race)
+    taper_weeks = []
+
+    for week_offset, pct, sessions, key_sessions, notes in schedule:
+        week_start = race_monday - _td(weeks=week_offset)
+        week_end = week_start + _td(days=6)
+        target_km = round(base_km * pct, 1)
+        taper_weeks.append({
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+            "target_km": target_km,
+            "volume_pct": int(pct * 100),
+            "sessions": sessions,
+            "key_sessions": key_sessions,
+            "notes": notes,
+        })
+
+    race_advice = (
+        "Rest and hydrate. Short 10-15 min shakeout run the day before is optional. "
+        "Trust the taper — fitness is locked in. Focus on pacing strategy and race-day logistics."
+    )
+
+    result: dict = {
+        "race_date": race_date,
+        "race_distance_km": race_distance_km,
+        "days_until_race": days_until_race,
+        "base_weekly_km": base_km,
+        "base_source": base_source,
+        "taper_weeks": taper_weeks,
+        "race_week": {
+            "date": race_date,
+            "distance_km": race_distance_km,
+            "advice": race_advice,
+        },
+    }
+    if warning:
+        result["warning"] = warning
+    return result
+
+
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
