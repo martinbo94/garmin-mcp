@@ -1112,6 +1112,102 @@ def plan_interval_session(
 
 
 @mcp.tool()
+def pace_calculator(
+    pace_min_per_km: Optional[str] = None,
+    speed_km_per_h: Optional[float] = None,
+    distance_km: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
+    duration_hms: Optional[str] = None,
+) -> dict:
+    """Convert between pace, speed, distance, and duration. Always use this
+    tool for running math — never compute pace/speed conversions mentally.
+
+    Provide any two of the four variables and the tool solves for the rest:
+      pace_min_per_km  (string like "4:30" or "4:30/km")
+      speed_km_per_h   (float, e.g. 13.3)
+      distance_km      (float, e.g. 10.0)
+      duration_seconds (float) OR duration_hms (string like "45:00" or "1:02:30")
+
+    Examples:
+      pace_calculator(pace_min_per_km="4:30", distance_km=10)
+        → duration = 45:00, speed = 13.33 km/h
+      pace_calculator(speed_km_per_h=12, duration_hms="1:00:00")
+        → distance = 12.0 km, pace = 5:00/km
+      pace_calculator(distance_km=21.1, duration_hms="1:45:00")
+        → pace = 4:58/km, speed = 12.06 km/h
+    """
+    def _parse_pace(s: str) -> float:
+        s = s.replace("/km", "").strip()
+        parts = s.split(":")
+        return int(parts[0]) * 60 + int(parts[1])
+
+    def _parse_hms(s: str) -> float:
+        parts = s.strip().split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        return int(parts[0]) * 60 + float(parts[1])
+
+    def _fmt_pace(s_per_km: float) -> str:
+        m = int(s_per_km // 60)
+        s = int(s_per_km % 60)
+        return f"{m}:{s:02d}/km"
+
+    def _fmt_duration(seconds: float) -> str:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+    # Parse inputs
+    pace_s: Optional[float] = None
+    dur_s: Optional[float] = None
+
+    if pace_min_per_km:
+        pace_s = _parse_pace(pace_min_per_km)
+    if speed_km_per_h is not None:
+        pace_s = 3600 / speed_km_per_h
+    if duration_hms:
+        dur_s = _parse_hms(duration_hms)
+    if duration_seconds is not None:
+        dur_s = duration_seconds
+
+    # Check for conflicting pace/speed inputs
+    if pace_min_per_km and speed_km_per_h is not None:
+        return {"error": "Provide pace OR speed, not both."}
+    if duration_hms and duration_seconds is not None:
+        return {"error": "Provide duration_hms OR duration_seconds, not both."}
+
+    known = sum(x is not None for x in [pace_s, distance_km, dur_s])
+    # Allow single pace/speed input for simple unit conversion
+    if known == 1 and pace_s is not None and distance_km is None and dur_s is None:
+        speed = round(3600 / pace_s, 2)
+        return {"pace": _fmt_pace(pace_s), "speed_km_h": speed,
+                "distance_km": None, "duration": None, "duration_seconds": None}
+    if known < 2:
+        return {"error": "Provide at least two of: pace/speed, distance, duration."}
+
+    # Solve for the missing variable
+    if pace_s and distance_km and dur_s is None:
+        dur_s = pace_s * distance_km
+    elif pace_s and dur_s is not None and distance_km is None:
+        distance_km = dur_s / pace_s
+    elif distance_km and dur_s is not None and pace_s is None:
+        pace_s = dur_s / distance_km
+    elif known == 3:
+        pass  # all three given — just convert/validate
+
+    speed = round(3600 / pace_s, 2) if pace_s else None
+
+    return {
+        "pace": _fmt_pace(pace_s) if pace_s else None,
+        "speed_km_h": speed,
+        "distance_km": round(distance_km, 3) if distance_km else None,
+        "duration": _fmt_duration(dur_s) if dur_s else None,
+        "duration_seconds": round(dur_s) if dur_s else None,
+    }
+
+
+@mcp.tool()
 def schedule_workout(workout_id: int, on_date: str) -> dict:
     """Schedule an existing workout template on a date ('YYYY-MM-DD').
 
