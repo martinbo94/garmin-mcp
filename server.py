@@ -2307,8 +2307,8 @@ def return_from_break() -> dict:
 
     try:
         from garmin_sync import DB_PATH as _DB_PATH
+        today = _date.today()
         with _sqlite3.connect(_DB_PATH) as conn:
-            # Most recent run
             row = conn.execute(
                 """
                 SELECT start_date_local, distance_m
@@ -2327,7 +2327,6 @@ def return_from_break() -> dict:
 
             last_run_date_str = row[0][:10]
             last_run_date = _date.fromisoformat(last_run_date_str)
-            today = _date.today()
             break_days = (today - last_run_date).days
 
             if break_days < 7:
