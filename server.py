@@ -990,9 +990,16 @@ def delete_workout_template(workout_id: int) -> str:
 def sync_activities(force_full: bool = False, weeks_back: Optional[int] = None) -> dict:
     """Pull new activities + HR streams + laps from Garmin into the local cache.
 
-    Runs incrementally since the last sync. First-time sync backfills the
-    last 12 weeks of activities; subsequent runs are cheap and just fetch
-    what's new.
+    Runs incrementally since the last sync. An incremental sync runs
+    automatically on every server startup, so `new_activities: 0` is normal
+    and just means nothing has been recorded since the last run — it does NOT
+    mean a recent activity is missing.
+
+    If a recent activity appears to be missing after sync returns 0:
+    1. Use `weekly_summary` for the relevant week to check the cache.
+       The activity is almost certainly already there under its Garmin ID.
+    2. Only call sync again (with force_full=True) if weekly_summary confirms
+       the activity is genuinely absent.
 
     Args:
         force_full: If True, re-pull the default 12-week backfill window.
