@@ -1895,6 +1895,208 @@ def morning_check_in() -> dict:
 
 
 @mcp.tool()
+def sleep_performance_correlation(
+    days_back: int = 60,
+    min_distance_km: float = 3.0,
+) -> dict:
+    """Find the relationship between sleep quality and running performance.
+
+    Joins run activities with wellness data for the same date. Splits
+    sessions into 'good sleep' (sleep_score >= 70 OR sleep >= 7 hours)
+    vs 'poor sleep' and compares average HR and pace between groups.
+    Also surfaces the 5 best performances (lowest pace) and their
+    associated sleep metrics.
+
+    Args:
+        days_back: How many days of history to analyse. Default 60.
+        min_distance_km: Minimum run distance to include. Default 3.0.
+
+    Returns:
+        good_sleep_avg, poor_sleep_avg, best_performances, insight string,
+        and per-run data rows used for the analysis.
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        cutoff = (_date.today() - _td(days=days_back)).isoformat()
+        min_dist_m = min_distance_km * 1000
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    a.id,
+                    date(a.start_date_local) AS run_date,
+                    a.name,
+                    a.avg_hr,
+                    a.moving_time_s,
+                    a.distance_m,
+                    w.sleep_seconds,
+                    w.sleep_score,
+                    w.hrv_overnight_avg,
+                    w.resting_hr AS wellness_rhr
+                FROM activities a
+                LEFT JOIN wellness_daily w ON date(a.start_date_local) = w.date
+                WHERE a.sport_type = 'Run'
+                  AND date(a.start_date_local) >= ?
+                  AND a.distance_m >= ?
+                  AND a.moving_time_s IS NOT NULL
+                  AND a.moving_time_s > 0
+                ORDER BY a.start_date_local
+                """,
+                (cutoff, min_dist_m),
+            ).fetchall()
+
+        runs = [dict(r) for r in rows]
+
+        # Compute pace for each run
+        for r in runs:
+            if r["distance_m"] and r["moving_time_s"]:
+                r["pace_s_per_km"] = r["moving_time_s"] / (r["distance_m"] / 1000)
+            else:
+                r["pace_s_per_km"] = None
+
+        def _is_good_sleep(r: dict) -> bool:
+            ss = r.get("sleep_score")
+            secs = r.get("sleep_seconds")
+            if ss is not None and ss >= 70:
+                return True
+            if secs is not None and secs >= 25200:  # 7 hours
+                return True
+            return False
+
+        def _has_sleep_data(r: dict) -> bool:
+            return r.get("sleep_score") is not None or r.get("sleep_seconds") is not None
+
+        # Split into groups — only include runs that have sleep data
+        runs_with_sleep = [r for r in runs if _has_sleep_data(r)]
+        good_sleep = [r for r in runs_with_sleep if _is_good_sleep(r)]
+        poor_sleep = [r for r in runs_with_sleep if not _is_good_sleep(r)]
+
+        def _avg(values: list) -> Optional[float]:
+            vals = [v for v in values if v is not None]
+            return round(sum(vals) / len(vals), 1) if vals else None
+
+        def _group_stats(group: list) -> dict:
+            return {
+                "n": len(group),
+                "avg_hr": _avg([r["avg_hr"] for r in group]),
+                "avg_pace_s_per_km": _avg([r["pace_s_per_km"] for r in group]),
+                "avg_sleep_score": _avg([r["sleep_score"] for r in group]),
+                "avg_sleep_hours": _avg(
+                    [round(r["sleep_seconds"] / 3600, 2) for r in group
+                     if r.get("sleep_seconds") is not None]
+                ),
+                "avg_hrv": _avg([r["hrv_overnight_avg"] for r in group]),
+            }
+
+        good_stats = _group_stats(good_sleep)
+        poor_stats = _group_stats(poor_sleep)
+
+        # Best 5 performances = lowest pace (fastest), runs that have pace data
+        runs_with_pace = [r for r in runs if r.get("pace_s_per_km") is not None]
+        best_5 = sorted(runs_with_pace, key=lambda r: r["pace_s_per_km"])[:5]
+        best_performances = [
+            {
+                "date": r["run_date"],
+                "name": r["name"],
+                "distance_km": round(r["distance_m"] / 1000, 2),
+                "pace_s_per_km": round(r["pace_s_per_km"], 1),
+                "avg_hr": r["avg_hr"],
+                "sleep_score": r["sleep_score"],
+                "sleep_hours": (
+                    round(r["sleep_seconds"] / 3600, 2)
+                    if r.get("sleep_seconds") is not None else None
+                ),
+                "hrv_overnight_avg": r["hrv_overnight_avg"],
+                "sleep_quality": "good" if _is_good_sleep(r) else (
+                    "poor" if _has_sleep_data(r) else "no_data"
+                ),
+            }
+            for r in best_5
+        ]
+
+        # Build insight string
+        def _fmt_pace(s: Optional[float]) -> str:
+            if s is None:
+                return "N/A"
+            m = int(s // 60)
+            sec = int(s % 60)
+            return f"{m}:{sec:02d}/km"
+
+        insight_parts: list[str] = []
+        g_n, p_n = good_stats["n"], poor_stats["n"]
+
+        if g_n == 0 and p_n == 0:
+            insight_parts.append(
+                f"No runs with sleep data found in the last {days_back} days "
+                f"(>= {min_distance_km} km). Sync wellness data first."
+            )
+        elif g_n == 0:
+            insight_parts.append(
+                f"Only poor-sleep runs found ({p_n} sessions). "
+                "Need good-sleep sessions to compare."
+            )
+        elif p_n == 0:
+            insight_parts.append(
+                f"Only good-sleep runs found ({g_n} sessions). "
+                "Need poor-sleep sessions to compare."
+            )
+        else:
+            pace_good = good_stats["avg_pace_s_per_km"]
+            pace_poor = poor_stats["avg_pace_s_per_km"]
+            hr_good = good_stats["avg_hr"]
+            hr_poor = poor_stats["avg_hr"]
+            insight_parts.append(
+                f"Analysed {g_n + p_n} runs ({g_n} good-sleep, {p_n} poor-sleep) "
+                f"over the last {days_back} days."
+            )
+            if pace_good is not None and pace_poor is not None:
+                diff = round(pace_poor - pace_good, 1)
+                direction = "faster" if diff > 0 else "slower"
+                insight_parts.append(
+                    f"Good-sleep pace: {_fmt_pace(pace_good)} vs "
+                    f"poor-sleep: {_fmt_pace(pace_poor)} "
+                    f"({abs(diff):.1f}s/km {direction} on good sleep)."
+                )
+            if hr_good is not None and hr_poor is not None:
+                hr_diff = round(hr_poor - hr_good, 1)
+                insight_parts.append(
+                    f"Good-sleep avg HR: {hr_good} bpm vs poor-sleep: {hr_poor} bpm "
+                    f"(delta {hr_diff:+.1f} bpm)."
+                )
+
+        best_sleep_quality_counts = {
+            "good": sum(1 for b in best_performances if b["sleep_quality"] == "good"),
+            "poor": sum(1 for b in best_performances if b["sleep_quality"] == "poor"),
+            "no_data": sum(1 for b in best_performances if b["sleep_quality"] == "no_data"),
+        }
+        if best_performances:
+            insight_parts.append(
+                f"Of the 5 best performances: "
+                f"{best_sleep_quality_counts['good']} on good sleep, "
+                f"{best_sleep_quality_counts['poor']} on poor sleep, "
+                f"{best_sleep_quality_counts['no_data']} with no sleep data."
+            )
+
+        return {
+            "days_back": days_back,
+            "min_distance_km": min_distance_km,
+            "total_runs_in_window": len(runs),
+            "runs_with_sleep_data": len(runs_with_sleep),
+            "good_sleep_avg": good_stats,
+            "poor_sleep_avg": poor_stats,
+            "best_performances": best_performances,
+            "insight": " ".join(insight_parts),
+        }
+
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+@mcp.tool()
 def weekly_retrospective(week_start: str) -> dict:
     """Combined weekly summary + plan compliance for one Mon-Sun week.
 
