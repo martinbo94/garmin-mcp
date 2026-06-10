@@ -1727,6 +1727,203 @@ def activity_breakdown(activity_id: int) -> dict:
 
 
 @mcp.tool()
+def detect_personal_records(
+    activity_id: Optional[int] = None,
+    recent_n: int = 20,
+) -> dict:
+    """Scan cached run activities for personal bests at common distances.
+
+    Checks whether any run sets a new PR at: 1 km, 1 mile (1609 m), 5 km,
+    10 km, half marathon (21097 m), marathon (42195 m), and longest run ever.
+
+    PR estimation uses average pace × target distance (no split columns in the
+    schema). For the distance PR, the run's total distance_m is compared
+    against all other cached runs.
+
+    Args:
+        activity_id: If given, check only this activity against historical
+            bests from all other cached runs. Returns a `broken_in_activity`
+            field with matching PR labels.
+        recent_n: When activity_id is not given, scan the most recent N run
+            activities. Default 20.
+
+    Returns:
+        any_pr (bool), records list [{distance_label, time_formatted,
+        pace_per_km, date, activity_name, activity_id}],
+        broken_in_activity (only when activity_id given, list of distance labels).
+    """
+    import sqlite3 as _sqlite3
+
+    _DISTANCES = [
+        ("1 km",         1_000.0),
+        ("1 mile",       1_609.0),
+        ("5 km",         5_000.0),
+        ("10 km",       10_000.0),
+        ("Half marathon", 21_097.0),
+        ("Marathon",     42_195.0),
+    ]
+    # Minimum run distance to be eligible for a split-distance PR estimate.
+    # A run must be at least 110% of the target distance to use avg-pace estimation.
+    _COVERAGE_FACTOR = 1.10
+
+    def _fmt_time(seconds: float) -> str:
+        total = round(seconds)
+        h = total // 3600
+        m = (total % 3600) // 60
+        s = total % 60
+        if h:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _fmt_pace(s_per_km: float) -> str:
+        total = round(s_per_km)
+        return f"{total // 60}:{total % 60:02d}/km"
+
+    try:
+        garmin_sync._init_db()
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+
+            if activity_id is not None:
+                # Fetch the specific activity plus all other cached runs for comparison.
+                target_row = conn.execute(
+                    "SELECT id, start_date_local, name, distance_m, moving_time_s "
+                    "FROM activities WHERE id = ? AND sport_type = 'Run'",
+                    (activity_id,),
+                ).fetchone()
+                if not target_row:
+                    return {
+                        "error": f"Activity {activity_id} not found in cache or is not a Run.",
+                        "any_pr": False,
+                        "records": [],
+                        "broken_in_activity": [],
+                    }
+                candidate_rows = [target_row]
+                # Historical rows are all OTHER runs (exclude the candidate itself).
+                history_rows = conn.execute(
+                    "SELECT id, start_date_local, name, distance_m, moving_time_s "
+                    "FROM activities WHERE sport_type = 'Run' AND id != ? "
+                    "ORDER BY start_date_local",
+                    (activity_id,),
+                ).fetchall()
+                all_rows = list(history_rows) + list(candidate_rows)
+            else:
+                # Scan the most recent N runs.
+                all_rows = conn.execute(
+                    "SELECT id, start_date_local, name, distance_m, moving_time_s "
+                    "FROM activities WHERE sport_type = 'Run' "
+                    "ORDER BY start_date_local DESC LIMIT ?",
+                    (recent_n,),
+                ).fetchall()
+
+        if not all_rows:
+            return {"any_pr": False, "records": [], "note": "No cached run activities found."}
+
+        # Build PR table: for each distance, track the all-time best (min time_s).
+        # {distance_label: {"time_s": float, "date": str, "name": str, "id": int}}
+        pr_table: dict[str, dict] = {}
+
+        def _estimate_split_time(row, target_m: float) -> Optional[float]:
+            dist = row["distance_m"] or 0
+            moving = row["moving_time_s"] or 0
+            if dist <= 0 or moving <= 0:
+                return None
+            if dist < target_m * _COVERAGE_FACTOR:
+                return None
+            s_per_m = moving / dist
+            return s_per_m * target_m
+
+        # Scan all rows to compute all-time bests.
+        for row in all_rows:
+            dist = row["distance_m"] or 0
+            moving = row["moving_time_s"] or 0
+            act_date = (row["start_date_local"] or "")[:10]
+            act_name = row["name"] or ""
+            act_id_val = row["id"]
+
+            # Split-distance PRs.
+            for label, target_m in _DISTANCES:
+                est = _estimate_split_time(row, target_m)
+                if est is None:
+                    continue
+                existing = pr_table.get(label)
+                if existing is None or est < existing["time_s"]:
+                    pr_table[label] = {
+                        "time_s": est,
+                        "date": act_date,
+                        "activity_name": act_name,
+                        "activity_id": act_id_val,
+                    }
+
+            # Longest run PR.
+            if dist > 0:
+                existing_dist = pr_table.get("Longest run")
+                if existing_dist is None or dist > existing_dist["distance_m"]:
+                    pr_table["Longest run"] = {
+                        "distance_m": dist,
+                        "time_s": moving if moving > 0 else None,
+                        "date": act_date,
+                        "activity_name": act_name,
+                        "activity_id": act_id_val,
+                    }
+
+        # Build records list.
+        records: list[dict] = []
+        for label, target_m in _DISTANCES:
+            best = pr_table.get(label)
+            if best is None:
+                continue
+            t = best["time_s"]
+            pace = t / (target_m / 1000)
+            records.append({
+                "distance_label": label,
+                "time_formatted": _fmt_time(t),
+                "pace_per_km": _fmt_pace(pace),
+                "date": best["date"],
+                "activity_name": best["activity_name"],
+                "activity_id": best["activity_id"],
+            })
+
+        longest = pr_table.get("Longest run")
+        if longest:
+            dist_km = round((longest["distance_m"] or 0) / 1000, 2)
+            t = longest.get("time_s")
+            pace_str = _fmt_pace(t / (longest["distance_m"] / 1000)) if t and longest["distance_m"] else None
+            records.append({
+                "distance_label": "Longest run",
+                "distance_km": dist_km,
+                "time_formatted": _fmt_time(t) if t else None,
+                "pace_per_km": pace_str,
+                "date": longest["date"],
+                "activity_name": longest["activity_name"],
+                "activity_id": longest["activity_id"],
+            })
+
+        result: dict = {
+            "any_pr": len(records) > 0,
+            "records": records,
+        }
+
+        if activity_id is not None:
+            # Determine which PRs were set by the target activity.
+            broken: list[str] = []
+            for rec in records:
+                if rec.get("activity_id") == activity_id:
+                    broken.append(rec["distance_label"])
+            result["broken_in_activity"] = broken
+            result["any_pr"] = len(broken) > 0
+
+        return result
+
+    except Exception as exc:
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "any_pr": False,
+            "records": [],
+        }
+
+
+@mcp.tool()
 def get_wellness_history(
     start_date: str,
     end_date: str,
