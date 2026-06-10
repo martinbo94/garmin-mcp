@@ -140,13 +140,16 @@ cp coach_data/examples/user_profile.example.md coach_data/user_profile.md
 Both `coach_data/user_profile.md` and `coach_data/plan.json` are
 gitignored — they hold personal data and never leave your machine.
 
-### Garmin auth caveat
+### Garmin auth
 
-`python-garminconnect` uses username/password login and does **not**
-support Garmin's MFA (two-factor authentication). If you have MFA
-enabled on your Garmin account, you must temporarily disable it in
-[Garmin Connect settings](https://connect.garmin.com) before setting
-this up.
+`setup.sh` handles authentication interactively and caches tokens to
+`~/.garminconnect`. After the first run, the MCP logs in automatically
+from the token cache — no password or MFA code needed again until the
+refresh token expires (typically several months).
+
+**MFA is supported.** If your Garmin account has two-factor
+authentication enabled, `setup.sh` will prompt you to enter the code
+once. Subsequent logins use the cached token automatically.
 
 Garmin rate-limits login attempts aggressively. You may see `429`
 warnings on cold start — the library retries automatically and this is

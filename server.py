@@ -639,19 +639,43 @@ def plan_design() -> str:
 
 # ─── Auth ──────────────────────────────────────────────────────────────
 _garmin: Optional[Garmin] = None
+_GARMIN_TOKEN_STORE = str(Path.home() / ".garminconnect")
 
 
 def _client() -> Garmin:
-    """Lazy singleton — log in on first tool call, reuse across calls."""
+    """Lazy singleton. Prefers cached tokens; falls back to credentials."""
     global _garmin
-    if _garmin is None:
-        email = os.environ.get("GARMIN_EMAIL")
-        password = os.environ.get("GARMIN_PASSWORD")
-        if not email or not password:
-            raise RuntimeError("Set GARMIN_EMAIL and GARMIN_PASSWORD in .env")
-        g = Garmin(email, password)
-        g.login()
-        _garmin = g
+    if _garmin is not None:
+        return _garmin
+
+    # Try cached tokens first (works after setup.sh has run once).
+    if Path(_GARMIN_TOKEN_STORE).exists():
+        try:
+            g = Garmin()
+            g.login(tokenstore=_GARMIN_TOKEN_STORE)
+            _garmin = g
+            return _garmin
+        except Exception:
+            pass  # Tokens expired or corrupt — fall through to credentials.
+
+    # Fresh login with email/password.
+    email = os.environ.get("GARMIN_EMAIL")
+    password = os.environ.get("GARMIN_PASSWORD")
+    if not email or not password:
+        raise RuntimeError(
+            "No cached Garmin tokens found and GARMIN_EMAIL / GARMIN_PASSWORD "
+            "are not set. Run 'bash setup.sh' to authenticate once."
+        )
+
+    g = Garmin(email, password, return_on_mfa=True)
+    status, _ = g.login(tokenstore=_GARMIN_TOKEN_STORE)
+    if status == "needs_mfa":
+        raise RuntimeError(
+            "Garmin account has MFA enabled. Run 'bash setup.sh' once to "
+            "authenticate interactively — tokens are cached afterwards and "
+            "MFA will not be required again until the refresh token expires."
+        )
+    _garmin = g
     return _garmin
 
 
