@@ -1922,6 +1922,159 @@ def weekly_retrospective(week_start: str) -> dict:
     }
 
 
+# ─── Utility / calculation tools ──────────────────────────────────────
+def _parse_pace(pace_str: str) -> int:
+    """Parse a 'M:SS' pace string into total seconds per km.
+
+    Accepts formats like '4:30', '4:05', '12:00'.
+    Raises ValueError on unrecognised input.
+    """
+    pace_str = pace_str.strip().rstrip("/km").strip()
+    parts = pace_str.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Expected 'M:SS' format, got: {pace_str!r}")
+    minutes, seconds = int(parts[0]), int(parts[1])
+    if seconds < 0 or seconds >= 60:
+        raise ValueError(f"Seconds out of range: {seconds}")
+    return minutes * 60 + seconds
+
+
+def _format_pace(total_seconds: float) -> str:
+    """Format a pace in total seconds per km to 'M:SS/km'."""
+    total_seconds = round(total_seconds)
+    minutes, seconds = divmod(int(total_seconds), 60)
+    return f"{minutes}:{seconds:02d}/km"
+
+
+@mcp.tool()
+def heat_pace_adjustment(
+    base_pace_min_per_km: str,
+    temperature_c: float,
+    humidity_pct: float = 50.0,
+    feels_like_c: Optional[float] = None,
+    actual_pace_min_per_km: Optional[str] = None,
+) -> dict:
+    """Adjust target running pace for heat and humidity conditions.
+
+    Uses the Switzer & Lafferty heat-adjustment model:
+    - Temperature factor: +3% per 5°C above 10°C baseline.
+    - Humidity factor: +(humidity − 40) × 0.1% for each percentage point
+      above 40% RH (no penalty at or below 40%).
+    - Combined: adjusted_pace = base_pace × (1 + temp_factor + humidity_factor).
+
+    Also supports the **reverse** calculation: if you ran `actual_pace_min_per_km`
+    in the heat, what is the cool-weather equivalent?
+
+    Args:
+        base_pace_min_per_km: Target pace under ideal (cool) conditions,
+            e.g. '4:30'.
+        temperature_c: Ambient temperature in °C.
+        humidity_pct: Relative humidity in % (0–100), default 50.
+        feels_like_c: Optional 'feels like' temperature. When provided this
+            overrides `temperature_c` for the calculation (wind-chill /
+            heat-index aware).
+        actual_pace_min_per_km: Optional. If you already ran in the heat and
+            want to know the cool-weather equivalent of your actual pace,
+            provide it here. Returns `cool_equivalent_pace` in the response.
+
+    Returns dict with:
+        adjusted_pace: pace string to target in the current conditions.
+        adjustment_pct: total slowdown in percent (positive = slower).
+        temp_factor_pct: contribution from temperature alone.
+        humidity_factor_pct: contribution from humidity alone.
+        effective_temp_c: temperature actually used in the calculation.
+        recommendation: human-readable coaching cue.
+        hr_note: reminder to run by feel in the heat.
+        cool_equivalent_pace: (only when actual_pace_min_per_km provided)
+            what your hot-weather pace equals in cool conditions.
+    """
+    try:
+        base_pace_s = _parse_pace(base_pace_min_per_km)
+    except ValueError as exc:
+        return {"error": f"Invalid base_pace_min_per_km: {exc}"}
+
+    if not (0 <= humidity_pct <= 100):
+        return {"error": f"humidity_pct must be 0–100, got {humidity_pct}"}
+
+    effective_temp = feels_like_c if feels_like_c is not None else temperature_c
+
+    # Temperature factor: 3% per 5°C above 10°C baseline.
+    temp_excess = max(0.0, effective_temp - 10.0)
+    temp_factor = (temp_excess / 5.0) * 0.03
+
+    # Humidity factor: 0.1% per % RH above 40%.
+    humidity_excess = max(0.0, humidity_pct - 40.0)
+    humidity_factor = humidity_excess * 0.001
+
+    total_factor = temp_factor + humidity_factor
+    adjusted_pace_s = base_pace_s * (1.0 + total_factor)
+
+    adjustment_pct = round(total_factor * 100, 2)
+    temp_factor_pct = round(temp_factor * 100, 2)
+    humidity_factor_pct = round(humidity_factor * 100, 2)
+
+    # Build a human-readable recommendation.
+    if adjustment_pct == 0:
+        recommendation = (
+            f"Conditions are at or below the 10°C baseline with ≤40% humidity — "
+            f"no pace adjustment needed. Target pace: {base_pace_min_per_km}/km."
+        )
+    elif adjustment_pct < 3:
+        recommendation = (
+            f"Mild heat/humidity: slow down by ~{adjustment_pct}% "
+            f"({base_pace_min_per_km}/km → {_format_pace(adjusted_pace_s)}). "
+            "Prioritise feel over splits."
+        )
+    elif adjustment_pct < 8:
+        recommendation = (
+            f"Moderate heat/humidity: expect a {adjustment_pct}% slowdown. "
+            f"Run at {_format_pace(adjusted_pace_s)} rather than {base_pace_min_per_km}/km. "
+            "Keep HR in its normal easy/threshold band — pace will drift."
+        )
+    else:
+        recommendation = (
+            f"Significant heat/humidity: {adjustment_pct}% adjustment required. "
+            f"Target {_format_pace(adjusted_pace_s)} instead of {base_pace_min_per_km}/km. "
+            "Shorten effort, carry fluids, and abandon pace targets entirely — "
+            "HR and perceived exertion are the only reliable guides."
+        )
+
+    result: dict = {
+        "adjusted_pace": _format_pace(adjusted_pace_s),
+        "adjustment_pct": adjustment_pct,
+        "temp_factor_pct": temp_factor_pct,
+        "humidity_factor_pct": humidity_factor_pct,
+        "effective_temp_c": effective_temp,
+        "recommendation": recommendation,
+        "hr_note": (
+            "Run by HR feel rather than pace in heat — pace is an estimate. "
+            "Heat elevates HR at any given pace; your normal zone boundaries still apply."
+        ),
+    }
+
+    # Reverse calculation: hot pace → cool-weather equivalent.
+    if actual_pace_min_per_km is not None:
+        try:
+            actual_pace_s = _parse_pace(actual_pace_min_per_km)
+        except ValueError as exc:
+            result["cool_equivalent_error"] = f"Invalid actual_pace_min_per_km: {exc}"
+        else:
+            if total_factor <= -1.0:
+                result["cool_equivalent_error"] = (
+                    "Adjustment factor would require division by zero."
+                )
+            else:
+                cool_equiv_s = actual_pace_s / (1.0 + total_factor)
+                result["cool_equivalent_pace"] = _format_pace(cool_equiv_s)
+                result["cool_equivalent_note"] = (
+                    f"Your {actual_pace_min_per_km}/km in {effective_temp:.0f}°C / "
+                    f"{humidity_pct:.0f}% RH is equivalent to roughly "
+                    f"{_format_pace(cool_equiv_s)} in ideal conditions."
+                )
+
+    return result
+
+
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
