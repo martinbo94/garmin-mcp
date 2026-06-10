@@ -168,17 +168,8 @@ _PROFILE_SETUP_QUESTIONS = [
             "estimate but typically underestimates well-trained athletes."
         ),
     },
-    {
-        "field": "zone_ceilings",
-        "required": False,
-        "framework_only": False,
-        "question": (
-            "Do you have custom HR zones set in Garmin Connect? If yes, give me the "
-            "four upper boundaries (Z1, Z2, Z3, Z4 ceilings) in bpm so this MCP uses "
-            "the same zones as your watch. If not, I'll compute sensible defaults from "
-            "your max HR."
-        ),
-    },
+    # zone_ceilings is auto-fetched from a recent Garmin activity in
+    # init_user_profile — no need to ask the user for it.
     {
         "field": "race_prs",
         "required": False,
@@ -497,8 +488,9 @@ def init_user_profile(
     Args:
         max_hr: Estimated or measured max heart rate (bpm). Required.
         zone_ceilings: Four ints — Z1, Z2, Z3, Z4 ceilings (Z5 begins
-            above Z4). Copy from Garmin Connect → Settings → HR Zones if
-            you can. If omitted, computed from 72/82/87/92% of max_hr.
+            above Z4). If omitted, auto-fetched from the most recent
+            Garmin activity with HR data (most accurate), falling back to
+            72/82/87/92% of max_hr if no activities are cached yet.
         weight_kg: Body weight (optional, for context).
         lt1_hr: Aerobic threshold / LT1 HR from a lactate test (optional).
         lt2_hr: Classical threshold / LT2 HR (~4 mmol) from a test (optional).
@@ -514,6 +506,24 @@ def init_user_profile(
             f"user_profile.md already exists at {_USER_PROFILE_PATH}. "
             "Call with overwrite=True to replace it."
         )
+
+    if zone_ceilings is None:
+        # Try to read zone boundaries from a recent Garmin activity —
+        # more accurate than %-of-max-HR defaults.
+        try:
+            import sqlite3 as _sqlite3
+            from garmin_sync import DB_PATH as _DB_PATH
+            with _sqlite3.connect(_DB_PATH) as _conn:
+                _row = _conn.execute(
+                    "SELECT id FROM activities WHERE sport_type='Run' "
+                    "AND avg_hr IS NOT NULL ORDER BY start_date_local DESC LIMIT 1"
+                ).fetchone()
+            if _row:
+                _zones = _client().get_activity_hr_in_timezones(_row[0])
+                if _zones and len(_zones) >= 5:
+                    zone_ceilings = [_zones[i]["zoneLowBoundary"] - 1 for i in range(1, 5)]
+        except Exception:
+            pass
 
     if zone_ceilings is None:
         zone_ceilings = [
