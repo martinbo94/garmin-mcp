@@ -11,3 +11,4 @@ ENV/
 coach_data/cache.db
 coach_data/user_profile.md
 coach_data/plan.json
+coach_data/deleted_templates_backup.json
