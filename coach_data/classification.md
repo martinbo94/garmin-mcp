@@ -1,10 +1,23 @@
 # Workout Classification Rules
 
-How to read an activity and decide what kind of session it was. The
+How to read an activity and decide what kind of session it was.
+
+**Strongest signal: plan linkage.** When an activity was run from a
+materialized plan workout, the cache stores `planned_type` (resolved via
+the activity's `associated_workout_id` → `workout_type_map`). That is
+ground truth — `list_activities` / `weekly_summary` report it as
+`classification_hint` with `classification_source='plan'`; no name
+interpretation needed. The rules below apply to **free runs and
+pre-linkage history** (`classification_source='name'`), where the
 workout **name** is the primary signal — HR, pace, and lap structure are
 fallback hints when the name is ambiguous.
 
-## Naming conventions (source of truth)
+Garmin's `training_effect_label` (TEMPO/AEROBIC_BASE/...) is also stored,
+but it labels the *physiological response*, not session intent — use it
+as a sanity check (an easy run labeled TEMPO was run too hard), never as
+the classification.
+
+## Naming conventions (source of truth for name-based fallback)
 
 The agent assumes activities are named according to a personal convention:
 default names (from the Garmin/Strava app) for easy runs, intentional custom

@@ -77,9 +77,28 @@ CREATE TABLE IF NOT EXISTS activities (
     avg_hr REAL,
     max_hr REAL,
     total_elevation_gain REAL,
-    synced_at TEXT NOT NULL
+    synced_at TEXT NOT NULL,
+    associated_workout_id INTEGER,
+    planned_type TEXT,
+    training_effect_label TEXT,
+    workout_rpe INTEGER,
+    workout_feel INTEGER,
+    workout_compliance INTEGER,
+    detail_fetched_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(start_date_local);
+
+-- Durable garmin_workout_id → planned type mapping. Written at materialize
+-- time and refreshed from plan.json on every sync, so completed activities
+-- can be classified even after plan.json is replaced by the next block.
+CREATE TABLE IF NOT EXISTS workout_type_map (
+    garmin_workout_id INTEGER PRIMARY KEY,
+    planned_type TEXT NOT NULL,
+    workout_name TEXT,
+    plan_name TEXT,
+    planned_date TEXT,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS streams (
     activity_id INTEGER PRIMARY KEY,
@@ -137,15 +156,29 @@ _WELLNESS_MIGRATION_COLUMNS = {
     "recovery_time_hours": "INTEGER",
 }
 
+_ACTIVITY_MIGRATION_COLUMNS = {
+    "associated_workout_id": "INTEGER",
+    "planned_type": "TEXT",
+    "training_effect_label": "TEXT",
+    "workout_rpe": "INTEGER",
+    "workout_feel": "INTEGER",
+    "workout_compliance": "INTEGER",
+    "detail_fetched_at": "TEXT",
+}
+
 
 def _init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.executescript(SCHEMA)
-        existing = {r[1] for r in conn.execute("PRAGMA table_info(wellness_daily)")}
-        for col, col_type in _WELLNESS_MIGRATION_COLUMNS.items():
-            if col not in existing:
-                conn.execute(f"ALTER TABLE wellness_daily ADD COLUMN {col} {col_type}")
+        for table, columns in (
+            ("wellness_daily", _WELLNESS_MIGRATION_COLUMNS),
+            ("activities", _ACTIVITY_MIGRATION_COLUMNS),
+        ):
+            existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for col, col_type in columns.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
 
 def _get_last_sync() -> Optional[datetime]:
@@ -302,6 +335,165 @@ def clear_activity_cache() -> None:
         conn.execute("DELETE FROM sync_state WHERE key='last_sync_at'")
 
 
+# ─── Workout linkage: planned type ↔ completed activity ──────────────
+PLAN_PATH = ROOT / "coach_data" / "plan.json"
+
+
+def record_workout_types(entries: list[dict], plan_name: Optional[str] = None) -> int:
+    """Upsert garmin_workout_id → planned_type rows into workout_type_map.
+
+    Each entry needs `garmin_workout_id` and `type`; `name` and `date` are
+    optional. Called from materialize_plan when workouts are created, and
+    from sync as a refresh of whatever plan.json currently holds.
+    """
+    _init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    with sqlite3.connect(DB_PATH) as conn:
+        for e in entries:
+            wid = e.get("garmin_workout_id")
+            wtype = e.get("type")
+            if not wid or not wtype or wtype in ("rest", "strength"):
+                continue
+            conn.execute(
+                """
+                INSERT INTO workout_type_map
+                    (garmin_workout_id, planned_type, workout_name, plan_name,
+                     planned_date, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(garmin_workout_id) DO UPDATE SET
+                    planned_type=excluded.planned_type,
+                    workout_name=excluded.workout_name,
+                    plan_name=excluded.plan_name,
+                    planned_date=excluded.planned_date,
+                    updated_at=excluded.updated_at
+                """,
+                (wid, wtype, e.get("name"), plan_name, e.get("date"), now),
+            )
+            count += 1
+    return count
+
+
+def _refresh_workout_type_map() -> None:
+    """Best-effort refresh of workout_type_map from the current plan.json."""
+    try:
+        plan = json.loads(PLAN_PATH.read_text(encoding="utf-8"))
+        record_workout_types(plan.get("workouts", []), plan.get("block_name"))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def _planned_type_for(workout_id: Optional[int]) -> Optional[str]:
+    if not workout_id:
+        return None
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT planned_type FROM workout_type_map WHERE garmin_workout_id = ?",
+            (workout_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def _fetch_detail_fields(garmin_client, act_id: int) -> dict:
+    """Per-activity detail fields the list API doesn't carry.
+
+    associatedWorkoutId links the activity to the workout template it
+    executed; RPE/feel are the watch's post-workout self-evaluation
+    prompts; compliance is Garmin's how-closely-you-followed-it score.
+    """
+    detail = garmin_client.get_activity(act_id) or {}
+    meta = detail.get("metadataDTO") or {}
+    summ = detail.get("summaryDTO") or {}
+    return {
+        "associated_workout_id": meta.get("associatedWorkoutId"),
+        "workout_rpe": summ.get("directWorkoutRpe"),
+        "workout_feel": summ.get("directWorkoutFeel"),
+        "workout_compliance": summ.get("directWorkoutComplianceScore"),
+        "training_effect_label": summ.get("trainingEffectLabel"),
+    }
+
+
+def _store_detail_fields(act_id: int, fields: dict) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE activities SET
+                associated_workout_id = ?,
+                planned_type = ?,
+                workout_rpe = ?,
+                workout_feel = ?,
+                workout_compliance = ?,
+                training_effect_label = COALESCE(?, training_effect_label),
+                detail_fetched_at = ?
+            WHERE id = ?
+            """,
+            (
+                fields.get("associated_workout_id"),
+                _planned_type_for(fields.get("associated_workout_id")),
+                fields.get("workout_rpe"),
+                fields.get("workout_feel"),
+                fields.get("workout_compliance"),
+                fields.get("training_effect_label"),
+                datetime.now(timezone.utc).isoformat(),
+                act_id,
+            ),
+        )
+
+
+def backfill_workout_links(garmin_client, max_activities: int = 100) -> dict:
+    """Fetch detail fields for cached activities that never got them.
+
+    Targets rows where detail_fetched_at IS NULL (one API call each),
+    newest first. Also re-resolves planned_type for already-fetched rows
+    where the workout_type_map has since gained the mapping.
+    """
+    _init_db()
+    _refresh_workout_type_map()
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [r[0] for r in conn.execute(
+            """
+            SELECT id FROM activities
+            WHERE detail_fetched_at IS NULL
+            ORDER BY start_date_local DESC LIMIT ?
+            """,
+            (max_activities,),
+        )]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE detail_fetched_at IS NULL"
+        ).fetchone()[0] - len(ids)
+
+    fetched = 0
+    errors: list[str] = []
+    for act_id in ids:
+        try:
+            _store_detail_fields(act_id, _fetch_detail_fields(garmin_client, act_id))
+            fetched += 1
+        except Exception as e:
+            errors.append(f"detail {act_id}: {type(e).__name__}: {e}")
+
+    # Pick up mappings that arrived after the detail fetch (e.g. a plan
+    # materialized after the activity was synced — shouldn't happen, but cheap).
+    with sqlite3.connect(DB_PATH) as conn:
+        relinked = conn.execute(
+            """
+            UPDATE activities SET planned_type = (
+                SELECT m.planned_type FROM workout_type_map m
+                WHERE m.garmin_workout_id = activities.associated_workout_id
+            )
+            WHERE planned_type IS NULL AND associated_workout_id IS NOT NULL
+              AND associated_workout_id IN
+                  (SELECT garmin_workout_id FROM workout_type_map)
+            """
+        ).rowcount
+
+    return {
+        "details_fetched": fetched,
+        "relinked": relinked,
+        "remaining_without_detail": remaining,
+        "errors": errors,
+    }
+
+
 def run_sync(
     garmin_client,
     force_full: bool = False,
@@ -331,6 +523,7 @@ def run_sync(
         after = _get_last_sync()  # type: ignore[assignment]
 
     sync_start = datetime.now(timezone.utc)
+    _refresh_workout_type_map()
 
     try:
         activities = _garmin_list_activities(garmin_client, after, until=until)
@@ -340,6 +533,7 @@ def run_sync(
     new_count = 0
     streams_count = 0
     laps_count = 0
+    details_count = 0
     errors: list[str] = []
 
     for act in activities:
@@ -358,8 +552,8 @@ def run_sync(
                 INSERT OR IGNORE INTO activities (
                     id, start_date_local, name, description, type, sport_type,
                     distance_m, moving_time_s, elapsed_time_s, avg_hr, max_hr,
-                    total_elevation_gain, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_elevation_gain, synced_at, training_effect_label
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     act_id, local_str,
@@ -373,9 +567,16 @@ def run_sync(
                     act.get("maxHR"),
                     act.get("elevationGain"),
                     sync_start.isoformat(),
+                    act.get("trainingEffectLabel"),
                 ),
             )
         new_count += 1
+
+        try:
+            _store_detail_fields(act_id, _fetch_detail_fields(garmin_client, act_id))
+            details_count += 1
+        except Exception as e:
+            errors.append(f"detail {act_id}: {type(e).__name__}: {e}")
 
         is_cardio = sport_type in _CARDIO_TYPES
         has_hr = bool(act.get("averageHR"))
@@ -410,6 +611,7 @@ def run_sync(
         "new_activities": new_count,
         "streams_fetched": streams_count,
         "laps_fetched": laps_count,
+        "details_fetched": details_count,
         "errors": errors,
         "last_sync": sync_start.isoformat(),
         "since": after.isoformat(),
@@ -428,11 +630,14 @@ _NAME_PATTERNS = [
     ("threshold", re.compile(
         r"terskel|subterskel|threshold|sub.?threshold|tempo.?run", re.I)),
     ("tempo", re.compile(
-        r"^tempo", re.I)),
+        r"\btempo\b", re.I)),
     ("intervals", re.compile(
         r"intervall|interval|pyramide|pyramid|vo2|speed.?work|track", re.I)),
     ("race", re.compile(
         r"stafett|etappe|race|parkrun|\bfun run\b|\b5k\b|\b10k\b|\bhalf marathon\b|\bmarathon\b", re.I)),
+    # Keep last so the more specific patterns above win (e.g. "Long easy").
+    ("easy", re.compile(
+        r"easy run|rolig tur|recovery run", re.I)),
 ]
 _DEFAULT_RUN_NAMES = re.compile(
     r"^(morning|afternoon|evening|lunch|easy|recovery|slow|base|aerobic|zone ?2)\s*(run|jog|løp)?$",
@@ -460,6 +665,22 @@ def name_hint(name: str, sport_type: Optional[str]) -> str:
     if sport_type == "Run" and _DEFAULT_RUN_NAMES.match(n):
         return "easy"
     return "unknown"
+
+
+def classify_activity(
+    name: str, sport_type: Optional[str], planned_type: Optional[str] = None
+) -> tuple[str, str]:
+    """Resolve an activity's classification and where it came from.
+
+    planned_type (the plan's own label, linked via the executed Garmin
+    workout) is ground truth when present; the name-based hint is the
+    fallback for free runs and pre-linkage history.
+
+    Returns (classification, source) where source is 'plan' or 'name'.
+    """
+    if planned_type:
+        return planned_type, "plan"
+    return name_hint(name, sport_type), "name"
 
 
 # ─── Zone parsing ─────────────────────────────────────────────────────
@@ -559,7 +780,9 @@ def weekly_summary(start_date: str, end_date: str) -> dict:
             "moving_time_s": r["moving_time_s"],
             "avg_hr": r["avg_hr"],
             "max_hr": r["max_hr"],
-            "classification_hint": name_hint(r["name"], r["sport_type"]),
+            "classification_hint": classify_activity(
+                r["name"], r["sport_type"], r["planned_type"]
+            )[0],
             "zone_secs": act_zones if r["time_json"] else None,
         })
         if r["type"] == "Run":
@@ -583,6 +806,174 @@ def weekly_summary(start_date: str, end_date: str) -> dict:
                 f"{oldest}. Call sync_activities(weeks_back=N) for deeper history."
             ) if gap_warning else None,
         },
+    }
+
+
+# ─── Flat activity list with filters ──────────────────────────────────
+def list_activities(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    sport_type: Optional[str] = None,
+    started_before: Optional[str] = None,
+    started_after: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    classification: Optional[str] = None,
+    limit: int = 200,
+) -> dict:
+    """Flat list of cached activities with per-activity metadata.
+
+    Unlike weekly_summary this returns one lightweight row per activity
+    (no streams, no zone computation) so it scales to the whole cache.
+    """
+    _init_db()
+    limit = max(1, min(limit, 1000))
+
+    where = ["1=1"]
+    params: list[Any] = []
+    if start_date:
+        where.append("date(start_date_local) >= ?")
+        params.append(start_date)
+    if end_date:
+        where.append("date(start_date_local) <= ?")
+        params.append(end_date)
+    if sport_type:
+        where.append("sport_type = ?")
+        params.append(sport_type)
+    if started_before:
+        where.append("substr(start_date_local, 12, 5) < ?")
+        params.append(started_before)
+    if started_after:
+        where.append("substr(start_date_local, 12, 5) >= ?")
+        params.append(started_after)
+    if name_contains:
+        where.append("name LIKE ?")
+        params.append(f"%{name_contains}%")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, start_date_local, name, type, sport_type, distance_m,
+                   moving_time_s, avg_hr, max_hr, total_elevation_gain,
+                   planned_type, training_effect_label, workout_rpe,
+                   workout_feel, workout_compliance
+            FROM activities
+            WHERE {' AND '.join(where)}
+            ORDER BY start_date_local
+            """,
+            params,
+        ).fetchall()
+        extent = conn.execute(
+            "SELECT MIN(date(start_date_local)) AS oldest, "
+            "MAX(date(start_date_local)) AS newest FROM activities"
+        ).fetchone()
+
+    activities = []
+    for r in rows:
+        hint, hint_source = classify_activity(
+            r["name"], r["sport_type"], r["planned_type"]
+        )
+        if classification and hint != classification:
+            continue
+        pace = None
+        if r["distance_m"] and r["moving_time_s"]:
+            sec_per_km = r["moving_time_s"] / (r["distance_m"] / 1000)
+            pace = f"{int(sec_per_km // 60)}:{int(sec_per_km % 60):02d}"
+        activities.append({
+            "id": r["id"],
+            "date": r["start_date_local"][:10],
+            "start_time": r["start_date_local"][11:16],
+            "name": r["name"],
+            "sport_type": r["sport_type"],
+            "distance_km": round((r["distance_m"] or 0) / 1000, 2),
+            "moving_time_s": r["moving_time_s"],
+            "avg_hr": r["avg_hr"],
+            "max_hr": r["max_hr"],
+            "elevation_gain_m": r["total_elevation_gain"],
+            "pace_per_km": pace,
+            "classification_hint": hint,
+            "classification_source": hint_source,
+            "training_effect_label": r["training_effect_label"],
+            "workout_rpe": r["workout_rpe"],
+            "workout_feel": r["workout_feel"],
+            "workout_compliance": r["workout_compliance"],
+        })
+
+    matched = len(activities)
+    oldest = extent["oldest"] if extent else None
+    gap_warning = bool(oldest and start_date and start_date < oldest)
+    return {
+        "activities": activities[:limit],
+        "matched_count": matched,
+        "returned_count": min(matched, limit),
+        "coverage": {
+            "cache_oldest_activity": oldest,
+            "cache_newest_activity": extent["newest"] if extent else None,
+            "gap_warning": gap_warning,
+            "gap_hint": (
+                f"Requested range starts {start_date} but cache only goes back "
+                f"to {oldest}. Call sync_activities(weeks_back=N) for deeper "
+                f"history."
+            ) if gap_warning else None,
+        },
+    }
+
+
+# ─── Read-only SQL access to the cache ────────────────────────────────
+_WRITE_SQL = re.compile(
+    r"\b(insert|update|delete|drop|alter|create|replace|pragma|attach"
+    r"|detach|vacuum|reindex)\b",
+    re.IGNORECASE,
+)
+
+
+def query_cache(
+    sql: str,
+    params: Optional[list] = None,
+    limit: int = 200,
+    max_cell_chars: int = 500,
+) -> dict:
+    """Run a read-only SELECT against cache.db.
+
+    The connection is opened with mode=ro (writes fail at the SQLite
+    level); the keyword check just gives a clearer error message.
+    """
+    _init_db()
+    stripped = sql.strip().rstrip(";")
+    if not re.match(r"^(select|with)\b", stripped, re.IGNORECASE):
+        return {"error": "Only SELECT (or WITH ... SELECT) statements are allowed."}
+    if _WRITE_SQL.search(stripped):
+        return {"error": "Statement contains a write/DDL keyword; the cache is read-only."}
+    limit = max(1, min(limit, 1000))
+
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    try:
+        cur = conn.execute(stripped, params or [])
+        columns = [d[0] for d in cur.description] if cur.description else []
+        raw = cur.fetchmany(limit + 1)
+    except sqlite3.Error as e:
+        return {"error": f"SQLite error: {e}"}
+    finally:
+        conn.close()
+
+    truncated_rows = len(raw) > limit
+    truncated_cells = 0
+    rows = []
+    for r in raw[:limit]:
+        out = []
+        for cell in r:
+            if isinstance(cell, str) and len(cell) > max_cell_chars:
+                cell = cell[:max_cell_chars] + f"… [truncated, {len(cell)} chars total]"
+                truncated_cells += 1
+            out.append(cell)
+        rows.append(out)
+
+    return {
+        "columns": columns,
+        "rows": rows,
+        "row_count": len(rows),
+        "truncated_rows": truncated_rows,
+        "truncated_cells": truncated_cells,
     }
 
 
