@@ -264,6 +264,7 @@ git.
 | `plan_interval_session` | Interval structure + rep distances from profile paces |
 | `forecast_conditions` | Weather (Open-Meteo) for a date/time; auto-locates from latest activity |
 | `heat_pace_adjustment` | Adjust pace for heat + humidity (dew-point method) |
+| `analyze_race_course` | GPX course profile + even-effort per-km race pacing for a goal |
 
 ### Gear
 
