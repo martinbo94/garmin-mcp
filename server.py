@@ -4126,6 +4126,102 @@ def heat_pace_adjustment(
 
 
 @mcp.tool()
+def forecast_conditions(
+    date: Optional[str] = None,
+    hour: int = 17,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    base_pace_min_per_km: Optional[str] = None,
+) -> dict:
+    """Fetch temp / humidity / dew point for a date+hour, and optionally the
+    heat-adjusted pace — the weather source for `heat_pace_adjustment`.
+
+    Conditions come from Open-Meteo (free, public, no API key). Location
+    defaults to your most recent outdoor activity's GPS coordinates (cached
+    from sync; falls back to a one-off Garmin lookup if the cache has none
+    yet), so you normally don't pass lat/lon at all — it follows you (e.g.
+    Bærum vs. Spain). When `base_pace_min_per_km` is given it feeds the
+    fetched conditions straight into `heat_pace_adjustment`, so heat-adjusting
+    a planned session is hands-free.
+
+    Args:
+        date: 'YYYY-MM-DD' (default today). Open-Meteo covers roughly the past
+            92 days through 16 days ahead — good for "tomorrow's session".
+        hour: local hour 0-23 the run will happen (default 17, typical
+            evening). It does NOT know your scheduled time — pass the real
+            hour to match conditions to when you'll run.
+        lat, lon: explicit coordinates; default = latest activity location.
+        base_pace_min_per_km: if given (e.g. '5:30'), the result also includes
+            `heat_adjustment` from `heat_pace_adjustment` for these conditions.
+
+    Returns location (+ how it was resolved), the resolved local time, current
+    `conditions` (temp_c, dew_point_c, relative_humidity, wind, precip), the
+    day's temp range, and — when a base pace is given — `heat_adjustment`.
+    """
+    from datetime import date as _date
+
+    loc_source = "explicit"
+    if lat is None or lon is None:
+        loc = garmin_sync.latest_location()
+        if loc:
+            lat, lon = loc["lat"], loc["lon"]
+            loc_source = f"latest activity ({loc['from_activity']}, {loc['as_of']})"
+        else:
+            # Cache has no coordinates yet (e.g. before any post-migration
+            # sync) — one-off Garmin lookup of the newest activity.
+            try:
+                acts = _client().get_activities(0, 1)
+                if acts:
+                    f = garmin_sync._fetch_detail_fields(
+                        _client(), acts[0]["activityId"]
+                    )
+                    lat, lon = f.get("start_lat"), f.get("start_lon")
+                    loc_source = "garmin latest activity"
+            except Exception as e:
+                return {
+                    "error": (
+                        f"No cached location and Garmin lookup failed: "
+                        f"{type(e).__name__}: {e}. Pass lat/lon explicitly."
+                    )
+                }
+    if lat is None or lon is None:
+        return {
+            "error": (
+                "No location available (no outdoor activity with GPS in the "
+                "cache). Pass lat/lon, or sync an outdoor run first."
+            )
+        }
+
+    date = date or _date.today().isoformat()
+    w = garmin_sync.fetch_weather(lat, lon, date, hour)
+    if "error" in w:
+        return w
+
+    result = {
+        "location": {"lat": round(lat, 4), "lon": round(lon, 4), "source": loc_source},
+        "date": date,
+        "conditions": {
+            "resolved_local_time": w["resolved_local_time"],
+            "temp_c": w["temp_c"],
+            "dew_point_c": w["dew_point_c"],
+            "relative_humidity": w["relative_humidity"],
+            "wind_speed_kmh": w["wind_speed_kmh"],
+            "precipitation_mm": w["precipitation_mm"],
+        },
+        "day_temp_range_c": {"min": w["day_temp_min_c"], "max": w["day_temp_max_c"]},
+        "source": w["source"],
+    }
+    if base_pace_min_per_km and w.get("temp_c") is not None:
+        kw = {"base_pace_min_per_km": base_pace_min_per_km, "temp_c": w["temp_c"]}
+        if w.get("dew_point_c") is not None:
+            kw["dew_point_c"] = w["dew_point_c"]
+        elif w.get("relative_humidity") is not None:
+            kw["relative_humidity"] = w["relative_humidity"]
+        result["heat_adjustment"] = heat_pace_adjustment(**kw)
+    return result
+
+
+@mcp.tool()
 def weekly_retrospective(week_start: str) -> dict:
     """Combined weekly summary + plan compliance for one Mon-Sun week.
 
