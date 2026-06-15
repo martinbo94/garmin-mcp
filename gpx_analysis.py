@@ -347,6 +347,86 @@ def detect_features(profile: dict) -> dict:
     return {"climbs": climbs, "descents": descents}
 
 
+# ─── Short steep pitches (the "walls" sustained detection merges away) ──
+# A sharp 100 m ramp inside a long gentle drag gets averaged out both by the
+# per-km table AND by the sustained-climb merge above (a 12% wall reads as a
+# 1340 m @ 1% climb). This finds those pitches directly via a sliding local
+# grade, independent of the surrounding profile — typically overpasses/short
+# hills that spike HR but barely move the split.
+_PITCH_WINDOW_M = 60.0      # window for the local grade
+_PITCH_GRADE = 8.0          # |grade| (%) that makes a stretch a steep pitch
+_PITCH_EXIT_FRAC = 0.6      # hysteresis: stay in the pitch until grade drops here
+_PITCH_MIN_LEN_M = 40.0     # ignore shorter (single-sample spike guard)
+_PITCH_MIN_CHANGE_M = 5.0   # ...and require real vertical change
+
+
+def _windowed_grades(dists, eles, win_m):
+    n = len(dists)
+    half = win_m / 2
+    grades = []
+    for k in range(n):
+        a, b = k, k
+        while a > 0 and dists[k] - dists[a] < half:
+            a -= 1
+        while b < n - 1 and dists[b] - dists[k] < half:
+            b += 1
+        span = dists[b] - dists[a]
+        grades.append((eles[b] - eles[a]) / span * 100 if span > 0 else 0.0)
+    return grades
+
+
+def detect_steep_pitches(profile: dict) -> list[dict]:
+    """Short steep ramps (up or down), found by sliding local grade.
+
+    Catches the sharp walls the sustained climb/descent merge dilutes away.
+    """
+    if not profile["has_elevation"]:
+        return []
+    dists, eles = _resample(profile, _DETECT_STEP_M)
+    grades = _windowed_grades(dists, eles, _PITCH_WINDOW_M)
+    n = len(grades)
+    pitches = []
+    for sign in (+1, -1):
+        i = 0
+        while i < n:
+            if sign * grades[i] < _PITCH_GRADE:
+                i += 1
+                continue
+            j = i
+            while j < n and sign * grades[j] >= _PITCH_GRADE * _PITCH_EXIT_FRAC:
+                j += 1
+            a, b = i, min(j, n - 1)
+            length = dists[b] - dists[a]
+            change = sign * (eles[b] - eles[a])
+            if length >= _PITCH_MIN_LEN_M and change >= _PITCH_MIN_CHANGE_M:
+                avg_grade = change / length * 100
+                start_km = dists[a] / 1000.0
+                pitches.append({
+                    "kind": "ramp_up" if sign > 0 else "drop",
+                    "start_km": round(start_km, 1),
+                    "length_m": int(round(length / 10.0) * 10),
+                    ("gain_m" if sign > 0 else "drop_m"): round(change),
+                    "avg_grade_pct": round(avg_grade, 1),
+                    "note": _pitch_note(sign, start_km,
+                                        int(round(length / 10.0) * 10),
+                                        avg_grade, change),
+                })
+            i = max(j, i + 1)
+    pitches.sort(key=lambda p: p["start_km"])
+    return pitches
+
+
+def _pitch_note(sign, start_km, length_m, avg_grade, change) -> str:
+    if sign > 0:
+        return (f"Steep ramp UP around {start_km:.1f} km: ~{length_m} m at "
+                f"~{avg_grade:.0f}% (+{change:.0f} m) — short hard effort. Shorten "
+                f"the stride, lift cadence, don't watch the clock; you'll lose "
+                f"20-40 s/km here and take it back over the top.")
+    return (f"Steep DROP around {start_km:.1f} km: ~{length_m} m at ~{avg_grade:.0f}% "
+            f"(−{change:.0f} m). Don't brake — roll it relaxed; but control the "
+            f"quads so a late one doesn't cost you the closing kms.")
+
+
 def fmt_pace(s_per_km: float) -> str:
     m = int(s_per_km // 60)
     s = int(round(s_per_km % 60))

@@ -4261,11 +4261,17 @@ def analyze_race_course(
     plan by effort and let pace drift — the targets just show where the course
     pushes HR up.
 
-    `course.notable_climbs` / `notable_descents` are detected at the POINT level,
-    not from the per-km averages — so a short steep hill that a flat-looking km
-    hides (e.g. a 100 m ramp at 10% inside an otherwise-flat km) still shows up,
-    each with a plain-language `note`. `course.warnings` collects those notes
-    (all climbs + any steep, model-unreliable descents) for quick reading.
+    Elevation features are detected at the POINT level, not from per-km
+    averages, in two complementary ways:
+    - `course.steep_pitches`: short sharp ramps/drops (the "walls" — e.g. a
+      ~100 m overpass at 12%) that BOTH the per-km table and the sustained
+      detector average away. These spike HR but barely move the split — run
+      them by effort.
+    - `course.notable_climbs` / `notable_descents`: sustained features (a long
+      gentle drag, a steep descent) that matter for HR management over
+      distance.
+    `course.warnings` is the quick-read list: the steep pitches first, then the
+    sustained climbs. Each feature carries a plain-language `note`.
 
     Args:
         gpx_path: path to a .gpx file on disk.
@@ -4293,6 +4299,7 @@ def analyze_race_course(
 
     steepest = max(segments, key=lambda s: s["avg_grade_pct"]) if segments else None
     features = gpx_analysis.detect_features(prof)
+    steep_pitches = gpx_analysis.detect_steep_pitches(prof)
     course = {
         "total_distance_km": round(dist_km, 2),
         "total_ascent_m": prof["total_ascent_m"],
@@ -4300,6 +4307,7 @@ def analyze_race_course(
         "net_elevation_m": prof["net_elevation_m"],
         "has_elevation": prof["has_elevation"],
         "steepest_km": steepest,
+        "steep_pitches": steep_pitches,
         "notable_climbs": features["climbs"],
         "notable_descents": features["descents"],
         "per_km_grade": [
@@ -4308,11 +4316,14 @@ def analyze_race_course(
             for s in segments
         ],
     }
-    # Surface the climb warnings up front — these are the point-level steep
-    # hills the per-km averages hide, plus any steep (model-unreliable) descents.
+    # Warnings, most actionable first: short steep pitches (the walls the per-km
+    # table AND the sustained-climb merge both hide), then sustained climbs
+    # (HR-creep drags). Sustained descents stay in notable_descents but are kept
+    # out of the headline list — the steep-pitch entries already cover the sharp
+    # drops, and gentle descents need no warning.
     course["warnings"] = (
-        [c["note"] for c in features["climbs"]]
-        + [d["note"] for d in features["descents"] if not d["pace_model_reliable"]]
+        [p["note"] for p in steep_pitches]
+        + [c["note"] for c in features["climbs"]]
     )
     if not prof["has_elevation"]:
         course["elevation_note"] = (
