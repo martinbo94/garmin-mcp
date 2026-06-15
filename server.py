@@ -4,6 +4,7 @@ Run with:
     python server.py             # via stdio (how Claude Desktop/Code invokes it)
     mcp dev server.py            # interactive inspector for development
 """
+import math
 import os
 import sys
 import threading
@@ -3906,6 +3907,222 @@ def recovery_prediction(lookback_sessions: int = 8) -> dict:
 
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ─── Heat / dew-point pace adjustment (pure calculator) ────────────────
+#
+# Local pace parse/format helpers. The repo's pace math lives *inside*
+# individual tools (pace_calculator, elevation tools) as nested closures,
+# so there is no shared module-level helper to import. Keeping local
+# copies here avoids reaching into another tool's scope; they mirror the
+# pace_calculator style ("M:SS" / "M:SS/km" in, "M:SS/km" out).
+def _heat_parse_pace_s(pace: str) -> float:
+    """Parse 'M:SS' or 'M:SS/km' into seconds per km. Raises ValueError."""
+    if pace is None:
+        raise ValueError("pace is required")
+    s = str(pace).replace("/km", "").strip()
+    parts = s.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"expected 'M:SS' (optionally '/km'), got {pace!r}")
+    minutes_str, seconds_str = parts[0].strip(), parts[1].strip()
+    try:
+        minutes = int(minutes_str)
+        seconds = int(seconds_str)
+    except ValueError:
+        raise ValueError(f"non-numeric pace component in {pace!r}")
+    if minutes < 0 or seconds < 0 or seconds >= 60:
+        raise ValueError(f"seconds out of range in {pace!r}")
+    return minutes * 60 + seconds
+
+
+def _heat_fmt_pace(seconds_per_km: float) -> str:
+    """Format seconds per km as 'M:SS/km'."""
+    total = round(seconds_per_km)
+    minutes, seconds = divmod(int(total), 60)
+    return f"{minutes}:{seconds:02d}/km"
+
+
+def _heat_dew_point_c(temp_c: float, rh_pct: float) -> float:
+    """Dew point (°C) from temperature (°C) and relative humidity (%),
+    via the Magnus-Tetens approximation."""
+    alpha = (17.27 * temp_c) / (237.7 + temp_c) + math.log(rh_pct / 100.0)
+    return (237.7 * alpha) / (17.27 - alpha)
+
+
+# (sum_upper_F_inclusive, pct_low, pct_high)
+# Bands keyed on temp_F + dewpoint_F per the Hadley / Maximum Performance
+# Running dew-point chart. Each band covers (prev_upper, upper]; a sum is
+# placed in the first band whose upper bound it does not exceed. Bounds are
+# contiguous (no gaps), so fractional sums like 130.5 land cleanly and the
+# mapping stays monotonic. Bucket midpoint = point estimate; (low, high)
+# is the range. The >180 case is handled separately.
+_HEAT_BANDS = [
+    (100, 0.0, 0.0),
+    (110, 0.0, 0.5),
+    (120, 0.5, 1.0),
+    (130, 1.0, 2.0),
+    (140, 2.0, 3.0),
+    (150, 3.0, 4.5),
+    (160, 4.5, 6.0),
+    (170, 6.0, 8.0),
+    (180, 8.0, 10.0),
+]
+
+
+@mcp.tool()
+def heat_pace_adjustment(
+    base_pace_min_per_km: str,
+    temp_c: float,
+    dew_point_c: Optional[float] = None,
+    relative_humidity: Optional[float] = None,
+) -> dict:
+    """Adjust target running pace for heat + humidity using the dew-point method.
+
+    Model: the dew-point sum method (Hadley / Maximum Performance Running
+    chart), the de-facto running-community standard. It sums the air
+    temperature and the dew point (both in °F) and maps that sum onto a
+    pace-slowdown band. Corroborated by RunnersConnect's heat chart and
+    consistent with published marathon-vs-temperature data (Ely et al.,
+    2007; Mantzios et al., 2022). This is a coaching heuristic validated
+    against race results, NOT primary physiological research.
+
+    Why dew point (not raw humidity): the body cools by evaporating sweat,
+    and evaporation is governed by the moisture gradient between skin and
+    air — which dew point captures directly. A cold, humid morning carries
+    little absolute moisture (dew point stays low), so it costs little;
+    raw relative-humidity penalties wrongly punish those conditions. Here
+    humidity only ever enters *through* the dew point, so a cold humid day
+    correctly yields ~0% adjustment.
+
+    The adjustment is athlete-dependent: fitter, heat-adapted runners slow
+    less than the band's high end, less-adapted runners more — hence each
+    band returns a low/high range around the midpoint point-estimate.
+
+    This athlete trains HR/effort-primary. Once conditions push into the
+    ~5%+ buckets (sum ≳ 155°F), treat the pace number as advisory only and
+    switch to running by effort / HR — heat elevates HR at any given pace,
+    so HR caps protect you better than a pace target.
+
+    Inputs are actual or forecast weather. This tool does NOT fetch
+    weather — supply temp plus either dew point or relative humidity.
+
+    Args:
+        base_pace_min_per_km: Cool-conditions target pace, "M:SS" or
+            "M:SS/km" (e.g. "5:30" or "5:30/km").
+        temp_c: Air (or forecast) temperature in °C.
+        dew_point_c: Dew point in °C, if known. Takes priority over
+            relative_humidity. Must be ≤ temp_c (physically).
+        relative_humidity: Relative humidity 0–100 (%). Used to derive
+            dew point via Magnus-Tetens when dew_point_c is not given.
+
+    Returns dict with: adjusted_pace ("M:SS/km"), adjustment_pct (midpoint),
+    adjustment_pct_range [low, high], temp_f, dew_point_c, dew_point_f,
+    heat_sum_f, base_pace, effort_based_recommended (bool), note, and
+    hr_note. On bad input returns {"error": ...}.
+    """
+    # ── Parse / validate pace ──────────────────────────────────────────
+    try:
+        base_pace_s = _heat_parse_pace_s(base_pace_min_per_km)
+    except ValueError as exc:
+        return {"error": f"Invalid base_pace_min_per_km: {exc}"}
+
+    # ── Resolve dew point ──────────────────────────────────────────────
+    if dew_point_c is None and relative_humidity is None:
+        return {
+            "error": "Provide either dew_point_c or relative_humidity "
+            "(plus temp_c)."
+        }
+
+    if dew_point_c is None:
+        rh = relative_humidity
+        if not (0 <= rh <= 100):
+            return {
+                "error": f"relative_humidity must be 0–100, got {rh}"
+            }
+        if rh <= 0:
+            return {
+                "error": "relative_humidity must be > 0 to compute dew point."
+            }
+        dew_c = _heat_dew_point_c(temp_c, rh)
+    else:
+        dew_c = dew_point_c
+
+    # Dew point cannot exceed air temperature (allow a tiny float epsilon).
+    if dew_c > temp_c + 1e-6:
+        return {
+            "error": f"dew_point_c ({dew_c:.1f}°C) cannot exceed temp_c "
+            f"({temp_c:.1f}°C) — physically impossible."
+        }
+
+    # ── Convert to °F and sum ──────────────────────────────────────────
+    temp_f = temp_c * 9 / 5 + 32
+    dew_f = dew_c * 9 / 5 + 32
+    heat_sum_f = temp_f + dew_f
+
+    # ── Map sum → band ─────────────────────────────────────────────────
+    effort_based = False
+    if heat_sum_f > 180:
+        pct_low, pct_high = 10.0, 10.0
+        pct_mid = 10.0
+        effort_based = True
+        band_note = (
+            "Sum exceeds 180°F — hard running is not recommended. Go "
+            "effort/HR-based, cap intensity, and treat any pace as a ceiling."
+        )
+    else:
+        pct_low = pct_high = pct_mid = 0.0
+        for upper, p_lo, p_hi in _HEAT_BANDS:
+            if heat_sum_f <= upper:
+                pct_low, pct_high = p_lo, p_hi
+                pct_mid = (p_lo + p_hi) / 2.0
+                break
+        band_note = None
+
+    # 5%+ buckets → recommend effort/HR-based running for this athlete.
+    if pct_mid >= 5.0:
+        effort_based = True
+
+    adjusted_pace_s = base_pace_s * (1.0 + pct_mid / 100.0)
+
+    base_clean = base_pace_min_per_km.replace("/km", "").strip()
+    if pct_mid == 0.0:
+        note = (
+            f"No adjustment — conditions are cool/dry enough (heat sum "
+            f"{heat_sum_f:.0f}°F ≤ 100°F). Hold {base_clean}/km."
+        )
+    elif band_note:
+        note = band_note
+    elif effort_based:
+        note = (
+            f"Heat sum {heat_sum_f:.0f}°F → slow ~{pct_mid:.1f}% "
+            f"({pct_low:.1f}–{pct_high:.1f}%). At this level treat the pace "
+            "as advisory and run by effort/HR — heat inflates HR at any pace."
+        )
+    else:
+        note = (
+            f"Heat sum {heat_sum_f:.0f}°F → slow ~{pct_mid:.1f}% "
+            f"({pct_low:.1f}–{pct_high:.1f}%). Target "
+            f"{_heat_fmt_pace(adjusted_pace_s)} instead of {base_clean}/km; "
+            "the range reflects how heat-adapted you are."
+        )
+
+    return {
+        "adjusted_pace": _heat_fmt_pace(adjusted_pace_s),
+        "adjustment_pct": round(pct_mid, 2),
+        "adjustment_pct_range": [round(pct_low, 2), round(pct_high, 2)],
+        "base_pace": f"{base_clean}/km",
+        "temp_c": round(temp_c, 1),
+        "temp_f": round(temp_f, 1),
+        "dew_point_c": round(dew_c, 1),
+        "dew_point_f": round(dew_f, 1),
+        "heat_sum_f": round(heat_sum_f, 1),
+        "effort_based_recommended": effort_based,
+        "note": note,
+        "hr_note": (
+            "Heat elevates HR at any given pace. Run by HR/effort and let "
+            "pace drift; your normal zone boundaries still apply."
+        ),
+    }
 
 
 @mcp.tool()
