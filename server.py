@@ -4846,7 +4846,7 @@ def return_from_break() -> dict:
     - first_quality_session_week: earliest week number where quality is allowed
     """
     import sqlite3 as _sqlite3
-    from datetime import date as _date, datetime as _datetime
+    from datetime import date as _date
 
     try:
         from garmin_sync import DB_PATH as _DB_PATH
