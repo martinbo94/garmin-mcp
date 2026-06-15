@@ -4274,19 +4274,28 @@ def analyze_race_course(
     `course.warnings` is the quick-read list: the steep pitches first, then the
     sustained climbs. Each feature carries a plain-language `note`.
 
-    Pacing is even-EFFORT by default. Pass `negative_split_pct` (e.g. 2) to
-    bias toward a negative split: the plan keeps the same goal time but ramps
-    pace from easier at the start to faster at the finish, so the back half
-    runs ~that % quicker than the front. Recommended ~1-3% for a half/longer,
-    especially when the goal is ambitious relative to fitness or the runner
-    tends to fade late — going out conservative is the most common way to NOT
-    blow up. 0 = even effort.
+    Pacing is even-EFFORT by default, and even pacing IS the evidence-optimal
+    strategy for a flat race (Foster 1993; Abbiss & Laursen 2008; distance
+    world records are run ~even, not negative). So treat `negative_split_pct`
+    as a conservative-START HEDGE against going out too fast — the dominant
+    way amateurs blow up — NOT as a "faster back half" target. Guidance:
+      - 5k / 10k: leave it 0. Even (with a quick settle + end-spurt) is
+        optimal; a deliberate negative split is sub-optimal at these
+        distances.
+      - Half / marathon: 0 is fine; use a SMALL value (~1-2%) only when the
+        goal is ambitious relative to fitness or the runner tends to fade
+        late. Bigger is not better — large negative splits usually just mean
+        the first half was left too slow.
+    The bias is applied to effort and renormalised to keep the goal time
+    exact (see the returned `half_split`: the negative split shows in the
+    effort paces; the clock paces are reshaped by terrain).
 
     Args:
         gpx_path: path to a .gpx file on disk.
         goal_time / goal_pace_min_per_km: see above.
-        negative_split_pct: front-to-back pace swing as a percent (default 0 =
-            even effort). 2 ≈ back half ~2% faster than the front, same finish.
+        negative_split_pct: conservative-start effort bias as a percent
+            (default 0 = even effort, the recommended default). ~1-2% is the
+            sensible ceiling for a half/marathon; 0 for 5k/10k.
 
     Returns `course` (distance, ascent/descent/net, per-km gradient table,
     steepest km, steep_pitches, notable_climbs, notable_descents, warnings) and,
