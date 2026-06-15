@@ -20,12 +20,19 @@ across sessions.
 │  │                 swap / delete workouts                  │  │
 │  │                                                         │  │
 │  │  ACTIVITY DATA  sync from Garmin → SQLite cache         │  │
-│  │                 weekly_summary, activity_breakdown       │  │
+│  │                 weekly_summary, list_activities,         │  │
+│  │                 activity_breakdown, query_activity_cache │  │
+│  │                                                         │  │
+│  │  ANALYSIS       progress / PRs / form / elevation /     │  │
+│  │                 ACWR / deload / taper / recovery         │  │
 │  │                                                         │  │
 │  │  WELLNESS       morning_check_in (HRV, sleep, HRR,      │  │
-│  │                 training readiness, body battery)        │  │
+│  │                 readiness), illness + stress + sleep     │  │
 │  │                                                         │  │
-│  │  PLAN           get / validate / save / materialize /   │  │
+│  │  CALCULATORS    pace, intervals, heat (dew-point) +     │  │
+│  │                 forecast_conditions (Open-Meteo)         │  │
+│  │                                                         │  │
+│  │  PLAN           get / save / materialize /              │  │
 │  │                 compare_vs_actual                        │  │
 │  │                                                         │  │
 │  │  RESOURCES      coach://user_profile                    │  │
@@ -212,17 +219,59 @@ git.
 
 | Tool | What it does |
 |---|---|
-| `sync_activities` | Pull new activities + HR streams + laps from Garmin |
+| `sync_activities` | Pull new activities + HR streams + laps + recent wellness into the cache |
+| `list_activities` | Flat, filterable activity list (date, start time, distance, HR, pace, classification) |
+| `query_activity_cache` | Read-only SQL SELECT against the local cache for custom analysis |
 | `weekly_summary` | Per-week volume, sessions, time-in-zone |
 | `activity_breakdown` | One activity's zone breakdown + lap classification |
 | `weekly_retrospective` | `weekly_summary` + plan compliance for Sunday review |
+| `progress_report` | Track one session type's HR/pace trend over time |
+| `detect_personal_records` | Scan cached runs for PRs at common distances |
+
+### Form & terrain
+
+| Tool | What it does |
+|---|---|
+| `running_form_trends` | Cadence, ground contact, vertical oscillation, stride trends |
+| `elevation_impact` | Grade-adjusted (flat-equivalent) pace for a hilly run |
 
 ### Wellness / readiness
 
 | Tool | What it does |
 |---|---|
-| `morning_check_in` | HRV, RHR, sleep, body battery, training readiness |
+| `morning_check_in` | HRV, RHR, sleep, body battery, training readiness + 7-day trends |
 | `get_wellness_history` | Multi-day wellness trends |
+| `recovery_prediction` | Predicted days back to baseline HRV after a quality session |
+| `illness_risk_check` | Early illness-onset signals from today's wellness |
+| `sleep_performance_correlation` | Pre-run-night sleep vs performance, within one session class |
+| `stress_training_balance` | Training load vs life stress over a window |
+
+### Training load & periodization
+
+| Tool | What it does |
+|---|---|
+| `training_load_balance` | Acute:chronic workload ratio (ACWR), rolling 7d/28d |
+| `deload_check` | Whether the current week is a recovery/deload week (plan-aware) |
+| `return_from_break` | Detect an inactivity gap and generate a ramp-back plan |
+| `taper_plan` | Race taper schedule from today to race day |
+| `double_day_advisor` | Whether to adopt double-threshold days (gated on base **or** informed opt-in) |
+
+### Calculators
+
+| Tool | What it does |
+|---|---|
+| `pace_calculator` | Convert between pace, speed, distance, duration |
+| `plan_interval_session` | Interval structure + rep distances from profile paces |
+| `forecast_conditions` | Weather (Open-Meteo) for a date/time; auto-locates from latest activity |
+| `heat_pace_adjustment` | Adjust pace for heat + humidity (dew-point method) |
+
+### Gear
+
+| Tool | What it does |
+|---|---|
+| `list_gear` | Shoes and gear in rotation, with total mileage |
+| `get_gear_for_activity` | Which gear was used on a specific activity |
+| `shoe_wear_check` | Flag shoes nearing retirement by mileage |
 
 ### Profile setup
 
@@ -231,20 +280,13 @@ git.
 | `user_profile_status` | Check whether `user_profile.md` exists / is filled in |
 | `init_user_profile` | Generate `user_profile.md` from structured inputs |
 | `get_athlete_profile` | Parse current profile into structured fields for tools |
-
-### Gear
-
-| Tool | What it does |
-|---|---|
-| `list_gear` | Shoes and gear in rotation, with total mileage |
-| `get_gear_for_activity` | Which gear was used on a specific activity |
+| `read_coach_doc` | Read a `coach://` framework doc as a tool call |
 
 ### Plan management
 
 | Tool | What it does |
 |---|---|
 | `get_plan` | Read current `plan.json` |
-| `validate_plan` | Structural check on a draft before saving |
 | `summarize_plan` | Preview per-week structure before saving |
 | `save_plan` | Write `plan.json` |
 | `materialize_plan` | Push planned workouts to Garmin calendar |
@@ -295,8 +337,12 @@ readiness against the session and the Bakken traffic-light cues.
 ## Notes
 
 **Background sync:** every MCP server start runs an incremental
-`sync_activities` in a daemon thread. Cheap when nothing's new (seconds),
-45-60 s for a cold 12-week backfill.
+`sync_activities` in a daemon thread — new activities (with HR streams,
+laps, and per-activity detail) plus the trailing ~10 days of wellness, so
+HRV/RHR/sleep stay current for the readiness tools. Cheap when nothing's
+new (seconds), 45-60 s for a cold 12-week backfill. `new_activities: 0`
+means "already up to date," not stale — the sync result returns
+`cache_newest_activity` / `cache_newest_wellness` to confirm freshness.
 
 **Zone calibration:** HR zones live in `coach_data/user_profile.md`. When
 Garmin's zones change, update the table verbatim. Zone time is recomputed
