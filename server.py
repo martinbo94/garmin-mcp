@@ -4910,19 +4910,22 @@ def double_day_advisor(
     - Goal race >= 10k (less benefit for a pure 5k focus).
     - The USER explicitly wants to try it (informed opt-in).
 
-    INFORMED CONSENT — gating contract:
-        This tool will NEVER return `eligible: true` unless `user_confirms_ready`
-        is True. With the default `user_confirms_ready=False` it reports the
-        preconditions and the user's actual standing against each, then asks the
-        user to confirm readiness. Only pass `user_confirms_ready=True` AFTER the
-        user has explicitly told you they want to try double days — never decide
-        on their behalf. Even with consent, the volume/consistency/recovery
-        checks must all pass for an eligible verdict.
+    ELIGIBILITY — base OR informed opt-in (not both required):
+        `eligible: true` is returned when EITHER the objective base is in place
+        (volume / consistency / recovery checks pass) OR the user has explicitly
+        opted in via `user_confirms_ready=True`. Meeting the base is not a hard
+        gate — an athlete who understands the trade-off can choose to proceed
+        without it; the tool then sets `override: true` and a prominent caution
+        listing exactly which preconditions are unmet and the added risk. The
+        ONLY not-eligible case is: base not met AND no explicit opt-in — there
+        the tool explains the gap and offers the opt-in path rather than
+        refusing. Only pass `user_confirms_ready=True` after the USER has
+        actually said they want to proceed — never decide that for them.
 
     WHEN NOT TO USE:
-    - The user has not asked about double days and is on the Singles default.
-    - The user is below ~70 km/week or has < 8 weeks of consistent volume —
-      they belong on Singles; double days will just add injury risk.
+    - The user has not asked about double days and is on the Singles default
+      (don't volunteer this — it's an advanced variant most runners shouldn't
+      adopt). Surface it only when the user raises double days.
     - There is a race or hard quality session scheduled in the next 3 days
       (checked against plan.json), or wellness flags poor recovery today.
 
@@ -4930,17 +4933,19 @@ def double_day_advisor(
         target_weekly_km: Target weekly km for context. If None, estimated
             from the trailing full-week average. Pass explicitly to override.
         user_confirms_ready: Set True ONLY after the user has explicitly said
-            they want to try double days. Required for an eligible verdict.
+            they want to try double days. Grants eligibility as an informed
+            override even when the objective base isn't met.
 
     Returns:
-        - eligible (bool): never True unless user_confirms_ready and all
-          objective checks pass.
-        - awaiting_user_confirmation (bool): True when consent is missing.
+        - eligible (bool): True when the base is met OR the user opted in.
+        - override (bool): True when eligible only via opt-in (base not met).
+        - awaiting_user_confirmation (bool): True only when base not met and
+          no opt-in yet — the tool is offering the informed-consent path.
         - reason (str): why eligible / not / awaiting confirmation.
-        - preconditions: each precondition with the user's status against it.
-        - suggested_structure: only when eligible — AM + PM sub-threshold plan.
+        - preconditions / failed_preconditions: status against each check.
+        - suggested_structure: AM + PM sub-threshold plan when eligible.
         - weekly_context: trailing volume + today's wellness.
-        - caution (str): safety reminder about double-day load.
+        - caution (str): safety reminder; stronger when override is True.
     """
     import sqlite3 as _sqlite3
     from datetime import date as _date, timedelta as _td
@@ -5157,86 +5162,115 @@ def double_day_advisor(
             "the first true doubles 10-15 sec/km slower than normal)."
         )
 
-        if not user_confirms_ready:
+        # Eligible if EITHER the objective base is in place OR the user has
+        # explicitly opted in (informed consent). Not meeting the base is not
+        # a hard block — the user can override; we just explain the risk. Only
+        # block when neither holds: base not met AND no explicit opt-in.
+        eligible = objective_ok or user_confirms_ready
+        override = user_confirms_ready and not objective_ok
+
+        if not eligible:
+            # Base not met and the user hasn't opted in — explain and offer
+            # the informed-consent path rather than refusing outright.
             return {
                 "eligible": False,
                 "awaiting_user_confirmation": True,
                 "reason": (
-                    "Double-threshold days are gatekept. Before going further, the "
-                    "user must explicitly confirm they want to try them (informed "
-                    "consent). Review the preconditions and your current standing "
-                    "below, then ask the user to confirm readiness. Re-run with "
-                    "user_confirms_ready=True only after the user says yes."
+                    "You don't currently meet the base for double-threshold days ("
+                    + " | ".join(reasons_fail) + "). That's not a hard block — if you "
+                    "still want to try them it's your call. Review the preconditions "
+                    "and your standing below; to proceed anyway, re-run with "
+                    "user_confirms_ready=True (informed-consent override)."
                 ),
                 "preconditions": preconditions,
                 "objective_checks_pass": objective_ok,
+                "failed_preconditions": reasons_fail,
                 "confirmation_prompt": (
-                    "Do you want to try double-threshold days? They are the "
-                    "advanced variant on top of the default Singles framework and "
-                    "require a deep base (70+ km/week, 8-12 consistent weeks). "
-                    "Confirm only if you have read the preconditions and want to proceed."
+                    "You don't yet meet the usual base (70+ km/week, 8-12 consistent "
+                    "weeks). Double-threshold days raise injury/overreach risk without "
+                    "it. Do you still want to proceed? It's your choice — confirm only "
+                    "if you understand the trade-off."
                 ),
                 "suggested_structure": None,
                 "weekly_context": weekly_context,
                 "caution": base_caution,
             }
 
-        # User has confirmed — eligibility now depends on the objective checks.
-        eligible = objective_ok
-
-        suggested_structure: Optional[dict] = None
-        if eligible:
-            suggested_structure = {
-                "am_session": {
-                    "type": "sub-threshold",
-                    "description": (
-                        "Long reps in the Golden Zone — e.g. 5×6 min or 4×8 min at "
-                        "sub-threshold HR (2.3-3.0 mmol / 80-87% max HR), short jog "
-                        "rests. Controlled and sustainable, NOT at-threshold."
-                    ),
-                },
-                "pm_session": {
-                    "type": "sub-threshold",
-                    "description": (
-                        "Short reps in the same Golden Zone — e.g. 10×1k or 45/15 "
-                        "for 20-30 min. Same HR target as AM; pace is faster only "
-                        "because rests are shorter. Still sub-threshold."
-                    ),
-                    "rest_between_sessions_h": "6-8",
-                },
-                "timing_note": (
-                    "Space the two sessions 6-8 h apart so muscle tone recovers and "
-                    "the PM reps land on relatively fresh legs. AM in the morning, "
-                    "PM by early evening to protect sleep."
+        suggested_structure = {
+            "am_session": {
+                "type": "sub-threshold",
+                "description": (
+                    "Long reps in the Golden Zone — e.g. 5×6 min or 4×8 min at "
+                    "sub-threshold HR (2.3-3.0 mmol / 80-87% max HR), short jog "
+                    "rests. Controlled and sustainable, NOT at-threshold."
                 ),
-                "rationale": (
-                    "Both sessions are sub-threshold (Golden Zone) — the goal is to "
-                    "compound recoverable threshold volume across the day, not to "
-                    "train hard twice. Partial glycogen depletion by the PM session "
-                    "is a side effect to MANAGE (fuel between sessions, keep both in "
-                    "the band), not the adaptive mechanism."
+            },
+            "pm_session": {
+                "type": "sub-threshold",
+                "description": (
+                    "Short reps in the same Golden Zone — e.g. 10×1k or 45/15 "
+                    "for 20-30 min. Same HR target as AM; pace is faster only "
+                    "because rests are shorter. Still sub-threshold."
                 ),
-            }
+                "rest_between_sessions_h": "6-8",
+            },
+            "timing_note": (
+                "Space the two sessions 6-8 h apart so muscle tone recovers and "
+                "the PM reps land on relatively fresh legs. AM in the morning, "
+                "PM by early evening to protect sleep."
+            ),
+            "rationale": (
+                "Both sessions are sub-threshold (Golden Zone) — the goal is to "
+                "compound recoverable threshold volume across the day, not to "
+                "train hard twice. Partial glycogen depletion by the PM session "
+                "is a side effect to MANAGE (fuel between sessions, keep both in "
+                "the band), not the adaptive mechanism."
+            ),
+        }
 
-        reason = (
-            "User confirmed and all preconditions met — double-threshold day is "
-            "appropriate. Keep both sessions sub-threshold."
-            if eligible
-            else "User confirmed, but preconditions not met: " + " | ".join(reasons_fail)
-        )
+        if override:
+            reason = (
+                "Preconditions NOT met (" + " | ".join(reasons_fail) + "), but you've "
+                "explicitly opted in — proceeding is your informed choice."
+            )
+            caution = (
+                "⚠ INFORMED-CONSENT OVERRIDE: you do not meet the base ("
+                + " | ".join(reasons_fail) + "), so injury/overreach risk is higher. "
+                + base_caution + " Start with the most conservative ramp (easy+threshold "
+                "on the same day before any true double; first doubles 10-15 sec/km "
+                "slower), cap at 1/week, and stop at the first sign recovery markers slip."
+            )
+        elif user_confirms_ready:
+            reason = (
+                "User confirmed and all preconditions met — double-threshold day is "
+                "appropriate. Keep both sessions sub-threshold."
+            )
+            caution = base_caution + (
+                " Skip or convert the PM session to easy if fatigue accumulates "
+                "during the AM session."
+            )
+        else:
+            # Objective base met; user hasn't explicitly opted in this call.
+            reason = (
+                "All preconditions met — double-threshold days are appropriate when "
+                "you want them. Both sessions stay sub-threshold."
+            )
+            caution = base_caution + (
+                " Skip or convert the PM session to easy if fatigue accumulates "
+                "during the AM session."
+            )
 
         return {
-            "eligible": eligible,
+            "eligible": True,
             "awaiting_user_confirmation": False,
+            "override": override,
             "reason": reason,
             "preconditions": preconditions,
             "objective_checks_pass": objective_ok,
+            "failed_preconditions": reasons_fail,
             "suggested_structure": suggested_structure,
             "weekly_context": weekly_context,
-            "caution": base_caution + (
-                " Skip or convert the PM session to easy if fatigue accumulates "
-                "during the AM session."
-            ),
+            "caution": caution,
         }
 
     except Exception as exc:
