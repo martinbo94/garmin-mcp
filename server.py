@@ -4673,6 +4673,371 @@ def return_from_break() -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
+@mcp.tool()
+def double_day_advisor(
+    target_weekly_km: Optional[float] = None,
+    user_confirms_ready: bool = False,
+) -> dict:
+    """Advise whether a runner is ready to adopt double-THRESHOLD days.
+
+    Double-threshold days are the gatekept *advanced* Bakken variant: two
+    SUB-threshold sessions in one day, 6-8 h apart, both in the Golden Zone
+    (neither at-threshold). They compound weekly threshold volume well beyond
+    the default Norwegian Singles framework — but only when a deep aerobic
+    base is already in place. The default for everyone is Singles, NOT doubles.
+
+    See coach_data/training_philosophy.md → "Advanced variant:
+    double-threshold days". Preconditions (per the doc):
+    - Sustained ~70+ km/week (ideally 100+).
+    - >= 8-12 weeks of consistent sub-threshold singles.
+    - Goal race >= 10k (less benefit for a pure 5k focus).
+    - The USER explicitly wants to try it (informed opt-in).
+
+    INFORMED CONSENT — gating contract:
+        This tool will NEVER return `eligible: true` unless `user_confirms_ready`
+        is True. With the default `user_confirms_ready=False` it reports the
+        preconditions and the user's actual standing against each, then asks the
+        user to confirm readiness. Only pass `user_confirms_ready=True` AFTER the
+        user has explicitly told you they want to try double days — never decide
+        on their behalf. Even with consent, the volume/consistency/recovery
+        checks must all pass for an eligible verdict.
+
+    WHEN NOT TO USE:
+    - The user has not asked about double days and is on the Singles default.
+    - The user is below ~70 km/week or has < 8 weeks of consistent volume —
+      they belong on Singles; double days will just add injury risk.
+    - There is a race or hard quality session scheduled in the next 3 days
+      (checked against plan.json), or wellness flags poor recovery today.
+
+    Args:
+        target_weekly_km: Target weekly km for context. If None, estimated
+            from the trailing full-week average. Pass explicitly to override.
+        user_confirms_ready: Set True ONLY after the user has explicitly said
+            they want to try double days. Required for an eligible verdict.
+
+    Returns:
+        - eligible (bool): never True unless user_confirms_ready and all
+          objective checks pass.
+        - awaiting_user_confirmation (bool): True when consent is missing.
+        - reason (str): why eligible / not / awaiting confirmation.
+        - preconditions: each precondition with the user's status against it.
+        - suggested_structure: only when eligible — AM + PM sub-threshold plan.
+        - weekly_context: trailing volume + today's wellness.
+        - caution (str): safety reminder about double-day load.
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    # Precondition thresholds (from training_philosophy.md).
+    MIN_WEEKLY_KM = 70.0          # sustained 70+ km/week (ideally 100+)
+    MIN_CONSISTENT_WEEKS = 8      # >= 8-12 weeks of consistency
+    CONSISTENT_WEEK_FLOOR_KM = 40.0  # a week "counts" only if it has real volume
+
+    try:
+        today = _date.today()
+        # Current week: Mon to today.
+        week_start = today - _td(days=today.weekday())
+        # Monday-aligned window: the Monday MIN_CONSISTENT_WEEKS *full* weeks
+        # before the current week. The current (incomplete) week is excluded
+        # from the baseline; each prior week is a complete Mon-Sun bucket.
+        window_start = week_start - _td(weeks=MIN_CONSISTENT_WEEKS)
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+
+            # ── Runs across the full-week baseline window ─────────────────
+            run_rows = conn.execute(
+                """
+                SELECT start_date_local, moving_time_s, distance_m
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) >= ?
+                  AND date(start_date_local) < ?
+                ORDER BY start_date_local
+                """,
+                (window_start.isoformat(), week_start.isoformat()),
+            ).fetchall()
+
+            # ── Current week's runs ───────────────────────────────────────
+            current_week_rows = conn.execute(
+                """
+                SELECT moving_time_s, distance_m
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) >= ?
+                  AND date(start_date_local) <= ?
+                """,
+                (week_start.isoformat(), today.isoformat()),
+            ).fetchall()
+
+            # ── Wellness for today ────────────────────────────────────────
+            wellness_row = conn.execute(
+                "SELECT body_battery_at_wake, hrv_status, recovery_time_hours "
+                "FROM wellness_daily WHERE date = ?",
+                (today.isoformat(),),
+            ).fetchone()
+
+        # ── Build one complete Mon-Sun bucket per week in the window ───────
+        # Pre-seed every week with 0.0 so weeks with NO runs count as 0 (an
+        # inconsistent runner must not pass by averaging only the weeks run).
+        weekly_km: dict[str, float] = {}
+        weekly_min: dict[str, float] = {}
+        for i in range(MIN_CONSISTENT_WEEKS):
+            wk = (window_start + _td(weeks=i)).isoformat()
+            weekly_km[wk] = 0.0
+            weekly_min[wk] = 0.0
+        for r in run_rows:
+            d = _date.fromisoformat(r["start_date_local"][:10])
+            wk = (d - _td(days=d.weekday())).isoformat()
+            if wk in weekly_km:  # ignore stragglers outside the seeded weeks
+                weekly_km[wk] += (r["distance_m"] or 0) / 1000
+                weekly_min[wk] += (r["moving_time_s"] or 0) / 60
+
+        baseline_km = list(weekly_km.values())
+        n_weeks = len(baseline_km)
+        avg_weekly_km = sum(baseline_km) / n_weeks if n_weeks else 0.0
+        consistent_weeks = sum(1 for v in baseline_km if v >= CONSISTENT_WEEK_FLOOR_KM)
+
+        if target_weekly_km is None:
+            target_weekly_km = round(avg_weekly_km * 1.05, 1) if avg_weekly_km > 0 else MIN_WEEKLY_KM
+
+        # Current week so far.
+        current_week_km = sum((r["distance_m"] or 0) for r in current_week_rows) / 1000
+        current_week_min = sum((r["moving_time_s"] or 0) for r in current_week_rows) / 60
+        remaining_km = max(0.0, target_weekly_km - current_week_km)
+
+        # ── Objective precondition checks ─────────────────────────────────
+        reasons_fail: list[str] = []
+        preconditions: list[dict] = []
+
+        # 1. Sustained weekly volume (~70+ km/week).
+        volume_ok = avg_weekly_km >= MIN_WEEKLY_KM
+        preconditions.append({
+            "name": "sustained_weekly_volume",
+            "requirement": f">= {MIN_WEEKLY_KM:.0f} km/week (ideally 100+)",
+            "your_status": f"{avg_weekly_km:.1f} km/week over the last {n_weeks} full weeks",
+            "met": volume_ok,
+        })
+        if not volume_ok:
+            reasons_fail.append(
+                f"Weekly volume too low ({avg_weekly_km:.1f} km/week) — "
+                f"double-threshold needs sustained {MIN_WEEKLY_KM:.0f}+ km/week"
+            )
+
+        # 2. Consistency (>= 8-12 weeks of real volume).
+        consistency_ok = consistent_weeks >= MIN_CONSISTENT_WEEKS
+        preconditions.append({
+            "name": "consistency",
+            "requirement": f">= {MIN_CONSISTENT_WEEKS} consecutive weeks of consistent volume",
+            "your_status": (
+                f"{consistent_weeks} of the last {n_weeks} weeks had "
+                f">= {CONSISTENT_WEEK_FLOOR_KM:.0f} km"
+            ),
+            "met": consistency_ok,
+        })
+        if not consistency_ok:
+            reasons_fail.append(
+                f"Not enough consistent weeks ({consistent_weeks}/{MIN_CONSISTENT_WEEKS}) — "
+                f"need {MIN_CONSISTENT_WEEKS}-12 weeks of consistent singles first"
+            )
+
+        # 3. Recovery / readiness today (wellness).
+        body_battery = wellness_row["body_battery_at_wake"] if wellness_row else None
+        hrv_status_raw = wellness_row["hrv_status"] if wellness_row else None
+        hrv_status = (hrv_status_raw or "").lower()
+        recovery_hours = wellness_row["recovery_time_hours"] if wellness_row else None
+        battery_ok = body_battery is not None and body_battery >= 70
+        hrv_ok = hrv_status not in ("poor", "low", "unbalanced")
+        recovery_ok = recovery_hours is None or recovery_hours <= 36
+        wellness_ok = battery_ok and hrv_ok and recovery_ok
+        preconditions.append({
+            "name": "recovery_today",
+            "requirement": "body battery >= 70, HRV not poor/unbalanced, recovery time <= 36 h",
+            "your_status": (
+                f"body battery {body_battery}, HRV '{hrv_status_raw}', "
+                f"recovery {recovery_hours}h"
+            ),
+            "met": wellness_ok,
+        })
+        if not battery_ok:
+            if body_battery is None:
+                reasons_fail.append("Body battery at wake not available (sync wellness data)")
+            else:
+                reasons_fail.append(f"Body battery at wake too low ({body_battery}) — need >= 70")
+        if not hrv_ok:
+            reasons_fail.append(
+                f"HRV status is '{hrv_status_raw}' — double day inadvisable when HRV is suppressed"
+            )
+        if not recovery_ok:
+            reasons_fail.append(
+                f"Recovery time elevated ({recovery_hours}h) — likely post-race/hard effort. "
+                "Skip a hard double until recovered"
+            )
+
+        # 4. No race / hard quality session scheduled in the next 3 days
+        #    (checked against plan.json, not inferred from recovery time).
+        upcoming_conflict: Optional[dict] = None
+        try:
+            plan = plan_mod.load_plan()
+        except Exception:
+            plan = None
+        if plan and isinstance(plan.get("workouts"), list):
+            horizon = today + _td(days=3)
+            HARD_TYPES = {"race", "threshold", "vo2", "interval"}
+            for w in plan["workouts"]:
+                w_date_s = w.get("date")
+                if not w_date_s:
+                    continue
+                try:
+                    w_date = _date.fromisoformat(w_date_s[:10])
+                except ValueError:
+                    continue
+                if today <= w_date <= horizon and (w.get("type") or "").lower() in HARD_TYPES:
+                    upcoming_conflict = {
+                        "date": w_date.isoformat(),
+                        "type": w.get("type"),
+                        "name": w.get("name"),
+                    }
+                    break
+        calendar_ok = upcoming_conflict is None
+        preconditions.append({
+            "name": "calendar_clear",
+            "requirement": "no race or hard quality session scheduled in the next 3 days",
+            "your_status": (
+                "clear" if calendar_ok
+                else f"{upcoming_conflict['type']} on {upcoming_conflict['date']} "
+                     f"({upcoming_conflict['name']})"
+            ),
+            "met": calendar_ok,
+        })
+        if not calendar_ok:
+            reasons_fail.append(
+                f"Hard session scheduled within 3 days "
+                f"({upcoming_conflict['type']} on {upcoming_conflict['date']}) — "
+                "don't stack a double day right before it"
+            )
+
+        objective_ok = len(reasons_fail) == 0
+
+        # ── Consent gate: never eligible without explicit user opt-in ─────
+        weekly_context = {
+            "current_week_km": round(current_week_km, 1),
+            "current_week_min": round(current_week_min, 0),
+            "target_weekly_km": target_weekly_km,
+            "remaining_km": round(remaining_km, 1),
+            "avg_weekly_km": round(avg_weekly_km, 1),
+            "weeks_assessed": n_weeks,
+            "consistent_weeks": consistent_weeks,
+            "body_battery_at_wake": body_battery,
+            "hrv_status": hrv_status_raw,
+            "recovery_time_hours": recovery_hours,
+        }
+        base_caution = (
+            "Double-threshold days are the advanced variant — at most 2 per "
+            "week with full easy days between, and the default remains "
+            "Norwegian Singles. Both sessions stay sub-threshold (Golden Zone); "
+            "ramp in gradually (start with easy+threshold on the same day, run "
+            "the first true doubles 10-15 sec/km slower than normal)."
+        )
+
+        if not user_confirms_ready:
+            return {
+                "eligible": False,
+                "awaiting_user_confirmation": True,
+                "reason": (
+                    "Double-threshold days are gatekept. Before going further, the "
+                    "user must explicitly confirm they want to try them (informed "
+                    "consent). Review the preconditions and your current standing "
+                    "below, then ask the user to confirm readiness. Re-run with "
+                    "user_confirms_ready=True only after the user says yes."
+                ),
+                "preconditions": preconditions,
+                "objective_checks_pass": objective_ok,
+                "confirmation_prompt": (
+                    "Do you want to try double-threshold days? They are the "
+                    "advanced variant on top of the default Singles framework and "
+                    "require a deep base (70+ km/week, 8-12 consistent weeks). "
+                    "Confirm only if you have read the preconditions and want to proceed."
+                ),
+                "suggested_structure": None,
+                "weekly_context": weekly_context,
+                "caution": base_caution,
+            }
+
+        # User has confirmed — eligibility now depends on the objective checks.
+        eligible = objective_ok
+
+        suggested_structure: Optional[dict] = None
+        if eligible:
+            suggested_structure = {
+                "am_session": {
+                    "type": "sub-threshold",
+                    "description": (
+                        "Long reps in the Golden Zone — e.g. 5×6 min or 4×8 min at "
+                        "sub-threshold HR (2.3-3.0 mmol / 80-87% max HR), short jog "
+                        "rests. Controlled and sustainable, NOT at-threshold."
+                    ),
+                },
+                "pm_session": {
+                    "type": "sub-threshold",
+                    "description": (
+                        "Short reps in the same Golden Zone — e.g. 10×1k or 45/15 "
+                        "for 20-30 min. Same HR target as AM; pace is faster only "
+                        "because rests are shorter. Still sub-threshold."
+                    ),
+                    "rest_between_sessions_h": "6-8",
+                },
+                "timing_note": (
+                    "Space the two sessions 6-8 h apart so muscle tone recovers and "
+                    "the PM reps land on relatively fresh legs. AM in the morning, "
+                    "PM by early evening to protect sleep."
+                ),
+                "rationale": (
+                    "Both sessions are sub-threshold (Golden Zone) — the goal is to "
+                    "compound recoverable threshold volume across the day, not to "
+                    "train hard twice. Partial glycogen depletion by the PM session "
+                    "is a side effect to MANAGE (fuel between sessions, keep both in "
+                    "the band), not the adaptive mechanism."
+                ),
+            }
+
+        reason = (
+            "User confirmed and all preconditions met — double-threshold day is "
+            "appropriate. Keep both sessions sub-threshold."
+            if eligible
+            else "User confirmed, but preconditions not met: " + " | ".join(reasons_fail)
+        )
+
+        return {
+            "eligible": eligible,
+            "awaiting_user_confirmation": False,
+            "reason": reason,
+            "preconditions": preconditions,
+            "objective_checks_pass": objective_ok,
+            "suggested_structure": suggested_structure,
+            "weekly_context": weekly_context,
+            "caution": base_caution + (
+                " Skip or convert the PM session to easy if fatigue accumulates "
+                "during the AM session."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "eligible": False,
+            "awaiting_user_confirmation": False,
+            "reason": f"Error assessing eligibility: {type(exc).__name__}: {exc}",
+            "preconditions": [],
+            "suggested_structure": None,
+            "weekly_context": {},
+            "caution": (
+                "Double-threshold days are the gatekept advanced variant; the "
+                "default is Norwegian Singles. Stay on Singles unless a deep base "
+                "is in place and the user has explicitly opted in."
+            ),
+        }
+
+
 # ─── Background startup sync ───────────────────────────────────────────
 def _startup_sync():
     try:
