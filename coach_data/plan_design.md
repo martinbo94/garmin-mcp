@@ -222,39 +222,40 @@ The signal-rich numbers (when available) are:
 - **Subjective "fast vs durable"** — Type II (sprinter-leaning) vs Type I
   (diesel-engine) tendency
 
-### Three common profiles and how to bias the plan
+### Reading the limiter (infer it, don't label it)
 
-**Profile A: High VO2max, low utilization (VO2-strong, threshold-weak).**
-Symptoms: natural speed, fast 5k for the volume trained, but feels like
-"hits a wall" at sustained efforts, can't hold threshold pace long.
-*Implication:* the bottleneck is utilization. Sub-threshold work is the
-right lever; speed and overspeed are not. Even for short-distance prep
-(5k / 10k), **bias X-økt toward sub-threshold variation** (45/15 at
-sub-threshold, longer threshold reps) rather than hills, 200-300 m
-repeats, or 30/30 at VO2max effort. Standard distance-specific X-økt
-menu is wrong here.
+There is no tidy "athlete type" taxonomy here — resist pinning a runner
+to a fixed profile. Read the limiter from the numbers above as a current,
+revisable observation and bias supplemental work toward it.
 
-**Profile B: Moderate VO2max, high utilization (well-rounded, "good for
-their VO2").** Symptoms: strong threshold but feels relative slow at
-short distances. *Implication:* VO2max work moves the ceiling and
-indirectly helps everything. Standard race-prep templates apply. The
-distance-specific X-økt menu in this doc is built for this profile.
-
-**Profile C: Low VO2max, low utilization (early in training history or
-returning).** *Implication:* both ends need work but threshold work is
-still the engine. Stay close to the Norwegian Singles base for months
-before adding any race-specific overspeed.
+- **Big ceiling-to-performance gap** — measured VO2max is high, but race
+  times imply a much lower effective level (a VDOT well below the lab
+  VO2max). That points to utilization and/or economy as the limiter, so
+  sub-threshold work is the lever, not speed/overspeed: even for 5k/10k
+  prep, bias the X-økt toward sub-threshold variation (45/15 at
+  sub-threshold, longer threshold reps) over hills, 200-300 m repeats, or
+  30/30 at VO2max effort. **Caveat:** race time alone cannot separate low
+  utilization from poor economy — only a lab utilization number
+  (VO2 at LT2 / VO2max) measures utilization directly, and effort/HR in a
+  race says nothing about it. Hold the inference loosely.
+- **Utilization already high (>~85% at LT2)** — the aerobic ceiling is
+  the constraint; VO2 work moves it and helps everything, and the
+  standard distance-specific X-økt menu in this doc applies.
+- **Both low (early in training / returning)** — both ends need work but
+  threshold is still the engine; stay close to the Norwegian Singles base
+  for months before adding race-specific overspeed.
 
 ### Rule of thumb
 
-If you don't know your profile, follow the standard template. If you do
-know your profile (from lab tests, race performance patterns, training
-history), bias the X-økt and supplemental work accordingly. The Tue/Thu
-threshold backbone stays the same regardless — only the X-økt and
-specific-prep elements change.
+If you can't identify a clear limiter, follow the standard template. If
+you can (from lab tests, race performance patterns, training history),
+bias the X-økt and supplemental work toward it. The Tue/Thu threshold
+backbone stays the same regardless — only the X-økt and specific-prep
+elements change.
 
-The athlete's profile and bias notes are in `coach://user_profile`.
-Always check before applying race-prep templates verbatim.
+The athlete's current limiter read and bias notes are in
+`coach://user_profile`. Always check before applying race-prep templates
+verbatim — and treat it as a revisable observation, not a fixed label.
 
 ## Top-up mileage weeks (volume-build option)
 

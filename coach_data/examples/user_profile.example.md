@@ -75,16 +75,16 @@ Real-world fitness anchors. Add as you set them.
 
 ## Athlete profile
 
-Pick the one that matches your test + race history (see
-`coach://plan_design` for the full taxonomy):
+State your current limiter as a revisable observation, not a fixed type
+(see `coach://plan_design` → "Reading the limiter"). The common reads:
 
-- **Profile A: VO2-strong / utilization-weak** — high VO2max relative to
-  race times, low utilization at LT2 (< 80%). Limiter is threshold
-  endurance. Bias X-økt toward sub-threshold variation, not VO2.
-- **Profile B: utilization-strong / VO2-weak** — already squeezing most
-  of your VO2max at threshold (utilization > 85%) but VO2max is the
-  ceiling. Limiter is aerobic ceiling. VO2 work matters more.
-- **Profile C: balanced** — no clear bottleneck. Standard mix.
+- **Limiter looks like utilization/endurance** — high VO2max relative to
+  race times, low measured utilization at LT2 (< ~80%). Bias the X-økt
+  toward sub-threshold variation, not VO2. (Race time alone can't tell
+  utilization from economy — lean on a lab utilization number.)
+- **Limiter looks like the VO2 ceiling** — already using most of your
+  VO2max at threshold (utilization > ~85%). VO2 work matters more.
+- **No clear limiter** — standard mix.
 
 ## Session pace estimates (conservative, training-day)
 
