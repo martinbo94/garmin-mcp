@@ -3325,6 +3325,168 @@ def weekly_retrospective(week_start: str) -> dict:
     }
 
 
+# ─── Training load balance (ACWR) ─────────────────────────────────────
+@mcp.tool()
+def training_load_balance(as_of_date: Optional[str] = None) -> dict:
+    """Estimate the Acute:Chronic Workload Ratio (ACWR) from cached run history.
+
+    Load metric is **run duration in minutes** (duration-only — there is no
+    intensity / HR / TRIMP weighting, even though avg_hr is cached, so a hard
+    interval session and an easy run of equal length count the same). Both
+    windows are *rolling* windows ending on the as-of date — NOT calendar
+    weeks — so the figure is stable on any weekday (including Monday morning).
+
+    - acute load   = total run minutes over the rolling LAST 7 DAYS
+                     (as_of - 6 days .. as_of, inclusive).
+    - chronic load = total run minutes over the rolling LAST 28 DAYS
+                     (as_of - 27 days .. as_of, inclusive), divided by 4 to
+                     express it as a weekly-equivalent that matches the 7-day
+                     acute window. Note the windows are *coupled*: the acute
+                     7 days sit inside the chronic 28 days.
+    - acwr = acute / chronic_weekly. If chronic is 0 (not enough history),
+      acwr is None and a "not enough history" message is returned.
+
+    The 0.8 / 1.3 / 1.5 ACWR thresholds below are a commonly-used heuristic
+    (Gabbett et al.) — the underlying injury model is contested in the
+    literature and has NOT been validated for this athlete. This repo's
+    framework is Bakken threshold-based, not ACWR-based; treat the zone as a
+    rough volume-trend sanity check, not a hard injury predictor.
+
+    Args:
+        as_of_date: Optional 'YYYY-MM-DD' anchor date for retrospectives.
+            Defaults to today (local date). Both windows end on this date.
+
+    Returns:
+        as_of_date             : the anchor date used
+        acute_load_min         : total run minutes over the last 7 days
+        chronic_load_min       : weekly-equivalent run minutes (last 28 days / 4)
+        acwr                   : rounded to 2 dp (None if chronic is 0)
+        zone                   : 'undertraining' | 'optimal' | 'caution'
+                                 | 'high_risk' (None if chronic is 0)
+        recommendation         : coaching string
+        weekly_breakdown       : list of {week_start, week_end, run_minutes} for
+                                 the 4 rolling 7-day blocks ending on as_of
+                                 (oldest first; last block == acute window)
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        if as_of_date is not None:
+            try:
+                as_of = _date.fromisoformat(as_of_date)
+            except ValueError as e:
+                return {"error": f"Invalid as_of_date: {e}"}
+        else:
+            as_of = _date.today()
+
+        acute_start = as_of - _td(days=6)    # rolling last 7 days, inclusive
+        chronic_start = as_of - _td(days=27)  # rolling last 28 days, inclusive
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            rows = conn.execute(
+                """
+                SELECT date(start_date_local) AS run_date,
+                       COALESCE(NULLIF(moving_time_s, 0), elapsed_time_s, 0)
+                           AS load_s
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) BETWEEN ? AND ?
+                ORDER BY run_date
+                """,
+                (chronic_start.isoformat(), as_of.isoformat()),
+            ).fetchall()
+
+        # Build 4 rolling 7-day blocks ending on as_of (oldest first).
+        weeks: list[dict] = []
+        for block_offset in range(3, -1, -1):
+            wk_end = as_of - _td(days=7 * block_offset)
+            wk_start = wk_end - _td(days=6)
+            weeks.append({
+                "week_start": wk_start.isoformat(),
+                "week_end": wk_end.isoformat(),
+                "run_minutes": 0.0,
+            })
+
+        acute_load_min = 0.0
+        chronic_total_min = 0.0
+        for run_date_str, load_s in rows:
+            minutes = (load_s or 0) / 60.0
+            chronic_total_min += minutes
+            if acute_start.isoformat() <= run_date_str <= as_of.isoformat():
+                acute_load_min += minutes
+            for bucket in weeks:
+                if bucket["week_start"] <= run_date_str <= bucket["week_end"]:
+                    bucket["run_minutes"] += minutes
+                    break
+
+        acute_load_min = round(acute_load_min, 1)
+        # Chronic expressed as a weekly equivalent (28 days / 4).
+        chronic_load_min = round(chronic_total_min / 4.0, 1)
+        for bucket in weeks:
+            bucket["run_minutes"] = round(bucket["run_minutes"], 1)
+
+        if chronic_load_min == 0:
+            return {
+                "as_of_date": as_of.isoformat(),
+                "acute_load_min": acute_load_min,
+                "chronic_load_min": chronic_load_min,
+                "acwr": None,
+                "zone": None,
+                "recommendation": (
+                    "Not enough history — no run load found in the last 28 days, "
+                    "so a chronic baseline can't be computed. Sync activities "
+                    "(or pick a later as_of_date with cache coverage), then "
+                    "rebuild volume gently."
+                ),
+                "weekly_breakdown": weeks,
+            }
+
+        acwr = round(acute_load_min / chronic_load_min, 2)
+        if acwr < 0.8:
+            zone = "undertraining"
+            recommendation = (
+                f"ACWR {acwr} — below the 0.8 floor. Recent volume is low "
+                "relative to your 28-day baseline. A moderate increase in "
+                "easy volume is reasonable. (Heuristic only, not validated "
+                "for you, and duration-only — it ignores intensity.)"
+            )
+        elif acwr <= 1.3:
+            zone = "optimal"
+            recommendation = (
+                f"ACWR {acwr} — in the commonly-cited 0.8–1.3 'optimal' band. "
+                "Recent load is well-matched to your 28-day base. (Heuristic "
+                "only, not validated for you, and duration-only.)"
+            )
+        elif acwr <= 1.5:
+            zone = "caution"
+            recommendation = (
+                f"ACWR {acwr} — in the 1.3–1.5 'caution' band. Acute load is "
+                "running ahead of your chronic base; consider holding volume "
+                "steady. (Heuristic only, not validated for you, and "
+                "duration-only.)"
+            )
+        else:
+            zone = "high_risk"
+            recommendation = (
+                f"ACWR {acwr} — above 1.5. Acute load is well ahead of your "
+                "chronic base; an easier day could let the base catch up. "
+                "(Heuristic only, not validated for you, and duration-only.)"
+            )
+
+        return {
+            "as_of_date": as_of.isoformat(),
+            "acute_load_min": acute_load_min,
+            "chronic_load_min": chronic_load_min,
+            "acwr": acwr,
+            "zone": zone,
+            "recommendation": recommendation,
+            "weekly_breakdown": weeks,
+        }
+
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
 # ─── Progress report ──────────────────────────────────────────────────
 @mcp.tool()
 def progress_report(
