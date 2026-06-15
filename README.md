@@ -264,7 +264,7 @@ git.
 | `plan_interval_session` | Interval structure + rep distances from profile paces |
 | `forecast_conditions` | Weather (Open-Meteo) for a date/time; auto-locates from latest activity |
 | `heat_pace_adjustment` | Adjust pace for heat + humidity (dew-point method) |
-| `analyze_race_course` | GPX course profile + even-effort per-km race pacing for a goal |
+| `analyze_race_course` | GPX course analysis (sustained climbs/descents + short steep "wall" pitches) + grade-adjusted per-km race pacing for a goal (even-effort default, optional conservative-start negative-split) |
 
 ### Gear
 
@@ -334,6 +334,17 @@ readiness against the session and the Bakken traffic-light cues.
 ```
 > Move Tuesday's threshold to Wednesday
 ```
+
+### Race-course pacing from a GPX
+```
+> Analyze this course (course.gpx) and give me a 1:45 pacing plan
+```
+Claude calls `analyze_race_course`, profiles the course (sustained climbs
+and short steep "wall" pitches detected at the point level, not just per-km
+averages), and returns a grade-adjusted per-km plan that sums to the goal —
+even-effort by default, with an optional conservative-start negative-split.
+For hot races it can pull conditions via `forecast_conditions` and
+heat-adjust the target (it'll ask your planned start time).
 
 ## Notes
 
