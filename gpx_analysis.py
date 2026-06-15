@@ -16,6 +16,12 @@ from typing import Optional
 _UPHILL_COEFF = 0.033       # +3.3% pace per +1% grade
 _DOWNHILL_COEFF = 0.018     # -1.8% pace per -1% grade (downhill helps less)
 _DOWNHILL_FACTOR_FLOOR = 0.90
+# The linear model is only a reasonable approximation for moderate gradients.
+# Beyond this the true cost is nonlinear (steep uphills become a hike; steep
+# downhills slow again from braking/eccentric load), so we clamp the grade fed
+# to the model and flag segments past it as "run by effort, not by the split."
+MODEL_RELIABLE_MAX_GRADE = 10.0
+_GRADE_CLAMP = 15.0
 # Total-ascent smoothing: GPS elevation is noisy. Smooth over a fixed
 # DISTANCE (~30 m) rather than a fixed point count, so dense (1 s) tracks get
 # denoised without flattening the profile of sparse tracks.
@@ -66,10 +72,17 @@ def parse_gpx(path: str) -> list[dict]:
 
 
 def grade_factor(grade_pct: float) -> float:
-    """Pace multiplier for a gradient (1.0 = flat-equivalent)."""
-    if grade_pct >= 0:
-        return 1 + grade_pct * _UPHILL_COEFF
-    return max(_DOWNHILL_FACTOR_FLOOR, 1 + grade_pct * _DOWNHILL_COEFF)
+    """Pace multiplier for a gradient (1.0 = flat-equivalent).
+
+    Grade is clamped to ±_GRADE_CLAMP before applying the linear model, so
+    a freak-steep segment can't produce an absurd split — but past
+    MODEL_RELIABLE_MAX_GRADE the number is only a rough placeholder; callers
+    should flag those segments as effort-paced.
+    """
+    g = max(-_GRADE_CLAMP, min(_GRADE_CLAMP, grade_pct))
+    if g >= 0:
+        return 1 + g * _UPHILL_COEFF
+    return max(_DOWNHILL_FACTOR_FLOOR, 1 + g * _DOWNHILL_COEFF)
 
 
 def _smoothed_elevations(eles: list[float], window: int) -> list[float]:
@@ -107,24 +120,29 @@ def course_profile(points: list[dict]) -> dict:
     elevations = None
     ascent = descent = net = 0.0
     if has_ele:
-        # forward-fill any sparse gaps, then smooth over ~_SMOOTH_DISTANCE_M.
+        # forward-fill any sparse gaps.
         filled = []
         last = next((e for e in eles_raw if e is not None), 0.0)
         for e in eles_raw:
             if e is not None:
                 last = e
             filled.append(last)
+        # `elevations` (used for grades + climb detection) stays as raw filled
+        # so sharp features aren't blunted. The ascent/descent TOTALS, which
+        # sum many small deltas and so amplify noise, use a ~_SMOOTH_DISTANCE_M
+        # moving average instead.
+        elevations = filled
         diffs = [cum[i] - cum[i - 1] for i in range(1, n) if cum[i] > cum[i - 1]]
         median_spacing = sorted(diffs)[len(diffs) // 2] if diffs else 1.0
         window = max(1, min(25, round(_SMOOTH_DISTANCE_M / median_spacing)))
-        elevations = _smoothed_elevations(filled, window)
+        smooth = _smoothed_elevations(filled, window)
         for i in range(1, n):
-            delta = elevations[i] - elevations[i - 1]
+            delta = smooth[i] - smooth[i - 1]
             if delta >= _ASCENT_STEP_THRESHOLD_M:
                 ascent += delta
             elif delta <= -_ASCENT_STEP_THRESHOLD_M:
                 descent += -delta
-        net = elevations[-1] - elevations[0]
+        net = smooth[-1] - smooth[0]
 
     return {
         "cum_dist_m": cum,
@@ -192,6 +210,134 @@ def per_km_segments(profile: dict) -> list[dict]:
         start = end
         km += 1
     return segments
+
+
+# ─── Notable climbs / descents (point-level, not per-km) ──────────────
+# Per-km averages hide short steep hills (a 100 m @ 10% inside a flat km reads
+# as ~1%). These detectors work on a fine resample so a sharp ramp is caught.
+_DETECT_STEP_M = 20.0       # resample resolution
+_RETRACE_TOL_M = 4.0        # vertical retracement that ends a climb/descent
+_MIN_GAIN_M = 8.0           # ignore bumps smaller than this
+_MIN_AVG_GRADE = 3.0        # ignore gentler-than-this features
+_MAXGRADE_WIN_M = 40.0      # window for the steepest sub-stretch
+
+
+def _grade_category(abs_grade: float) -> str:
+    if abs_grade >= 10:
+        return "very steep"
+    if abs_grade >= 7:
+        return "steep"
+    if abs_grade >= 4:
+        return "moderate"
+    return "gentle"
+
+
+def _resample(profile: dict, step_m: float):
+    total = profile["total_distance_m"]
+    dists = []
+    d = 0.0
+    while d < total:
+        dists.append(d)
+        d += step_m
+    dists.append(total)
+    eles = [_ele_at(profile, x) for x in dists]
+    return dists, eles
+
+
+def _max_grade_in(dists, eles, a, b, sign) -> float:
+    """Steepest ~_MAXGRADE_WIN_M sub-stretch grade within [a, b] (signed)."""
+    mg = 0.0
+    for k in range(a, b):
+        m = k + 1
+        while m < b and dists[m] - dists[k] < _MAXGRADE_WIN_M:
+            m += 1
+        span = dists[m] - dists[k]
+        if span <= 0:
+            continue
+        g = sign * (eles[m] - eles[k]) / span * 100
+        if g > mg:
+            mg = g
+    return mg
+
+
+def _detect(profile: dict, sign: int) -> list[dict]:
+    """Sustained ascents (sign=+1) or descents (sign=-1) on the resampled
+    profile, merged across small retracements, filtered to notable ones."""
+    if not profile["has_elevation"]:
+        return []
+    dists, eles = _resample(profile, _DETECT_STEP_M)
+    n = len(eles)
+    feats = []
+    i = 0
+    while i < n - 1:
+        if sign * (eles[i + 1] - eles[i]) <= 0:
+            i += 1
+            continue
+        start = i
+        ext = i + 1            # peak (climb) or trough (descent)
+        j = i + 1
+        while j < n:
+            if sign * (eles[j] - eles[ext]) > 0:
+                ext = j
+            if sign * (eles[ext] - eles[j]) >= _RETRACE_TOL_M:
+                break
+            j += 1
+        gain = sign * (eles[ext] - eles[start])      # always positive
+        length = dists[ext] - dists[start]
+        if length > 0 and gain >= _MIN_GAIN_M:
+            avg_grade = gain / length * 100
+            if avg_grade >= _MIN_AVG_GRADE:
+                max_grade = _max_grade_in(dists, eles, start, ext, sign)
+                start_km = dists[start] / 1000.0
+                end_km = dists[ext] / 1000.0
+                reliable = (avg_grade <= MODEL_RELIABLE_MAX_GRADE
+                            and max_grade <= MODEL_RELIABLE_MAX_GRADE + 3)
+                feats.append({
+                    "kind": "climb" if sign > 0 else "descent",
+                    "start_km": round(start_km, 1),
+                    "end_km": round(end_km, 1),
+                    "length_m": int(round(length / 10.0) * 10),
+                    ("gain_m" if sign > 0 else "drop_m"): round(gain),
+                    "avg_grade_pct": round(avg_grade, 1),
+                    "max_grade_pct": round(max_grade, 1),
+                    "category": _grade_category(avg_grade),
+                    "pace_model_reliable": reliable,
+                    "note": _feature_note(
+                        sign, start_km, int(round(length / 10.0) * 10),
+                        avg_grade, max_grade, gain, _grade_category(avg_grade),
+                        reliable,
+                    ),
+                })
+        i = max(ext, start + 1)
+    return feats
+
+
+def _feature_note(sign, start_km, length_m, avg_grade, max_grade, gain,
+                  category, reliable) -> str:
+    if sign > 0:
+        note = (f"Climb around {start_km:.1f} km: ~{length_m} m at ~{avg_grade:.0f}% "
+                f"(max ~{max_grade:.0f}%, +{gain:.0f} m) — {category}.")
+        if not reliable:
+            note += (" Pace target here is unreliable at this gradient — run by "
+                     "effort and be ready to hike.")
+        else:
+            note += " Hold effort, let pace drift up; don't chase the split."
+    else:
+        note = (f"Descent around {start_km:.1f} km: ~{length_m} m at ~{avg_grade:.0f}% "
+                f"(max ~{max_grade:.0f}%, −{gain:.0f} m) — {category}.")
+        if not reliable:
+            note += (" Steep — the time-gain estimate is optimistic; control the "
+                     "quads, don't brake-and-blow.")
+        else:
+            note += " Free speed — stay relaxed and roll it."
+    return note
+
+
+def detect_features(profile: dict) -> dict:
+    """Notable climbs and descents (point-level), each with a coaching note."""
+    climbs = _detect(profile, +1)
+    descents = _detect(profile, -1)
+    return {"climbs": climbs, "descents": descents}
 
 
 def fmt_pace(s_per_km: float) -> str:
