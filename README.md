@@ -1,4 +1,4 @@
-# garmin-coach-mcp
+# garmin-mcp
 
 Personal running coach MCP server. Plan workouts, push them to Garmin
 Connect, pull activity history into a local cache, and reason about
@@ -14,7 +14,7 @@ across sessions.
 ```
 ┌─ Claude (Desktop / Code / API) ───────────────────────────────┐
 │                                                               │
-│  ┌─ garmin-coach (this repo) ──────────────────────────────┐  │
+│  ┌─ garmin-mcp (this repo) ────────────────────────────────┐  │
 │  │                                                         │  │
 │  │  GARMIN WRITE   create / schedule / reschedule /        │  │
 │  │                 swap / delete workouts                  │  │
@@ -70,8 +70,8 @@ replacing the path in the last one with wherever you cloned the repo:
 git --version
 
 # 2. Clone the repo
-git clone https://github.com/martinbo94/garmin-workout-scheduler.git
-cd garmin-workout-scheduler
+git clone https://github.com/martinbo94/garmin-mcp.git
+cd garmin-mcp
 
 # 3. Run the setup script
 bash setup.sh
@@ -103,9 +103,9 @@ cp .env.example .env
 ```json
 {
   "mcpServers": {
-    "garmin-coach": {
-      "command": "/absolute/path/to/garmin-coach-mcp/.venv/bin/python",
-      "args": ["/absolute/path/to/garmin-coach-mcp/server.py"]
+    "garmin-mcp": {
+      "command": "/absolute/path/to/garmin-mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/garmin-mcp/server.py"]
     }
   }
 }
@@ -114,7 +114,7 @@ cp .env.example .env
 **Claude Code** — run once:
 
 ```bash
-claude mcp add -s user garmin-coach -- \
+claude mcp add -s user garmin-mcp -- \
   <repo>/.venv/bin/python <repo>/server.py
 ```
 
