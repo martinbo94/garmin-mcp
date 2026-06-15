@@ -1,4 +1,4 @@
-"""garmin-coach-mcp — MCP server for managing Garmin Connect workouts.
+"""garmin-mcp — MCP server for managing Garmin Connect workouts.
 
 Run with:
     python server.py             # via stdio (how Claude Desktop/Code invokes it)
@@ -106,7 +106,7 @@ Skip the Bakken-specific analysis (session_category, profile A/B/C,
 sub-threshold band) — just use HR zones and lap data directly.
 """.strip()
 
-mcp = FastMCP("garmin-coach", instructions=SERVER_INSTRUCTIONS)
+mcp = FastMCP("garmin-mcp", instructions=SERVER_INSTRUCTIONS)
 _COACH_DATA = Path(__file__).parent / "coach_data"
 
 

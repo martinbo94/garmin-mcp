@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-time setup for garmin-coach-mcp.
+# One-time setup for garmin-mcp.
 # Run once from the repo root: bash setup.sh
 
 set -e
@@ -25,7 +25,7 @@ fi
 CONFIG_FILE="$CONFIG_DIR/claude_desktop_config.json"
 
 echo ""
-echo "=== garmin-coach-mcp setup ==="
+echo "=== garmin-mcp setup ==="
 echo ""
 
 # 1. Create virtual environment and install dependencies
@@ -95,7 +95,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     cat > "$CONFIG_FILE" <<EOF
 {
   "mcpServers": {
-    "garmin-coach": {
+    "garmin-mcp": {
       "command": "$PYTHON",
       "args": ["$REPO/server.py"]
     }
@@ -104,19 +104,19 @@ if [ ! -f "$CONFIG_FILE" ]; then
 EOF
     echo "Created Claude Desktop config."
 else
-    if grep -q "garmin-coach" "$CONFIG_FILE"; then
-        echo "garmin-coach already in Claude Desktop config, skipping."
+    if grep -q "garmin-mcp" "$CONFIG_FILE"; then
+        echo "garmin-mcp already in Claude Desktop config, skipping."
     else
         REPO="$REPO" PYTHON="$PYTHON" python3 <<PYEOF
 import json, pathlib, os
 path = pathlib.Path(os.environ["HOME"] + "/Library/Application Support/Claude/claude_desktop_config.json")
 cfg = json.loads(path.read_text())
-cfg.setdefault("mcpServers", {})["garmin-coach"] = {
+cfg.setdefault("mcpServers", {})["garmin-mcp"] = {
     "command": os.environ["PYTHON"],
     "args": [os.environ["REPO"] + "/server.py"]
 }
 path.write_text(json.dumps(cfg, indent=2))
-print("  Added garmin-coach to existing Claude Desktop config.")
+print("  Added garmin-mcp to existing Claude Desktop config.")
 PYEOF
     fi
 fi
