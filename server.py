@@ -3006,25 +3006,42 @@ def morning_check_in() -> dict:
 
 
 @mcp.tool()
-def deload_check() -> dict:
+def deload_check(as_of_date: Optional[str] = None) -> dict:
     """Detect whether the current week is a recovery (deload) week.
 
-    Queries the local activity cache for the last 5 weeks of runs.
-    Computes weekly_km and weekly_minutes per Mon-Sun week, then checks
-    whether the current (incomplete) week's volume is <= 60% of the
-    preceding 3-week rolling average — the standard threshold for an
-    intentional deload in most periodized plans.
+    Queries the local activity cache for the last 5 weeks of runs and
+    buckets them into Mon-Sun weeks. The current week is almost always
+    *partial*, so comparing its raw km against a full-week average would
+    fire a false positive every Monday/Tuesday/Wednesday. Instead the
+    current week's km is compared against a **prorated** reference: the
+    3-week rolling average scaled by how much of the week has elapsed
+    (`avg_3week_km * days_elapsed / 7`). A deload is only flagged when
+    the *projected* full-week volume (current_km / fraction_elapsed)
+    falls to <= 60% of the 3-week average — the standard threshold for
+    an intentional deload in most periodized plans.
 
-    Also flags "unplanned deload" when the volume dropped without any
-    round-number pattern, suggesting illness or injury rather than a
-    deliberate rest week.
+    Planned-vs-unplanned is read from the plan, not guessed: if the
+    scheduled workouts for the assessed week (coach_data/plan.json)
+    include any session marked "(deload)" the deload is classified
+    `planned`; otherwise `unplanned`.
+
+    A lightweight `recovery_context` is surfaced from wellness_daily —
+    recent HRV vs its baseline band and resting HR vs its trailing
+    mean — purely as informational color alongside the volume verdict.
+
+    Args:
+        as_of_date: 'YYYY-MM-DD' to assess as of a specific day (default
+            today). Useful for retrospectives and testing.
 
     Returns:
     - current_week_km: running distance so far this week (km)
+    - projected_week_km: current_km extrapolated to a full week
     - avg_3week_km: mean of the 3 complete weeks before this one
-    - deload_ratio: current_week_km / avg_3week_km (or null if no history)
+    - prorated_reference_km: avg_3week_km scaled to the elapsed fraction
+    - deload_ratio: projected_week_km / avg_3week_km (or null if no history)
     - is_deload: True when deload_ratio <= 0.60
     - deload_type: 'planned' | 'unplanned' | 'none'
+    - recovery_context: HRV/RHR readout vs baseline (informational)
     - recommendation: plain-language coaching note
     - weekly_history: list of last 4 complete weeks + current
       (each entry: week_start, total_km, total_minutes, run_count)
@@ -3033,7 +3050,10 @@ def deload_check() -> dict:
     from datetime import date as _date, timedelta as _td
 
     try:
-        today = _date.today()
+        if as_of_date:
+            today = _date.fromisoformat(as_of_date)
+        else:
+            today = _date.today()
         # Monday of current week
         current_week_start = today - _td(days=today.weekday())
         # Go back 5 weeks (4 complete + current)
@@ -3068,6 +3088,18 @@ def deload_check() -> dict:
             b["total_minutes"] += (r["moving_time_s"] or 0) / 60.0
             b["run_count"] += 1
 
+        # Ensure every complete week in the lookback window is present as a
+        # zero-km bucket, so a week with no runs counts as 0 km in the
+        # reference average instead of silently vanishing.
+        for i in range(1, 5):
+            wk = (current_week_start - _td(weeks=i)).isoformat()
+            week_buckets.setdefault(wk, {
+                "week_start": wk,
+                "total_km": 0.0,
+                "total_minutes": 0.0,
+                "run_count": 0,
+            })
+
         # Round km/minutes for readability
         for b in week_buckets.values():
             b["total_km"] = round(b["total_km"], 1)
@@ -3091,6 +3123,13 @@ def deload_check() -> dict:
 
         current_km = current_week["total_km"]
 
+        # Fraction of the current week that has elapsed (Mon=1/7 … Sun=7/7).
+        days_into_week = today.weekday()  # Mon=0 … Sun=6
+        days_elapsed = days_into_week + 1
+        fraction_elapsed = days_elapsed / 7.0
+        # Project the partial week to a full-week equivalent.
+        projected_week_km = round(current_km / fraction_elapsed, 1)
+
         if reference_weeks:
             avg_3week_km = round(
                 sum(w["total_km"] for w in reference_weeks) / len(reference_weeks), 1
@@ -3098,56 +3137,69 @@ def deload_check() -> dict:
         else:
             avg_3week_km = None
 
+        prorated_reference_km = (
+            round(avg_3week_km * fraction_elapsed, 1) if avg_3week_km is not None else None
+        )
+
         if avg_3week_km is not None and avg_3week_km > 0:
-            deload_ratio = round(current_km / avg_3week_km, 2)
+            # Ratio is projected-full-week vs full-week average, so a young
+            # week can no longer flag a deload purely for being incomplete.
+            deload_ratio = round(projected_week_km / avg_3week_km, 2)
             is_deload = deload_ratio <= 0.60
         else:
             deload_ratio = None
             is_deload = False
 
-        # Unplanned vs planned heuristic:
-        # Planned deloads tend to fall on round-number weeks in a structured
-        # plan (every 4th week, etc.). We can't know the plan here, so we use
-        # a simpler proxy: if volume dropped steeply AND the current week has
-        # very few sessions (0-1) this early in the week it's more likely
-        # unplanned. Instead, detect "unplanned" when the ratio is very low
-        # (< 0.35 — deeper than a typical planned deload of ~40-50%) and it's
-        # already Thursday or later (so we have enough of the week to judge).
-        days_into_week = today.weekday()  # Mon=0 … Sun=6
+        # ── Planned vs unplanned: read from the plan, do not guess ─────────
+        # A week is a *planned* deload when its scheduled workouts include
+        # any session whose name/description is marked "(deload)".
+        deload_type = "none"
+        planned_deload_workouts: list[str] = []
         if is_deload:
-            if deload_ratio is not None and deload_ratio < 0.35 and days_into_week >= 3:
-                deload_type = "unplanned"
-            else:
-                deload_type = "planned"
-        else:
-            deload_type = "none"
+            plan = plan_mod.load_plan()
+            if plan:
+                week_end_key = (current_week_start + _td(days=6)).isoformat()
+                for w in plan.get("workouts", []):
+                    wdate = w.get("date", "")
+                    if not (current_week_key <= wdate <= week_end_key):
+                        continue
+                    text = f"{w.get('name', '')} {w.get('description', '')}".lower()
+                    if "(deload)" in text or "deload" in text:
+                        planned_deload_workouts.append(w.get("name", wdate))
+            deload_type = "planned" if planned_deload_workouts else "unplanned"
+
+        # ── Recovery context from wellness_daily (informational) ───────────
+        recovery_context = _deload_recovery_context(today)
 
         # Recommendation
         if deload_type == "unplanned":
             recommendation = (
-                "Volume is very low for this point in the week — this looks more like "
-                "an unplanned disruption (illness/injury/life) than a deliberate recovery "
-                "week. Keep efforts genuinely easy and address the root cause before "
+                "Volume is well below the 3-week average and no deload is scheduled "
+                "in the plan for this week — this looks like an unplanned drop "
+                "(illness/injury/life) rather than a deliberate recovery week. "
+                "Keep efforts genuinely easy and address the root cause before "
                 "resuming normal load."
             )
         elif deload_type == "planned":
             recommendation = (
-                "This looks like a recovery week — keep easy efforts genuinely easy, "
-                "avoid the temptation to add extra sessions, and trust the process. "
-                "Sleep and nutrition quality matter most right now."
+                "This is a scheduled recovery week (plan has deload-marked sessions) — "
+                "keep easy efforts genuinely easy, avoid the temptation to add extra "
+                "sessions, and trust the process. Sleep and nutrition quality matter "
+                "most right now."
             )
         else:
             # Not a deload
-            if avg_3week_km and current_km > avg_3week_km * 1.15:
+            if avg_3week_km and projected_week_km > avg_3week_km * 1.15:
                 recommendation = (
                     f"Volume is tracking above the 3-week average "
-                    f"({current_km} km vs {avg_3week_km} km avg). "
+                    f"(projected {projected_week_km} km vs {avg_3week_km} km avg). "
                     "Monitor fatigue closely — consider whether this is an intentional "
                     "build week or an inadvertent overreach."
                 )
             else:
                 recommendation = (
-                    f"Normal training week — {current_km} km so far vs "
+                    f"Normal training week — {current_km} km so far "
+                    f"(projecting ~{projected_week_km} km) vs "
                     f"{avg_3week_km} km 3-week average. No deload detected."
                 ) if avg_3week_km else (
                     "Not enough history to assess deload status — sync more activities."
@@ -3157,19 +3209,82 @@ def deload_check() -> dict:
         weekly_history = complete_weeks[-4:] + [current_week]
 
         return {
+            "as_of_date": today.isoformat(),
+            "current_week_start": current_week_key,
+            "days_into_week": days_into_week,
             "current_week_km": current_km,
+            "projected_week_km": projected_week_km,
             "avg_3week_km": avg_3week_km,
+            "prorated_reference_km": prorated_reference_km,
             "deload_ratio": deload_ratio,
             "is_deload": is_deload,
             "deload_type": deload_type,
+            "planned_deload_workouts": planned_deload_workouts,
+            "recovery_context": recovery_context,
             "recommendation": recommendation,
-            "current_week_start": current_week_key,
-            "days_into_week": days_into_week,
             "weekly_history": weekly_history,
         }
 
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _deload_recovery_context(as_of: "date") -> dict:
+    """Read HRV/RHR from the wellness cache and summarise vs baseline.
+
+    Read-only and informational — never blocks or overrides the volume
+    verdict. Compares the most recent few days of HRV against the Garmin
+    baseline band (and resting HR against its trailing mean) and returns
+    a short status string. Returns a 'no wellness data' status when the
+    cache has nothing for the window.
+    """
+    from datetime import timedelta as _td
+
+    try:
+        window_start = (as_of - _td(days=10)).isoformat()
+        window_end = as_of.isoformat()
+        hist = garmin_sync.wellness_history(window_start, window_end)
+        daily = hist.get("daily", [])
+        if not daily:
+            return {"status": "no wellness data", "detail": "No wellness rows cached for the window."}
+
+        # Recent HRV (last up to 3 days with data) vs baseline band.
+        hrv_recent = [d["hrv_overnight_avg"] for d in daily
+                      if d.get("hrv_overnight_avg") is not None][-3:]
+        rhr_recent = [d["resting_hr"] for d in daily
+                      if d.get("resting_hr") is not None][-3:]
+        baseline_band = hist.get("summary", {}).get("hrv_baseline_band")
+        rhr_mean = hist.get("summary", {}).get("rhr_mean")
+
+        # Rows existed but carried no usable HRV/RHR (older device, etc.).
+        if not hrv_recent and not rhr_recent:
+            return {
+                "status": "no wellness data",
+                "detail": "Wellness rows cached but no HRV/RHR values in the window.",
+            }
+
+        flags: list[str] = []
+        hrv_recent_avg = round(sum(hrv_recent) / len(hrv_recent), 1) if hrv_recent else None
+        rhr_recent_avg = round(sum(rhr_recent) / len(rhr_recent), 1) if rhr_recent else None
+
+        if hrv_recent_avg is not None and baseline_band and baseline_band[0]:
+            if hrv_recent_avg < baseline_band[0]:
+                flags.append("HRV suppressed")
+        if rhr_recent_avg is not None and rhr_mean is not None:
+            # >3 bpm above the window mean reads as elevated.
+            if rhr_recent_avg > rhr_mean + 3:
+                flags.append("RHR elevated")
+
+        status = ", ".join(flags) if flags else "wellness normal"
+        return {
+            "status": status,
+            "hrv_recent_avg": hrv_recent_avg,
+            "hrv_baseline_band": baseline_band,
+            "rhr_recent_avg": rhr_recent_avg,
+            "rhr_window_mean": rhr_mean,
+        }
+    except Exception as e:
+        return {"status": "wellness unavailable", "detail": f"{type(e).__name__}: {e}"}
 
 
 @mcp.tool()
