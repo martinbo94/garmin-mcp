@@ -4136,20 +4136,29 @@ def forecast_conditions(
     """Fetch temp / humidity / dew point for a date+hour, and optionally the
     heat-adjusted pace — the weather source for `heat_pace_adjustment`.
 
+    ASK THE USER WHAT TIME THEY PLAN TO RUN and pass it as `hour` before
+    quoting any heat adjustment. Conditions are read for that single hour, not
+    a daily average, and temperature swings a lot across a day (a morning run
+    and an evening run can land in different adjustment buckets). The `hour`
+    default (17:00) is only a placeholder for when the time genuinely doesn't
+    matter — do not rely on it for a real pace recommendation. There is no
+    scheduled time on the plan to infer from, so the run time has to come from
+    the user. The returned `day_temp_range_c` shows how much the time-of-day
+    choice matters that day.
+
     Conditions come from Open-Meteo (free, public, no API key). Location
     defaults to your most recent outdoor activity's GPS coordinates (cached
     from sync; falls back to a one-off Garmin lookup if the cache has none
     yet), so you normally don't pass lat/lon at all — it follows you (e.g.
     Bærum vs. Spain). When `base_pace_min_per_km` is given it feeds the
-    fetched conditions straight into `heat_pace_adjustment`, so heat-adjusting
-    a planned session is hands-free.
+    fetched conditions straight into `heat_pace_adjustment`.
 
     Args:
         date: 'YYYY-MM-DD' (default today). Open-Meteo covers roughly the past
             92 days through 16 days ahead — good for "tomorrow's session".
-        hour: local hour 0-23 the run will happen (default 17, typical
-            evening). It does NOT know your scheduled time — pass the real
-            hour to match conditions to when you'll run.
+        hour: local hour 0-23 the run will happen. ASK THE USER — don't guess.
+            Defaults to 17 only as a fallback; pass the real planned hour so
+            the conditions match when they'll actually run.
         lat, lon: explicit coordinates; default = latest activity location.
         base_pace_min_per_km: if given (e.g. '5:30'), the result also includes
             `heat_adjustment` from `heat_pace_adjustment` for these conditions.
