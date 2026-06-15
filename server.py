@@ -1430,19 +1430,24 @@ def sync_activities(
     weeks_back: Optional[int] = None,
     backfill_links: bool = False,
     backfill_max: int = 100,
+    wellness_days: int = 10,
 ) -> dict:
-    """Pull new activities + HR streams + laps from Garmin into the local cache.
+    """Pull new activities + HR streams + laps + recent wellness into the cache.
 
-    Runs incrementally since the last sync. An incremental sync runs
-    automatically on every server startup, so `new_activities: 0` is normal
-    and just means nothing has been recorded since the last run — it does NOT
-    mean a recent activity is missing.
+    Runs incrementally since the last sync, and also refreshes the trailing
+    `wellness_days` of wellness (HRV, resting HR, sleep) so the recovery /
+    readiness tools stay current.
 
-    If a recent activity appears to be missing after sync returns 0:
-    1. Use `weekly_summary` for the relevant week to check the cache.
-       The activity is almost certainly already there under its Garmin ID.
-    2. Only call sync again (with force_full=True) if weekly_summary confirms
-       the activity is genuinely absent.
+    IMPORTANT — `new_activities: 0` does NOT mean the cache is stale or that a
+    recent activity is missing. It almost always means the activity was
+    already synced (e.g. by a prior sync or the startup sync) and there is
+    simply nothing new since then. To judge freshness, do NOT re-read the
+    `new_activities` count — instead check the `cache_newest_activity` and
+    `cache_newest_wellness` dates returned by this call (they are the actual
+    newest cached dates), or call `list_activities` and look at the top row.
+    Only escalate to `force_full=True` if those dates confirm a genuinely
+    missing recent activity. Re-syncing because the count was 0 is a common
+    mistake — verify the cached dates first.
 
     Args:
         force_full: If True, re-pull the default 12-week backfill window.
@@ -1461,13 +1466,20 @@ def sync_activities(
         backfill_max: Max activities to backfill per call (default 100).
             `remaining_without_detail` in the response tells you whether
             another round is needed.
+        wellness_days: Trailing days of wellness to refresh (default 10;
+            0 to skip). Historical wellness backfill is via
+            get_wellness_history.
 
-    Returns dict with new_activities count, streams_fetched count,
-    laps_fetched count, details_fetched count, last_sync timestamp, and
-    any per-activity errors. With backfill_links also details_fetched /
-    relinked / remaining_without_detail for the backfill pass.
+    Returns dict with new_activities, streams_fetched, laps_fetched,
+    details_fetched, wellness_fetched/wellness_cached, last_sync, per-item
+    errors, and — for freshness checks — `cache_newest_activity` and
+    `cache_newest_wellness` (the newest cached dates). With backfill_links
+    also details_fetched / relinked / remaining_without_detail.
     """
-    result = garmin_sync.run_sync(_client(), force_full=force_full, weeks_back=weeks_back)
+    result = garmin_sync.run_sync(
+        _client(), force_full=force_full, weeks_back=weeks_back,
+        wellness_days=wellness_days,
+    )
     if backfill_links and "error" not in result:
         result["backfill"] = garmin_sync.backfill_workout_links(
             _client(), max_activities=backfill_max
@@ -3006,6 +3018,897 @@ def morning_check_in() -> dict:
 
 
 @mcp.tool()
+def sleep_performance_correlation(
+    days_back: int = 60,
+    min_distance_km: float = 3.0,
+    session_type: str = "easy",
+) -> dict:
+    """Relate pre-run-night sleep to running performance, within one session class.
+
+    Restricting to a single session class (default 'easy') is deliberate:
+    a raw all-runs comparison is dominated by session-type mix (good-sleep
+    days holding more easy runs makes that group look "slower" for reasons
+    that have nothing to do with sleep). Sessions are classified via
+    `classify_activity` (planned_type when linked, else the name hint).
+
+    Sleep is keyed to the night BEFORE the run. In this repo sleep_* fields
+    in wellness_daily are stored on the date the sleep STARTED, so the night
+    before a run on date D lives in the row dated D-1. `hrv_overnight_avg`
+    follows the opposite convention (it is "last night's" HRV as of the
+    morning of its row date), so the morning-of-run HRV lives in the row
+    dated D. The two are joined from their respective rows.
+
+    Within the chosen class this computes Pearson correlations of
+    sleep_score (and sleep hours) against avg_hr and pace, plus a
+    good-sleep vs poor-sleep mean comparison. Correlations and group means
+    are only reported when n is large enough to be defensible.
+
+    Args:
+        days_back: How many days of history to analyse. Default 60.
+        min_distance_km: Minimum run distance to include. Default 3.0.
+        session_type: Session class to restrict to (e.g. 'easy',
+            'threshold', 'long', 'intervals'). Default 'easy'.
+
+    Returns:
+        good_sleep_avg, poor_sleep_avg, correlations, best_performances,
+        insight string, and the per-run rows used for the analysis.
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    # Below this, group means / correlations are not presented as findings.
+    MIN_GROUP_N = 3
+    MIN_CORR_N = 5
+
+    try:
+        cutoff = (_date.today() - _td(days=days_back)).isoformat()
+        min_dist_m = min_distance_km * 1000
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT
+                    a.id,
+                    date(a.start_date_local) AS run_date,
+                    a.name,
+                    a.sport_type,
+                    a.planned_type,
+                    a.avg_hr,
+                    a.moving_time_s,
+                    a.distance_m,
+                    ws.sleep_seconds,
+                    ws.sleep_score,
+                    ws.sleep_deep_s,
+                    ws.sleep_rem_s,
+                    ws.sleep_light_s,
+                    wh.hrv_overnight_avg,
+                    wh.resting_hr AS wellness_rhr
+                FROM activities a
+                -- sleep_* are stored on the date sleep started: the night
+                -- before the run is the row dated run_date - 1 day.
+                LEFT JOIN wellness_daily ws
+                       ON ws.date = date(a.start_date_local, '-1 day')
+                -- hrv_overnight_avg is "last night" as of its row's morning,
+                -- so the morning-of-run HRV is the row dated run_date.
+                LEFT JOIN wellness_daily wh
+                       ON wh.date = date(a.start_date_local)
+                WHERE a.sport_type = 'Run'
+                  AND date(a.start_date_local) >= ?
+                  AND a.distance_m >= ?
+                  AND a.moving_time_s IS NOT NULL
+                  AND a.moving_time_s > 0
+                ORDER BY a.start_date_local
+                """,
+                (cutoff, min_dist_m),
+            ).fetchall()
+
+        all_runs = [dict(r) for r in rows]
+
+        # Restrict to one session class so the comparison is controlled.
+        runs: list[dict] = []
+        for r in all_runs:
+            cls, src = garmin_sync.classify_activity(
+                r["name"], r["sport_type"], r["planned_type"]
+            )
+            r["classification"] = cls
+            r["classification_source"] = src
+            if cls == session_type:
+                runs.append(r)
+
+        # Compute pace for each run
+        for r in runs:
+            if r["distance_m"] and r["moving_time_s"]:
+                r["pace_s_per_km"] = r["moving_time_s"] / (r["distance_m"] / 1000)
+            else:
+                r["pace_s_per_km"] = None
+
+        def _is_good_sleep(r: dict) -> bool:
+            ss = r.get("sleep_score")
+            secs = r.get("sleep_seconds")
+            if ss is not None and ss >= 70:
+                return True
+            if secs is not None and secs >= 25200:  # 7 hours
+                return True
+            return False
+
+        def _has_sleep_data(r: dict) -> bool:
+            return r.get("sleep_score") is not None or r.get("sleep_seconds") is not None
+
+        # Split into groups — only include runs that have sleep data
+        runs_with_sleep = [r for r in runs if _has_sleep_data(r)]
+        good_sleep = [r for r in runs_with_sleep if _is_good_sleep(r)]
+        poor_sleep = [r for r in runs_with_sleep if not _is_good_sleep(r)]
+
+        def _avg(values: list) -> Optional[float]:
+            vals = [v for v in values if v is not None]
+            return round(sum(vals) / len(vals), 1) if vals else None
+
+        def _group_stats(group: list) -> dict:
+            return {
+                "n": len(group),
+                "avg_hr": _avg([r["avg_hr"] for r in group]),
+                "avg_pace_s_per_km": _avg([r["pace_s_per_km"] for r in group]),
+                "avg_sleep_score": _avg([r["sleep_score"] for r in group]),
+                "avg_sleep_hours": _avg(
+                    [round(r["sleep_seconds"] / 3600, 2) for r in group
+                     if r.get("sleep_seconds") is not None]
+                ),
+                "avg_hrv": _avg([r["hrv_overnight_avg"] for r in group]),
+            }
+
+        good_stats = _group_stats(good_sleep)
+        poor_stats = _group_stats(poor_sleep)
+
+        # Pearson correlations within the class. Only meaningful with enough
+        # paired observations and non-zero variance on both axes.
+        def _pearson(pairs: list[tuple[float, float]]) -> Optional[float]:
+            xs = [p[0] for p in pairs if p[0] is not None and p[1] is not None]
+            ys = [p[1] for p in pairs if p[0] is not None and p[1] is not None]
+            n = len(xs)
+            if n < MIN_CORR_N:
+                return None
+            mx = sum(xs) / n
+            my = sum(ys) / n
+            sxx = sum((x - mx) ** 2 for x in xs)
+            syy = sum((y - my) ** 2 for y in ys)
+            if sxx == 0 or syy == 0:
+                return None
+            sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            return round(sxy / (sxx ** 0.5 * syy ** 0.5), 3)
+
+        correlations = {
+            "n_with_sleep_score": sum(
+                1 for r in runs_with_sleep if r.get("sleep_score") is not None
+            ),
+            "sleep_score_vs_avg_hr": _pearson(
+                [(r["sleep_score"], r["avg_hr"]) for r in runs_with_sleep]
+            ),
+            "sleep_score_vs_pace": _pearson(
+                [(r["sleep_score"], r["pace_s_per_km"]) for r in runs_with_sleep]
+            ),
+            "sleep_hours_vs_avg_hr": _pearson(
+                [((r["sleep_seconds"] / 3600) if r.get("sleep_seconds") else None,
+                  r["avg_hr"]) for r in runs_with_sleep]
+            ),
+        }
+
+        # Best 5 performances within the class = lowest pace (fastest).
+        runs_with_pace = [r for r in runs if r.get("pace_s_per_km") is not None]
+        best_5 = sorted(runs_with_pace, key=lambda r: r["pace_s_per_km"])[:5]
+
+        def _run_row(r: dict) -> dict:
+            return {
+                "id": r["id"],
+                "date": r["run_date"],
+                "name": r["name"],
+                "classification": r["classification"],
+                "classification_source": r["classification_source"],
+                "distance_km": round(r["distance_m"] / 1000, 2),
+                "pace_s_per_km": (
+                    round(r["pace_s_per_km"], 1)
+                    if r.get("pace_s_per_km") is not None else None
+                ),
+                "avg_hr": r["avg_hr"],
+                "sleep_score": r["sleep_score"],
+                "sleep_hours": (
+                    round(r["sleep_seconds"] / 3600, 2)
+                    if r.get("sleep_seconds") is not None else None
+                ),
+                "hrv_overnight_avg": r["hrv_overnight_avg"],
+                "sleep_quality": "good" if _is_good_sleep(r) else (
+                    "poor" if _has_sleep_data(r) else "no_data"
+                ),
+            }
+
+        best_performances = [_run_row(r) for r in best_5]
+        per_run = [_run_row(r) for r in runs]
+
+        # Build insight string
+        def _fmt_pace(s: Optional[float]) -> str:
+            if s is None:
+                return "N/A"
+            m = int(s // 60)
+            sec = int(s % 60)
+            return f"{m}:{sec:02d}/km"
+
+        insight_parts: list[str] = []
+        g_n, p_n = good_stats["n"], poor_stats["n"]
+        n_class = len(runs)
+        n_sleep = len(runs_with_sleep)
+
+        if n_class == 0:
+            insight_parts.append(
+                f"No '{session_type}' runs found in the last {days_back} days "
+                f"(>= {min_distance_km} km). Try a different session_type or "
+                "widen the window."
+            )
+        elif n_sleep == 0:
+            insight_parts.append(
+                f"Found {n_class} '{session_type}' runs but none have wellness "
+                "data for the night before. Sync wellness data first."
+            )
+        else:
+            insight_parts.append(
+                f"Analysed {n_sleep} '{session_type}' runs with pre-run-night "
+                f"sleep data over the last {days_back} days "
+                f"({g_n} good-sleep, {p_n} poor-sleep)."
+            )
+            if g_n >= MIN_GROUP_N and p_n >= MIN_GROUP_N:
+                pace_good = good_stats["avg_pace_s_per_km"]
+                pace_poor = poor_stats["avg_pace_s_per_km"]
+                hr_good = good_stats["avg_hr"]
+                hr_poor = poor_stats["avg_hr"]
+                if pace_good is not None and pace_poor is not None:
+                    diff = round(pace_poor - pace_good, 1)
+                    direction = "faster" if diff > 0 else "slower"
+                    insight_parts.append(
+                        f"Good-sleep pace: {_fmt_pace(pace_good)} vs "
+                        f"poor-sleep: {_fmt_pace(pace_poor)} "
+                        f"({abs(diff):.1f}s/km {direction} on good sleep)."
+                    )
+                if hr_good is not None and hr_poor is not None:
+                    hr_diff = round(hr_poor - hr_good, 1)
+                    insight_parts.append(
+                        f"Good-sleep avg HR: {hr_good} bpm vs poor-sleep: "
+                        f"{hr_poor} bpm (delta {hr_diff:+.1f} bpm)."
+                    )
+            else:
+                insight_parts.append(
+                    f"Too few sessions per group to compare means "
+                    f"(good={g_n}, poor={p_n}, need >= {MIN_GROUP_N} each)."
+                )
+            corr_hr = correlations["sleep_score_vs_avg_hr"]
+            if corr_hr is not None:
+                insight_parts.append(
+                    f"Sleep-score vs avg-HR correlation r={corr_hr:+.2f} "
+                    f"(n={correlations['n_with_sleep_score']})."
+                )
+            else:
+                insight_parts.append(
+                    f"Not enough paired sleep-score observations for a "
+                    f"correlation (need >= {MIN_CORR_N})."
+                )
+
+        return {
+            "days_back": days_back,
+            "min_distance_km": min_distance_km,
+            "session_type": session_type,
+            "total_runs_in_window": len(all_runs),
+            "runs_in_class": n_class,
+            "runs_with_sleep_data": n_sleep,
+            "good_sleep_avg": good_stats,
+            "poor_sleep_avg": poor_stats,
+            "correlations": correlations,
+            "best_performances": best_performances,
+            "per_run": per_run,
+            "insight": " ".join(insight_parts),
+        }
+
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+@mcp.tool()
+def deload_check(as_of_date: Optional[str] = None) -> dict:
+    """Detect whether the current week is a recovery (deload) week.
+
+    Queries the local activity cache for the last 5 weeks of runs and
+    buckets them into Mon-Sun weeks. The current week is almost always
+    *partial*, so comparing its raw km against a full-week average would
+    fire a false positive every Monday/Tuesday/Wednesday. Instead the
+    current week's km is compared against a **prorated** reference: the
+    3-week rolling average scaled by how much of the week has elapsed
+    (`avg_3week_km * days_elapsed / 7`). A deload is only flagged when
+    the *projected* full-week volume (current_km / fraction_elapsed)
+    falls to <= 60% of the 3-week average — the standard threshold for
+    an intentional deload in most periodized plans.
+
+    Planned-vs-unplanned is read from the plan, not guessed: if the
+    scheduled workouts for the assessed week (coach_data/plan.json)
+    include any session marked "(deload)" the deload is classified
+    `planned`; otherwise `unplanned`.
+
+    A lightweight `recovery_context` is surfaced from wellness_daily —
+    recent HRV vs its baseline band and resting HR vs its trailing
+    mean — purely as informational color alongside the volume verdict.
+
+    Args:
+        as_of_date: 'YYYY-MM-DD' to assess as of a specific day (default
+            today). Useful for retrospectives and testing.
+
+    Returns:
+    - current_week_km: running distance so far this week (km)
+    - projected_week_km: current_km extrapolated to a full week
+    - avg_3week_km: mean of the 3 complete weeks before this one
+    - prorated_reference_km: avg_3week_km scaled to the elapsed fraction
+    - deload_ratio: projected_week_km / avg_3week_km (or null if no history)
+    - is_deload: True when deload_ratio <= 0.60
+    - deload_type: 'planned' | 'unplanned' | 'none'
+    - recovery_context: HRV/RHR readout vs baseline (informational)
+    - recommendation: plain-language coaching note
+    - weekly_history: list of last 4 complete weeks + current
+      (each entry: week_start, total_km, total_minutes, run_count)
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        if as_of_date:
+            today = _date.fromisoformat(as_of_date)
+        else:
+            today = _date.today()
+        # Monday of current week
+        current_week_start = today - _td(days=today.weekday())
+        # Go back 5 weeks (4 complete + current)
+        history_start = (current_week_start - _td(weeks=4)).isoformat()
+        history_end = today.isoformat()
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT start_date_local, distance_m, moving_time_s
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) BETWEEN ? AND ?
+                ORDER BY start_date_local
+                """,
+                (history_start, history_end),
+            ).fetchall()
+
+        # Bucket activities into Mon-Sun weeks
+        week_buckets: dict[str, dict] = {}
+        for r in rows:
+            d = _date.fromisoformat(r["start_date_local"][:10])
+            wk_monday = (d - _td(days=d.weekday())).isoformat()
+            b = week_buckets.setdefault(wk_monday, {
+                "week_start": wk_monday,
+                "total_km": 0.0,
+                "total_minutes": 0.0,
+                "run_count": 0,
+            })
+            b["total_km"] += (r["distance_m"] or 0.0) / 1000.0
+            b["total_minutes"] += (r["moving_time_s"] or 0) / 60.0
+            b["run_count"] += 1
+
+        # Ensure every complete week in the lookback window is present as a
+        # zero-km bucket, so a week with no runs counts as 0 km in the
+        # reference average instead of silently vanishing.
+        for i in range(1, 5):
+            wk = (current_week_start - _td(weeks=i)).isoformat()
+            week_buckets.setdefault(wk, {
+                "week_start": wk,
+                "total_km": 0.0,
+                "total_minutes": 0.0,
+                "run_count": 0,
+            })
+
+        # Round km/minutes for readability
+        for b in week_buckets.values():
+            b["total_km"] = round(b["total_km"], 1)
+            b["total_minutes"] = round(b["total_minutes"], 0)
+
+        # Ordered list of all buckets (oldest first)
+        all_weeks = sorted(week_buckets.values(), key=lambda w: w["week_start"])
+
+        current_week_key = current_week_start.isoformat()
+        current_week = week_buckets.get(current_week_key, {
+            "week_start": current_week_key,
+            "total_km": 0.0,
+            "total_minutes": 0.0,
+            "run_count": 0,
+        })
+
+        complete_weeks = [w for w in all_weeks if w["week_start"] != current_week_key]
+
+        # Take up to 3 complete weeks immediately before the current week
+        reference_weeks = complete_weeks[-3:]
+
+        current_km = current_week["total_km"]
+
+        # Fraction of the current week that has elapsed (Mon=1/7 … Sun=7/7).
+        days_into_week = today.weekday()  # Mon=0 … Sun=6
+        days_elapsed = days_into_week + 1
+        fraction_elapsed = days_elapsed / 7.0
+        # Project the partial week to a full-week equivalent.
+        projected_week_km = round(current_km / fraction_elapsed, 1)
+
+        if reference_weeks:
+            avg_3week_km = round(
+                sum(w["total_km"] for w in reference_weeks) / len(reference_weeks), 1
+            )
+        else:
+            avg_3week_km = None
+
+        prorated_reference_km = (
+            round(avg_3week_km * fraction_elapsed, 1) if avg_3week_km is not None else None
+        )
+
+        if avg_3week_km is not None and avg_3week_km > 0:
+            # Ratio is projected-full-week vs full-week average, so a young
+            # week can no longer flag a deload purely for being incomplete.
+            deload_ratio = round(projected_week_km / avg_3week_km, 2)
+            is_deload = deload_ratio <= 0.60
+        else:
+            deload_ratio = None
+            is_deload = False
+
+        # ── Planned vs unplanned: read from the plan, do not guess ─────────
+        # A week is a *planned* deload when its scheduled workouts include
+        # any session whose name/description is marked "(deload)".
+        deload_type = "none"
+        planned_deload_workouts: list[str] = []
+        if is_deload:
+            plan = plan_mod.load_plan()
+            if plan:
+                week_end_key = (current_week_start + _td(days=6)).isoformat()
+                for w in plan.get("workouts", []):
+                    wdate = w.get("date", "")
+                    if not (current_week_key <= wdate <= week_end_key):
+                        continue
+                    text = f"{w.get('name', '')} {w.get('description', '')}".lower()
+                    if "(deload)" in text or "deload" in text:
+                        planned_deload_workouts.append(w.get("name", wdate))
+            deload_type = "planned" if planned_deload_workouts else "unplanned"
+
+        # ── Recovery context from wellness_daily (informational) ───────────
+        recovery_context = _deload_recovery_context(today)
+
+        # Recommendation
+        if deload_type == "unplanned":
+            recommendation = (
+                "Volume is well below the 3-week average and no deload is scheduled "
+                "in the plan for this week — this looks like an unplanned drop "
+                "(illness/injury/life) rather than a deliberate recovery week. "
+                "Keep efforts genuinely easy and address the root cause before "
+                "resuming normal load."
+            )
+        elif deload_type == "planned":
+            recommendation = (
+                "This is a scheduled recovery week (plan has deload-marked sessions) — "
+                "keep easy efforts genuinely easy, avoid the temptation to add extra "
+                "sessions, and trust the process. Sleep and nutrition quality matter "
+                "most right now."
+            )
+        else:
+            # Not a deload
+            if avg_3week_km and projected_week_km > avg_3week_km * 1.15:
+                recommendation = (
+                    f"Volume is tracking above the 3-week average "
+                    f"(projected {projected_week_km} km vs {avg_3week_km} km avg). "
+                    "Monitor fatigue closely — consider whether this is an intentional "
+                    "build week or an inadvertent overreach."
+                )
+            else:
+                recommendation = (
+                    f"Normal training week — {current_km} km so far "
+                    f"(projecting ~{projected_week_km} km) vs "
+                    f"{avg_3week_km} km 3-week average. No deload detected."
+                ) if avg_3week_km else (
+                    "Not enough history to assess deload status — sync more activities."
+                )
+
+        # Build weekly_history: last 4 complete weeks + current
+        weekly_history = complete_weeks[-4:] + [current_week]
+
+        return {
+            "as_of_date": today.isoformat(),
+            "current_week_start": current_week_key,
+            "days_into_week": days_into_week,
+            "current_week_km": current_km,
+            "projected_week_km": projected_week_km,
+            "avg_3week_km": avg_3week_km,
+            "prorated_reference_km": prorated_reference_km,
+            "deload_ratio": deload_ratio,
+            "is_deload": is_deload,
+            "deload_type": deload_type,
+            "planned_deload_workouts": planned_deload_workouts,
+            "recovery_context": recovery_context,
+            "recommendation": recommendation,
+            "weekly_history": weekly_history,
+        }
+
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _deload_recovery_context(as_of: "date") -> dict:
+    """Read HRV/RHR from the wellness cache and summarise vs baseline.
+
+    Read-only and informational — never blocks or overrides the volume
+    verdict. Compares the most recent few days of HRV against the Garmin
+    baseline band (and resting HR against its trailing mean) and returns
+    a short status string. Returns a 'no wellness data' status when the
+    cache has nothing for the window.
+    """
+    from datetime import timedelta as _td
+
+    try:
+        window_start = (as_of - _td(days=10)).isoformat()
+        window_end = as_of.isoformat()
+        hist = garmin_sync.wellness_history(window_start, window_end)
+        daily = hist.get("daily", [])
+        if not daily:
+            return {"status": "no wellness data", "detail": "No wellness rows cached for the window."}
+
+        # Recent HRV (last up to 3 days with data) vs baseline band.
+        hrv_recent = [d["hrv_overnight_avg"] for d in daily
+                      if d.get("hrv_overnight_avg") is not None][-3:]
+        rhr_recent = [d["resting_hr"] for d in daily
+                      if d.get("resting_hr") is not None][-3:]
+        baseline_band = hist.get("summary", {}).get("hrv_baseline_band")
+        rhr_mean = hist.get("summary", {}).get("rhr_mean")
+
+        # Rows existed but carried no usable HRV/RHR (older device, etc.).
+        if not hrv_recent and not rhr_recent:
+            return {
+                "status": "no wellness data",
+                "detail": "Wellness rows cached but no HRV/RHR values in the window.",
+            }
+
+        flags: list[str] = []
+        hrv_recent_avg = round(sum(hrv_recent) / len(hrv_recent), 1) if hrv_recent else None
+        rhr_recent_avg = round(sum(rhr_recent) / len(rhr_recent), 1) if rhr_recent else None
+
+        if hrv_recent_avg is not None and baseline_band and baseline_band[0]:
+            if hrv_recent_avg < baseline_band[0]:
+                flags.append("HRV suppressed")
+        if rhr_recent_avg is not None and rhr_mean is not None:
+            # >3 bpm above the window mean reads as elevated.
+            if rhr_recent_avg > rhr_mean + 3:
+                flags.append("RHR elevated")
+
+        status = ", ".join(flags) if flags else "wellness normal"
+        return {
+            "status": status,
+            "hrv_recent_avg": hrv_recent_avg,
+            "hrv_baseline_band": baseline_band,
+            "rhr_recent_avg": rhr_recent_avg,
+            "rhr_window_mean": rhr_mean,
+        }
+    except Exception as e:
+        return {"status": "wellness unavailable", "detail": f"{type(e).__name__}: {e}"}
+
+
+@mcp.tool()
+def recovery_prediction(lookback_sessions: int = 8) -> dict:
+    """Predict how many days it typically takes to return to baseline HRV
+    after a quality session, based on your personal historical pattern.
+
+    For each quality session in the last `lookback_sessions` quality runs,
+    finds how many days until HRV returned to within the normal baseline
+    band. Averages the measured ones to build a personal recovery profile,
+    then applies it to the most recent quality session to estimate when
+    you're likely fully recovered.
+
+    A "quality session" is detected from the plan's `planned_type`
+    (threshold / intervals / vo2 / race), the activity name, OR — as a
+    fallback for default-named hard runs and races — Garmin's
+    `training_effect_label` (VO2MAX / LACTATE_THRESHOLD /
+    ANAEROBIC_CAPACITY). This catches max-effort races logged under a
+    generic name (e.g. a 10k race named "Bærum Løping").
+
+    The "recovered" verdict is gated on today's *actual* HRV being back in
+    the baseline band — the predicted date merely passing is not treated
+    as recovered. This stays consistent with morning_check_in's
+    traffic-light HRV model. recovery_time_hours (Garmin's own estimate)
+    is surfaced for cross-checking.
+
+    Args:
+        lookback_sessions: Number of past quality sessions to analyse.
+            Default 8 — enough for a stable average without going too far
+            back in time. At least 2 measured sessions are needed for a
+            prediction.
+
+    This predicts recovery from your most recent QUALITY session (see
+    last_quality_session) — it is NOT a readiness check for right now and
+    does not look at easy runs. For "am I ready to train today" use
+    morning_check_in.
+
+    Returns:
+        - typical_recovery_days: your personal average (float)
+        - confidence: 'low' / 'medium' / 'high' based on sample size
+        - last_quality_session: date and type of the most recent hard session
+        - predicted_recovered_by: estimated date of full HRV recovery
+        - recovery_status: one of
+            'recovered'        — today's HRV is confirmed in the baseline band
+            'not_recovered'    — today's HRV is confirmed below baseline
+            'likely_recovered' — predicted date has passed but there's no HRV
+                                 reading today to confirm (NOT a negative signal)
+            'recovering'       — still within the predicted window, unconfirmed
+        - already_recovered: legacy boolean; True ONLY for 'recovered'. Prefer
+            recovery_status — a False here can mean 'likely_recovered' (just
+            no data), not actual non-recovery.
+        - today_hrv_status: today's HRV vs baseline (or 'no_data')
+        - garmin_recovery_time_hours: Garmin's own recovery estimate, if any
+        - sample: list of past sessions with their measured recovery days
+        - censored_sessions: count whose HRV had not returned within 7 days
+        - no_depression_sessions: count where HRV never dropped below baseline
+        - note: human-readable summary
+    """
+    import sqlite3 as _sq
+    from datetime import datetime as _dt, timedelta as _td
+
+    try:
+        _db = garmin_sync.DB_PATH
+
+        # ── 1. Find quality sessions ──────────────────────────────────
+        # Detect via plan label (planned_type), name hint, OR Garmin's
+        # training-effect label as a fallback for default-named hard runs.
+        _QUALITY_PLANNED = {"threshold", "intervals", "vo2", "race"}
+        _QUALITY_NAME = {"threshold", "intervals", "tempo", "race"}
+        _QUALITY_TE = {"VO2MAX", "LACTATE_THRESHOLD", "ANAEROBIC_CAPACITY"}
+
+        with _sq.connect(_db) as conn:
+            conn.row_factory = _sq.Row
+            acts = conn.execute("""
+                SELECT id, start_date_local, name, sport_type, avg_hr,
+                       planned_type, training_effect_label
+                FROM activities
+                WHERE sport_type = 'Run'
+                ORDER BY start_date_local DESC
+                LIMIT 120
+            """).fetchall()
+
+        def _quality_type(a) -> Optional[str]:
+            """Return the quality label for a session, or None if not hard."""
+            pt = (a["planned_type"] or "").lower()
+            if pt in _QUALITY_PLANNED:
+                return pt
+            hint = garmin_sync.name_hint(a["name"], a["sport_type"])
+            if hint in _QUALITY_NAME:
+                return hint
+            te = (a["training_effect_label"] or "").upper()
+            if te in _QUALITY_TE:
+                return te.lower()
+            return None
+
+        quality = []
+        for a in acts:
+            qt = _quality_type(a)
+            if qt is not None:
+                d = dict(a)
+                d["quality_type"] = qt
+                quality.append(d)
+            if len(quality) >= lookback_sessions + 2:
+                break
+
+        if not quality:
+            return {
+                "error": "No quality sessions found in recent history.",
+                "note": "Record some threshold, interval, or race sessions first.",
+            }
+
+        # ── 2. For each quality session, find days until HRV recovered ─
+        with _sq.connect(_db) as conn:
+            conn.row_factory = _sq.Row
+            wellness = conn.execute("""
+                SELECT date, hrv_overnight_avg, hrv_baseline_low, hrv_baseline_upper,
+                       hrv_status, recovery_time_hours
+                FROM wellness_daily
+                ORDER BY date ASC
+            """).fetchall()
+
+        wellness_by_date = {r["date"]: dict(r) for r in wellness}
+
+        def _hrv_in_baseline(w: Optional[dict]) -> Optional[bool]:
+            """True/False if HRV state is known for the day, None if unknown.
+
+            Unknown (missing day / no HRV reading) returns None so callers
+            can skip it rather than treating absence as 'not recovered'.
+            """
+            if not w:
+                return None
+            hrv = w.get("hrv_overnight_avg")
+            if hrv is None:
+                return None
+            lo = w.get("hrv_baseline_low")
+            hi = w.get("hrv_baseline_upper")
+            if lo and hi:
+                return lo <= hrv <= hi
+            # Fallback: use Garmin's status string
+            status = (w.get("hrv_status") or "").lower()
+            return status in ("balanced", "good")
+
+        sample = []
+        censored = 0          # HRV had not returned within the 7-day window
+        no_depression = 0     # HRV was never below baseline (no measurable dip)
+        for sess in quality[:lookback_sessions]:
+            sess_date = sess["start_date_local"][:10]
+
+            # Did this session actually depress HRV? If the day after is
+            # already in-baseline (and we have data for it), there is no
+            # measurable recovery to time — flag rather than score "1 day".
+            day1 = (_dt.strptime(sess_date, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+            day1_state = _hrv_in_baseline(wellness_by_date.get(day1))
+
+            recovery_days = None
+            saw_suppressed = False
+            for d in range(1, 8):
+                check_date = (
+                    _dt.strptime(sess_date, "%Y-%m-%d") + _td(days=d)
+                ).strftime("%Y-%m-%d")
+                state = _hrv_in_baseline(wellness_by_date.get(check_date))
+                if state is None:
+                    continue  # missing/unknown day — skip, don't penalise
+                if state is False:
+                    saw_suppressed = True
+                elif state is True:
+                    if saw_suppressed:
+                        recovery_days = d
+                    break
+
+            if recovery_days is not None:
+                sample.append({
+                    "date": sess_date,
+                    "session_type": sess["quality_type"],
+                    "name": sess["name"],
+                    "recovery_days": recovery_days,
+                })
+            elif not saw_suppressed and day1_state is True:
+                # HRV never dipped after this session — don't average a
+                # phantom "1 day" recovery; count it separately.
+                no_depression += 1
+            elif saw_suppressed:
+                # HRV was suppressed but had not returned within 7 days —
+                # a slow recovery. Counting it (not silently dropping) keeps
+                # the mean from being biased downward.
+                censored += 1
+
+        if len(sample) < 2:
+            note = (
+                "Not enough measured recoveries to build a pattern yet "
+                f"({len(sample)} of {len(quality)} quality sessions had a "
+                "suppression-then-return signal in the HRV record)."
+            )
+            if no_depression:
+                note += f" {no_depression} session(s) never depressed HRV."
+            if censored:
+                note += f" {censored} session(s) had not recovered within 7 days."
+            return {
+                "error": "Not enough HRV data to build a recovery pattern.",
+                "sessions_found": len(quality),
+                "sessions_with_measured_recovery": len(sample),
+                "no_depression_sessions": no_depression,
+                "censored_sessions": censored,
+                "note": note,
+            }
+
+        avg_recovery = round(sum(s["recovery_days"] for s in sample) / len(sample), 1)
+        n = len(sample)
+        confidence = "high" if n >= 6 else "medium" if n >= 3 else "low"
+
+        # ── 3. Apply to most recent quality session ────────────────────
+        last_sess = quality[0]
+        last_date = last_sess["start_date_local"][:10]
+        predicted_date = (
+            _dt.strptime(last_date, "%Y-%m-%d") + _td(days=round(avg_recovery))
+        ).strftime("%Y-%m-%d")
+
+        # "Recovered" is gated on today's ACTUAL HRV being in baseline — a
+        # passed predicted date is NOT sufficient. Use local date (UTC can
+        # roll to the wrong day 00:00-02:00 Norway time).
+        today_str = _dt.now().strftime("%Y-%m-%d")
+        today_wellness = wellness_by_date.get(today_str)
+        today_state = _hrv_in_baseline(today_wellness)
+        if today_state is True:
+            today_hrv_status = "in_baseline"
+        elif today_state is False:
+            today_hrv_status = "below_baseline"
+        else:
+            today_hrv_status = "no_data"
+
+        garmin_recovery_hours = (
+            today_wellness.get("recovery_time_hours") if today_wellness else None
+        )
+
+        # Tri-state recovery_status disambiguates the three distinct cases a
+        # bare boolean conflates — most importantly "no HRV today" must NOT
+        # read as "not recovered". Note this is recovery from the last
+        # QUALITY session (see last_quality_session), not readiness right now
+        # (use morning_check_in for that).
+        date_passed = predicted_date <= today_str
+        if today_state is True:
+            recovery_status = "recovered"            # HRV confirms in baseline
+        elif today_state is False:
+            recovery_status = "not_recovered"        # HRV confirms below baseline
+        elif date_passed:
+            recovery_status = "likely_recovered"     # date passed, no HRV to confirm
+        else:
+            recovery_status = "recovering"           # within predicted window, unconfirmed
+        already = today_state is True
+
+        note = (
+            f"Based on {n} measured session(s), your HRV typically recovers in "
+            f"{avg_recovery} days after a quality session. "
+        )
+        if already:
+            note += "Today's HRV is back in the baseline band — you're recovered."
+        elif today_state is False:
+            if predicted_date <= today_str:
+                note += (
+                    f"The predicted recovery date ({predicted_date}) has passed, "
+                    "but today's HRV is still below baseline — not yet recovered."
+                )
+            else:
+                note += (
+                    f"After your last quality session ({last_date}), expect full "
+                    f"recovery around {predicted_date}. Today's HRV is still below baseline."
+                )
+        else:
+            # No HRV reading for today — can't confirm recovery either way.
+            if predicted_date <= today_str:
+                note += (
+                    f"The predicted recovery date ({predicted_date}) has passed, but "
+                    "there's no HRV reading for today to confirm recovery — wear your "
+                    "watch overnight to verify."
+                )
+            else:
+                note += (
+                    f"After your last quality session ({last_date}), expect full "
+                    f"recovery around {predicted_date}."
+                )
+        if garmin_recovery_hours:
+            note += (
+                f" (Garmin's own recovery estimate today: {garmin_recovery_hours}h "
+                "remaining.)"
+            )
+        if censored:
+            note += (
+                f" Note: {censored} recent session(s) had not recovered within 7 days "
+                "and are excluded from the average (true recovery may be slightly longer)."
+            )
+        if no_depression:
+            note += (
+                f" {no_depression} session(s) never depressed HRV and are excluded."
+            )
+
+        return {
+            "typical_recovery_days": avg_recovery,
+            "confidence": confidence,
+            "sample_size": n,
+            "last_quality_session": {
+                "date": last_date,
+                "name": last_sess["name"],
+                "type": last_sess["quality_type"],
+            },
+            "predicted_recovered_by": predicted_date,
+            "recovery_status": recovery_status,
+            "already_recovered": already,
+            "today_hrv_status": today_hrv_status,
+            "garmin_recovery_time_hours": garmin_recovery_hours,
+            "censored_sessions": censored,
+            "no_depression_sessions": no_depression,
+            "sample": sample,
+            "note": note,
+        }
+
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+@mcp.tool()
 def weekly_retrospective(week_start: str) -> dict:
     """Combined weekly summary + plan compliance for one Mon-Sun week.
 
@@ -3031,6 +3934,410 @@ def weekly_retrospective(week_start: str) -> dict:
             start.isoformat(), end.isoformat()
         ),
     }
+
+
+# ─── Training load balance (ACWR) ─────────────────────────────────────
+@mcp.tool()
+def training_load_balance(as_of_date: Optional[str] = None) -> dict:
+    """Estimate the Acute:Chronic Workload Ratio (ACWR) from cached run history.
+
+    Load metric is **run duration in minutes** (duration-only — there is no
+    intensity / HR / TRIMP weighting, even though avg_hr is cached, so a hard
+    interval session and an easy run of equal length count the same). Both
+    windows are *rolling* windows ending on the as-of date — NOT calendar
+    weeks — so the figure is stable on any weekday (including Monday morning).
+
+    - acute load   = total run minutes over the rolling LAST 7 DAYS
+                     (as_of - 6 days .. as_of, inclusive).
+    - chronic load = total run minutes over the rolling LAST 28 DAYS
+                     (as_of - 27 days .. as_of, inclusive), divided by 4 to
+                     express it as a weekly-equivalent that matches the 7-day
+                     acute window. Note the windows are *coupled*: the acute
+                     7 days sit inside the chronic 28 days.
+    - acwr = acute / chronic_weekly. If chronic is 0 (not enough history),
+      acwr is None and a "not enough history" message is returned.
+
+    The 0.8 / 1.3 / 1.5 ACWR thresholds below are a commonly-used heuristic
+    (Gabbett et al.) — the underlying injury model is contested in the
+    literature and has NOT been validated for this athlete. This repo's
+    framework is Bakken threshold-based, not ACWR-based; treat the zone as a
+    rough volume-trend sanity check, not a hard injury predictor.
+
+    Args:
+        as_of_date: Optional 'YYYY-MM-DD' anchor date for retrospectives.
+            Defaults to today (local date). Both windows end on this date.
+
+    Returns:
+        as_of_date             : the anchor date used
+        acute_load_min         : total run minutes over the last 7 days
+        chronic_load_min       : weekly-equivalent run minutes (last 28 days / 4)
+        acwr                   : rounded to 2 dp (None if chronic is 0)
+        zone                   : 'undertraining' | 'optimal' | 'caution'
+                                 | 'high_risk' (None if chronic is 0)
+        recommendation         : coaching string
+        weekly_breakdown       : list of {week_start, week_end, run_minutes} for
+                                 the 4 rolling 7-day blocks ending on as_of
+                                 (oldest first; last block == acute window)
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        if as_of_date is not None:
+            try:
+                as_of = _date.fromisoformat(as_of_date)
+            except ValueError as e:
+                return {"error": f"Invalid as_of_date: {e}"}
+        else:
+            as_of = _date.today()
+
+        acute_start = as_of - _td(days=6)    # rolling last 7 days, inclusive
+        chronic_start = as_of - _td(days=27)  # rolling last 28 days, inclusive
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            rows = conn.execute(
+                """
+                SELECT date(start_date_local) AS run_date,
+                       COALESCE(NULLIF(moving_time_s, 0), elapsed_time_s, 0)
+                           AS load_s
+                FROM activities
+                WHERE sport_type = 'Run'
+                  AND date(start_date_local) BETWEEN ? AND ?
+                ORDER BY run_date
+                """,
+                (chronic_start.isoformat(), as_of.isoformat()),
+            ).fetchall()
+
+        # Build 4 rolling 7-day blocks ending on as_of (oldest first).
+        weeks: list[dict] = []
+        for block_offset in range(3, -1, -1):
+            wk_end = as_of - _td(days=7 * block_offset)
+            wk_start = wk_end - _td(days=6)
+            weeks.append({
+                "week_start": wk_start.isoformat(),
+                "week_end": wk_end.isoformat(),
+                "run_minutes": 0.0,
+            })
+
+        acute_load_min = 0.0
+        chronic_total_min = 0.0
+        for run_date_str, load_s in rows:
+            minutes = (load_s or 0) / 60.0
+            chronic_total_min += minutes
+            if acute_start.isoformat() <= run_date_str <= as_of.isoformat():
+                acute_load_min += minutes
+            for bucket in weeks:
+                if bucket["week_start"] <= run_date_str <= bucket["week_end"]:
+                    bucket["run_minutes"] += minutes
+                    break
+
+        acute_load_min = round(acute_load_min, 1)
+        # Chronic expressed as a weekly equivalent (28 days / 4).
+        chronic_load_min = round(chronic_total_min / 4.0, 1)
+        for bucket in weeks:
+            bucket["run_minutes"] = round(bucket["run_minutes"], 1)
+
+        if chronic_load_min == 0:
+            return {
+                "as_of_date": as_of.isoformat(),
+                "acute_load_min": acute_load_min,
+                "chronic_load_min": chronic_load_min,
+                "acwr": None,
+                "zone": None,
+                "recommendation": (
+                    "Not enough history — no run load found in the last 28 days, "
+                    "so a chronic baseline can't be computed. Sync activities "
+                    "(or pick a later as_of_date with cache coverage), then "
+                    "rebuild volume gently."
+                ),
+                "weekly_breakdown": weeks,
+            }
+
+        acwr = round(acute_load_min / chronic_load_min, 2)
+        if acwr < 0.8:
+            zone = "undertraining"
+            recommendation = (
+                f"ACWR {acwr} — below the 0.8 floor. Recent volume is low "
+                "relative to your 28-day baseline. A moderate increase in "
+                "easy volume is reasonable. (Heuristic only, not validated "
+                "for you, and duration-only — it ignores intensity.)"
+            )
+        elif acwr <= 1.3:
+            zone = "optimal"
+            recommendation = (
+                f"ACWR {acwr} — in the commonly-cited 0.8–1.3 'optimal' band. "
+                "Recent load is well-matched to your 28-day base. (Heuristic "
+                "only, not validated for you, and duration-only.)"
+            )
+        elif acwr <= 1.5:
+            zone = "caution"
+            recommendation = (
+                f"ACWR {acwr} — in the 1.3–1.5 'caution' band. Acute load is "
+                "running ahead of your chronic base; consider holding volume "
+                "steady. (Heuristic only, not validated for you, and "
+                "duration-only.)"
+            )
+        else:
+            zone = "high_risk"
+            recommendation = (
+                f"ACWR {acwr} — above 1.5. Acute load is well ahead of your "
+                "chronic base; an easier day could let the base catch up. "
+                "(Heuristic only, not validated for you, and duration-only.)"
+            )
+
+        return {
+            "as_of_date": as_of.isoformat(),
+            "acute_load_min": acute_load_min,
+            "chronic_load_min": chronic_load_min,
+            "acwr": acwr,
+            "zone": zone,
+            "recommendation": recommendation,
+            "weekly_breakdown": weeks,
+        }
+
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+# ─── Progress report ──────────────────────────────────────────────────
+@mcp.tool()
+def progress_report(
+    session_type: Literal["threshold", "intervals", "long", "easy", "tempo"],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict:
+    """Compare the same session type over time to track fitness progress.
+
+    Sessions are classified via the plan link first (the workout's own
+    planned_type is ground truth) and fall back to the name pattern for
+    free runs and pre-linkage history — so plan-driven blocks (e.g.
+    threshold) classify correctly even when the activity name is generic.
+
+    For interval/threshold sessions, per-session metrics are derived from
+    work-rep (drag) laps only — warmup, cooldown, and rest laps are
+    excluded so the comparison isn't diluted by session structure.
+
+    For continuous sessions (easy, long, tempo) the whole-session avg HR
+    and pace are used since there are no meaningful lap divisions.
+
+    Trend is HR-based for every session type. Pace is *not* used to assess
+    the trend: for intervals/threshold pace varies with rep length (a pace
+    lever, not an intensity lever), and for easy/long pace is HR-capped by
+    this framework. Pace is still reported per session for context, and
+    pace deltas are included as informational-only fields.
+
+    Args:
+        session_type: One of 'threshold', 'intervals', 'long', 'easy', 'tempo'.
+        start_date: 'YYYY-MM-DD' (inclusive). Defaults to 90 days ago.
+        end_date:   'YYYY-MM-DD' (inclusive). Defaults to today.
+
+    Returns:
+    - `sessions`: matching sessions in chronological order (oldest first).
+      For intervals/threshold: `avg_hr` and `pace_s_per_km` are drag-lap
+      averages; `drag_count` shows how many reps were found; sessions with
+      no lap data are flagged with data_source 'session_avg_fallback'.
+      For easy/long/tempo: whole-session values. Each session also carries
+      `classification_source` ('plan' or 'name').
+    - `trend`: first_half vs second_half comparison with `assessment`
+      ('improving' / 'stable' / 'declining'), based on HR. For interval
+      types only drag-lap sessions feed the trend (fallback sessions are
+      excluded so warmup/rest HR doesn't pollute the halves).
+    - `data_source`: 'drag_laps' or 'session_avg' — the per-session signal.
+    - `note`: human-readable summary, including the pace caveat.
+    """
+    import sqlite3 as _sqlite3
+    import json as _json
+    from datetime import date as _date, datetime as _datetime, timedelta as _td
+
+    _INTERVAL_TYPES = {"threshold", "intervals"}
+    # classify_activity may return richer labels (e.g. prog-long); map the
+    # ones that belong to a requested bucket.
+    _type_aliases = {
+        "threshold": {"threshold"},
+        "intervals": {"intervals"},
+        "long": {"long", "prog-long"},
+        "easy": {"easy"},
+        "tempo": {"tempo"},
+    }
+
+    def _valid_date(s: str) -> bool:
+        try:
+            _datetime.strptime(s, "%Y-%m-%d")
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    try:
+        today = _date.today()
+        if start_date is not None and not _valid_date(start_date):
+            return {"error": f"Invalid start_date '{start_date}'. Expected 'YYYY-MM-DD'."}
+        if end_date is not None and not _valid_date(end_date):
+            return {"error": f"Invalid end_date '{end_date}'. Expected 'YYYY-MM-DD'."}
+
+        effective_end = end_date or today.isoformat()
+        effective_start = start_date or (today - _td(days=90)).isoformat()
+        if effective_start > effective_end:
+            return {"error": f"start_date ({effective_start}) is after end_date ({effective_end})."}
+
+        target_hints = _type_aliases.get(session_type, {session_type})
+        use_drag_laps = session_type in _INTERVAL_TYPES
+
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT a.id, a.start_date_local, a.name, a.sport_type,
+                       a.distance_m, a.moving_time_s, a.avg_hr,
+                       a.planned_type, l.laps_json
+                FROM activities a
+                LEFT JOIN laps l ON l.activity_id = a.id
+                WHERE date(a.start_date_local) BETWEEN ? AND ?
+                  AND a.sport_type = 'Run'
+                ORDER BY a.start_date_local
+                """,
+                (effective_start, effective_end),
+            ).fetchall()
+
+        zones = garmin_sync._parse_zones()
+        sessions = []
+
+        for r in rows:
+            classification, cls_source = garmin_sync.classify_activity(
+                r["name"], r["sport_type"], r["planned_type"]
+            )
+            if classification not in target_hints:
+                continue
+
+            dist_m = r["distance_m"] or 0
+            time_s = r["moving_time_s"]
+
+            if use_drag_laps and r["laps_json"]:
+                # Use drag-lap averages — excludes wu/cd/pause
+                raw_laps = _json.loads(r["laps_json"])
+                classified = garmin_sync._classify_laps(raw_laps, zones)
+                drag_laps = [l for l in classified if l.get("lap_type") == "drag"]
+
+                if not drag_laps:
+                    # No drags found — fall back to session avg with a flag.
+                    # Flagged sessions are excluded from the drag-lap trend.
+                    avg_hr = r["avg_hr"]
+                    pace = round(time_s / (dist_m / 1000)) if (time_s and dist_m) else None
+                    drag_count = 0
+                    source = "session_avg_fallback"
+                else:
+                    hrs = [l["average_heartrate"] for l in drag_laps if l.get("average_heartrate")]
+                    paces = [
+                        round(1000 / l["average_speed"])
+                        for l in drag_laps
+                        if (l.get("average_speed") or 0) > 0
+                    ]
+                    avg_hr = round(sum(hrs) / len(hrs), 1) if hrs else None
+                    pace = round(sum(paces) / len(paces)) if paces else None
+                    drag_count = len(drag_laps)
+                    source = "drag_laps"
+            else:
+                # Continuous session or no lap data
+                avg_hr = r["avg_hr"]
+                pace = round(time_s / (dist_m / 1000)) if (time_s and dist_m) else None
+                drag_count = None
+                source = "session_avg"
+
+            entry: dict = {
+                "date": r["start_date_local"][:10],
+                "name": r["name"],
+                "classification_source": cls_source,
+                "distance_km": round(dist_m / 1000, 2) if dist_m else None,
+                "avg_hr": avg_hr,
+                "moving_time_s": round(time_s) if time_s is not None else None,
+                "pace_s_per_km": pace,
+                "data_source": source,
+            }
+            if drag_count is not None:
+                entry["drag_count"] = drag_count
+            sessions.append(entry)
+
+        # Rows are already chronological (oldest first) from the query.
+        sessions_chrono = sessions
+
+        def _halves_stats(items):
+            hrs = [s["avg_hr"] for s in items if s.get("avg_hr") is not None]
+            paces = [s["pace_s_per_km"] for s in items if s.get("pace_s_per_km") is not None]
+            return {
+                "avg_hr": round(sum(hrs) / len(hrs), 1) if hrs else None,
+                "avg_pace_s_per_km": round(sum(paces) / len(paces)) if paces else None,
+                "count": len(items),
+            }
+
+        # Trend is HR-based. For interval types, exclude fallback sessions
+        # (whole-session HR would mix warmup/rest into the comparison).
+        if use_drag_laps:
+            trend_items = [s for s in sessions_chrono if s.get("data_source") == "drag_laps"]
+        else:
+            trend_items = sessions_chrono
+
+        trend: dict = {}
+        if len(trend_items) >= 2:
+            mid = len(trend_items) // 2
+            fh = _halves_stats(trend_items[:mid])
+            sh = _halves_stats(trend_items[mid:])
+
+            assessment = "stable"
+            if fh["avg_hr"] is not None and sh["avg_hr"] is not None:
+                hr_d = sh["avg_hr"] - fh["avg_hr"]
+                # Lower HR for the same kind of work = improving fitness.
+                if hr_d < -2:
+                    assessment = "improving"
+                elif hr_d > 3:
+                    assessment = "declining"
+            else:
+                assessment = "insufficient_data"
+
+            pace_delta = (
+                sh["avg_pace_s_per_km"] - fh["avg_pace_s_per_km"]
+                if (fh["avg_pace_s_per_km"] and sh["avg_pace_s_per_km"]) else None
+            )
+            trend = {
+                "based_on": "hr",
+                "first_half": fh,
+                "second_half": sh,
+                "hr_delta_bpm": round(sh["avg_hr"] - fh["avg_hr"], 1)
+                    if (fh["avg_hr"] is not None and sh["avg_hr"] is not None) else None,
+                "pace_delta_s_per_km_informational": pace_delta,
+                "assessment": assessment,
+                "trend_session_count": len(trend_items),
+            }
+        elif trend_items:
+            trend = {"based_on": "hr", "assessment": "insufficient_data",
+                     "trend_session_count": len(trend_items)}
+        else:
+            trend = {"based_on": "hr", "assessment": "no_data", "trend_session_count": 0}
+
+        total = len(sessions)
+        data_source = "drag_laps" if use_drag_laps else "session_avg"
+        note = f"Found {total} {session_type} session(s) between {effective_start} and {effective_end}."
+        if total == 0:
+            note += (f" No sessions classified as '{session_type}'. "
+                     "Try sync_activities() or check session names/plan links.")
+        elif use_drag_laps:
+            no_laps = sum(1 for s in sessions if s.get("data_source") == "session_avg_fallback")
+            note += " HR/pace from work reps (drag laps) only — warmup, rest, and cooldown excluded."
+            if no_laps:
+                note += (f" {no_laps} session(s) had no lap data; shown with a "
+                         "'session_avg_fallback' flag and excluded from the HR trend.")
+            note += " Trend is HR-based; pace varies with rep length so it is informational only."
+        else:
+            note += " Trend is HR-based; pace is HR-capped in this framework and shown for context only."
+
+        return {
+            "session_type": session_type,
+            "data_source": data_source,
+            "date_range": {"start": effective_start, "end": effective_end},
+            "sessions": sessions_chrono,
+            "trend": trend,
+            "note": note,
+        }
+
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
 
 
 # ─── Taper planner ────────────────────────────────────────────────────
