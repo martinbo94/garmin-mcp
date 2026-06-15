@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -500,8 +501,9 @@ def run_sync(
     weeks_back: Optional[int] = None,
     since: Optional[datetime] = None,
     until: Optional[datetime] = None,
+    wellness_days: int = 10,
 ) -> dict:
-    """Pull new activities + streams + laps from Garmin into the local cache.
+    """Pull new activities + streams + laps + recent wellness into the cache.
 
     Args:
         garmin_client: Authenticated garminconnect.Garmin instance.
@@ -510,6 +512,11 @@ def run_sync(
         since: Explicit start datetime (overrides weeks_back/force_full).
         until: Optional end datetime — only activities before this are synced.
             Used for month-by-month backfills.
+        wellness_days: Also refresh the trailing N days of wellness (HRV,
+            resting HR, sleep, body battery) ending today, so the recovery /
+            readiness tools don't see stale "no data". Default 10; set 0 to
+            skip. Deeper historical wellness backfill is via
+            get_wellness_history(start, end), not here.
     """
     _init_db()
 
@@ -605,16 +612,48 @@ def run_sync(
                 _store_laps(act_id, laps)
                 laps_count += 1
 
+    # Refresh recent wellness so HRV/RHR/sleep stay current alongside
+    # activities — activity sync alone leaves these stale, which makes the
+    # recovery/readiness tools report phantom "no data". Failures here never
+    # break activity sync.
+    wellness_fetched = 0
+    wellness_cached = 0
+    if wellness_days and wellness_days > 0:
+        try:
+            today = datetime.now(timezone.utc).date()
+            w_start = (today - timedelta(days=wellness_days - 1)).isoformat()
+            w = sync_wellness_range(garmin_client, w_start, today.isoformat())
+            wellness_fetched = w.get("fetched", 0)
+            wellness_cached = w.get("cached", 0)
+            errors.extend(w.get("errors", []))
+        except Exception as e:
+            errors.append(f"wellness: {type(e).__name__}: {e}")
+
     _set_last_sync(sync_start)
+
+    # Report the newest cached dates so callers can tell "0 new" (already
+    # up to date) from "stale" without a second lookup — `new_activities: 0`
+    # is normal and does NOT mean the cache is behind.
+    with sqlite3.connect(DB_PATH) as conn:
+        newest_activity = conn.execute(
+            "SELECT MAX(date(start_date_local)) FROM activities"
+        ).fetchone()[0]
+        newest_wellness = conn.execute(
+            "SELECT MAX(date) FROM wellness_daily"
+        ).fetchone()[0]
 
     return {
         "new_activities": new_count,
         "streams_fetched": streams_count,
         "laps_fetched": laps_count,
         "details_fetched": details_count,
+        "wellness_fetched": wellness_fetched,
+        "wellness_cached": wellness_cached,
         "errors": errors,
         "last_sync": sync_start.isoformat(),
         "since": after.isoformat(),
+        "cache_newest_activity": newest_activity,
+        "cache_newest_wellness": newest_wellness,
     }
 
 
