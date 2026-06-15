@@ -21,6 +21,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import garmin_sync  # noqa: E402  (must load after dotenv so token refresh works)
 import plan as plan_mod  # noqa: E402
+import gpx_analysis  # noqa: E402
 
 SERVER_INSTRUCTIONS = """
 This server is a personal running coach MCP. It connects to Garmin
@@ -4227,6 +4228,125 @@ def forecast_conditions(
         elif w.get("relative_humidity") is not None:
             kw["relative_humidity"] = w["relative_humidity"]
         result["heat_adjustment"] = heat_pace_adjustment(**kw)
+    return result
+
+
+@mcp.tool()
+def analyze_race_course(
+    gpx_path: str,
+    goal_time: Optional[str] = None,
+    goal_pace_min_per_km: Optional[str] = None,
+) -> dict:
+    """Analyze a race course from a GPX file and build a per-km pace plan.
+
+    Reads a .gpx track, profiles the course (distance, ascent/descent,
+    per-km gradient, hardest climb), and — given a goal — produces an
+    EVEN-EFFORT pacing plan: each km's target pace is a single flat-equivalent
+    'effort pace' scaled by that km's gradient, so uphill km are slower,
+    downhill faster, and the splits sum to the goal. This paces by effort, not
+    by the clock, which is how you actually run a hilly course evenly.
+
+    Provide ONE of goal_time or goal_pace_min_per_km (or neither — then you get
+    course analysis only, no plan):
+        goal_time: target finish, 'H:MM:SS' or 'MM:SS' (e.g. '1:45:00', '45:00').
+        goal_pace_min_per_km: target AVERAGE pace 'M:SS' (e.g. '5:30'); the goal
+            time is this pace × the measured course distance.
+
+    The grade adjustment is the same linear heuristic family as
+    `elevation_impact` (asymmetric: uphill costs more pace than downhill saves);
+    treat the splits as a guide, not gospel. Since you train HR/effort-primary,
+    run the plan by effort and let pace drift — the per-km targets just tell you
+    where the course will push HR up (climbs) so you don't over-run them.
+
+    Args:
+        gpx_path: path to a .gpx file on disk.
+        goal_time / goal_pace_min_per_km: see above.
+
+    Returns `course` (distance, ascent, descent, net, per-km gradient table,
+    steepest km, biggest climb) and, when a goal is given, `pacing` (effort
+    pace, predicted finish, and per-km target paces + cumulative splits).
+    """
+    import os as _os
+    if not _os.path.isfile(gpx_path):
+        return {"error": f"GPX file not found: {gpx_path}"}
+    try:
+        points = gpx_analysis.parse_gpx(gpx_path)
+    except Exception as e:
+        return {"error": f"Could not parse GPX: {type(e).__name__}: {e}"}
+    if len(points) < 2:
+        return {"error": "GPX has fewer than 2 track points — nothing to analyze."}
+
+    prof = gpx_analysis.course_profile(points)
+    segments = gpx_analysis.per_km_segments(prof)
+    dist_km = prof["total_distance_m"] / 1000.0
+
+    steepest = max(segments, key=lambda s: s["avg_grade_pct"]) if segments else None
+    course = {
+        "total_distance_km": round(dist_km, 2),
+        "total_ascent_m": prof["total_ascent_m"],
+        "total_descent_m": prof["total_descent_m"],
+        "net_elevation_m": prof["net_elevation_m"],
+        "has_elevation": prof["has_elevation"],
+        "steepest_km": steepest,
+        "per_km_grade": [
+            {"km": s["km"], "distance_km": s["distance_km"],
+             "avg_grade_pct": s["avg_grade_pct"], "elev_change_m": s["elev_change_m"]}
+            for s in segments
+        ],
+    }
+    if not prof["has_elevation"]:
+        course["elevation_note"] = (
+            "GPX has no usable elevation data — treated as flat. Pacing (if "
+            "requested) assumes no gradient."
+        )
+
+    result = {"course": course}
+
+    # Resolve the goal into seconds, if any.
+    goal_time_s = None
+    if goal_time and goal_pace_min_per_km:
+        return {"error": "Provide only one of goal_time or goal_pace_min_per_km."}
+    if goal_time:
+        parts = goal_time.split(":")
+        try:
+            nums = [int(p) for p in parts]
+        except ValueError:
+            return {"error": f"Could not parse goal_time '{goal_time}'. Use H:MM:SS or MM:SS."}
+        if len(nums) == 3:
+            goal_time_s = nums[0] * 3600 + nums[1] * 60 + nums[2]
+        elif len(nums) == 2:
+            goal_time_s = nums[0] * 60 + nums[1]
+        else:
+            return {"error": f"Could not parse goal_time '{goal_time}'. Use H:MM:SS or MM:SS."}
+    elif goal_pace_min_per_km:
+        p = goal_pace_min_per_km.replace("/km", "").strip().split(":")
+        if len(p) != 2:
+            return {"error": f"Could not parse goal_pace_min_per_km '{goal_pace_min_per_km}'. Use M:SS."}
+        try:
+            pace_s = int(p[0]) * 60 + int(p[1])
+        except ValueError:
+            return {"error": f"Could not parse goal_pace_min_per_km '{goal_pace_min_per_km}'. Use M:SS."}
+        goal_time_s = pace_s * dist_km
+
+    if goal_time_s is not None:
+        plan = gpx_analysis.pacing_plan(segments, goal_time_s)
+        if "error" in plan:
+            return plan
+        plan["goal"] = {
+            "goal_time": gpx_analysis.fmt_time(goal_time_s),
+            "implied_avg_pace": gpx_analysis.fmt_pace(goal_time_s / dist_km),
+            "course_distance_km": round(dist_km, 2),
+        }
+        result["pacing"] = plan
+        result["hr_note"] = (
+            "Run this by effort/HR, not the watch — the splits show where the "
+            "course steepens so you hold effort instead of pace on the climbs."
+        )
+    else:
+        result["note"] = (
+            "No goal given — course analysis only. Pass goal_time or "
+            "goal_pace_min_per_km for a per-km pace plan."
+        )
     return result
 
 
