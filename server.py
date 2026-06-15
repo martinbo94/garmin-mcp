@@ -4253,18 +4253,29 @@ def analyze_race_course(
             time is this pace × the measured course distance.
 
     The grade adjustment is the same linear heuristic family as
-    `elevation_impact` (asymmetric: uphill costs more pace than downhill saves);
-    treat the splits as a guide, not gospel. Since you train HR/effort-primary,
-    run the plan by effort and let pace drift — the per-km targets just tell you
-    where the course will push HR up (climbs) so you don't over-run them.
+    `elevation_impact` (asymmetric: uphill costs more pace than downhill saves).
+    It is only reliable for MODERATE gradients (roughly within ±10%); beyond
+    that the real cost is nonlinear (steep climbs become a hike, steep descents
+    slow again from braking), so such segments are flagged and should be run by
+    effort, not by the split. Since you train HR/effort-primary, run the whole
+    plan by effort and let pace drift — the targets just show where the course
+    pushes HR up.
+
+    `course.notable_climbs` / `notable_descents` are detected at the POINT level,
+    not from the per-km averages — so a short steep hill that a flat-looking km
+    hides (e.g. a 100 m ramp at 10% inside an otherwise-flat km) still shows up,
+    each with a plain-language `note`. `course.warnings` collects those notes
+    (all climbs + any steep, model-unreliable descents) for quick reading.
 
     Args:
         gpx_path: path to a .gpx file on disk.
         goal_time / goal_pace_min_per_km: see above.
 
-    Returns `course` (distance, ascent, descent, net, per-km gradient table,
-    steepest km, biggest climb) and, when a goal is given, `pacing` (effort
-    pace, predicted finish, and per-km target paces + cumulative splits).
+    Returns `course` (distance, ascent/descent/net, per-km gradient table,
+    steepest km, notable_climbs, notable_descents, warnings) and, when a goal is
+    given, `pacing` (effort pace, predicted finish, per-km targets + cumulative
+    splits). Each climb/descent carries start/end km, length, gain/drop, avg and
+    max grade, a difficulty category, and a `pace_model_reliable` flag.
     """
     import os as _os
     if not _os.path.isfile(gpx_path):
@@ -4281,6 +4292,7 @@ def analyze_race_course(
     dist_km = prof["total_distance_m"] / 1000.0
 
     steepest = max(segments, key=lambda s: s["avg_grade_pct"]) if segments else None
+    features = gpx_analysis.detect_features(prof)
     course = {
         "total_distance_km": round(dist_km, 2),
         "total_ascent_m": prof["total_ascent_m"],
@@ -4288,12 +4300,20 @@ def analyze_race_course(
         "net_elevation_m": prof["net_elevation_m"],
         "has_elevation": prof["has_elevation"],
         "steepest_km": steepest,
+        "notable_climbs": features["climbs"],
+        "notable_descents": features["descents"],
         "per_km_grade": [
             {"km": s["km"], "distance_km": s["distance_km"],
              "avg_grade_pct": s["avg_grade_pct"], "elev_change_m": s["elev_change_m"]}
             for s in segments
         ],
     }
+    # Surface the climb warnings up front — these are the point-level steep
+    # hills the per-km averages hide, plus any steep (model-unreliable) descents.
+    course["warnings"] = (
+        [c["note"] for c in features["climbs"]]
+        + [d["note"] for d in features["descents"] if not d["pace_model_reliable"]]
+    )
     if not prof["has_elevation"]:
         course["elevation_note"] = (
             "GPX has no usable elevation data — treated as flat. Pacing (if "
