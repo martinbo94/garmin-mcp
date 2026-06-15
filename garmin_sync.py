@@ -85,7 +85,9 @@ CREATE TABLE IF NOT EXISTS activities (
     workout_rpe INTEGER,
     workout_feel INTEGER,
     workout_compliance INTEGER,
-    detail_fetched_at TEXT
+    detail_fetched_at TEXT,
+    start_lat REAL,
+    start_lon REAL
 );
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(start_date_local);
 
@@ -165,6 +167,8 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     "workout_feel": "INTEGER",
     "workout_compliance": "INTEGER",
     "detail_fetched_at": "TEXT",
+    "start_lat": "REAL",
+    "start_lon": "REAL",
 }
 
 
@@ -411,6 +415,8 @@ def _fetch_detail_fields(garmin_client, act_id: int) -> dict:
         "workout_feel": summ.get("directWorkoutFeel"),
         "workout_compliance": summ.get("directWorkoutComplianceScore"),
         "training_effect_label": summ.get("trainingEffectLabel"),
+        "start_lat": summ.get("startLatitude"),
+        "start_lon": summ.get("startLongitude"),
     }
 
 
@@ -425,7 +431,9 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
                 workout_feel = ?,
                 workout_compliance = ?,
                 training_effect_label = COALESCE(?, training_effect_label),
-                detail_fetched_at = ?
+                detail_fetched_at = ?,
+                start_lat = COALESCE(?, start_lat),
+                start_lon = COALESCE(?, start_lon)
             WHERE id = ?
             """,
             (
@@ -436,6 +444,8 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
                 fields.get("workout_compliance"),
                 fields.get("training_effect_label"),
                 datetime.now(timezone.utc).isoformat(),
+                fields.get("start_lat"),
+                fields.get("start_lon"),
                 act_id,
             ),
         )
@@ -492,6 +502,106 @@ def backfill_workout_links(garmin_client, max_activities: int = 100) -> dict:
         "relinked": relinked,
         "remaining_without_detail": remaining,
         "errors": errors,
+    }
+
+
+# ─── Location + weather (Open-Meteo) ──────────────────────────────────
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+def latest_location() -> Optional[dict]:
+    """Coordinates of the most recent cached activity that has GPS, if any.
+
+    Coordinates are populated on the per-activity detail fetch during sync;
+    indoor/treadmill activities have none, so this skips them.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT start_lat, start_lon, name, date(start_date_local) AS d
+            FROM activities
+            WHERE start_lat IS NOT NULL AND start_lon IS NOT NULL
+            ORDER BY start_date_local DESC LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "lat": row["start_lat"], "lon": row["start_lon"],
+        "from_activity": row["name"], "as_of": row["d"],
+    }
+
+
+def fetch_weather(lat: float, lon: float, date_str: str, hour: int) -> dict:
+    """One local date+hour of conditions from Open-Meteo (free, no API key).
+
+    Read-only public API. Covers roughly the past 92 days through 16 days
+    ahead. Returns the requested hour's temperature / humidity / dew point
+    (the exact inputs heat_pace_adjustment wants) plus wind, precipitation,
+    and the day's temperature range.
+    """
+    import requests
+    from datetime import date as _date
+
+    try:
+        target = _date.fromisoformat(date_str)
+    except ValueError:
+        return {"error": f"Invalid date '{date_str}', expected YYYY-MM-DD."}
+    delta = (target - _date.today()).days
+    if delta < -92 or delta > 16:
+        return {
+            "error": (
+                f"{date_str} is outside Open-Meteo's window (about the past 92 "
+                "days through 16 days ahead)."
+            )
+        }
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": (
+            "temperature_2m,relative_humidity_2m,dew_point_2m,"
+            "precipitation,wind_speed_10m"
+        ),
+        "timezone": "auto",
+        "start_date": date_str,
+        "end_date": date_str,
+    }
+    try:
+        resp = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return {"error": f"Weather fetch failed: {type(e).__name__}: {e}"}
+
+    h = data.get("hourly") or {}
+    times = h.get("time") or []
+    if not times:
+        return {"error": "No hourly data returned for that date/location."}
+
+    hour = max(0, min(23, int(hour)))
+    idx = next(
+        (i for i, t in enumerate(times) if t.endswith(f"T{hour:02d}:00")),
+        min(hour, len(times) - 1),
+    )
+
+    def at(key):
+        arr = h.get(key) or []
+        return arr[idx] if idx < len(arr) else None
+
+    temps = [t for t in (h.get("temperature_2m") or []) if t is not None]
+    return {
+        "resolved_local_time": times[idx],
+        "temp_c": at("temperature_2m"),
+        "dew_point_c": at("dew_point_2m"),
+        "relative_humidity": at("relative_humidity_2m"),
+        "precipitation_mm": at("precipitation"),
+        "wind_speed_kmh": at("wind_speed_10m"),
+        "day_temp_max_c": max(temps) if temps else None,
+        "day_temp_min_c": min(temps) if temps else None,
+        "source": "open-meteo",
     }
 
 
