@@ -217,9 +217,14 @@ def per_km_segments(profile: dict) -> list[dict]:
 # as ~1%). These detectors work on a fine resample so a sharp ramp is caught.
 _DETECT_STEP_M = 20.0       # resample resolution
 _RETRACE_TOL_M = 4.0        # vertical retracement that ends a climb/descent
-_MIN_GAIN_M = 8.0           # ignore bumps smaller than this
-_MIN_AVG_GRADE = 3.0        # ignore gentler-than-this features
 _MAXGRADE_WIN_M = 40.0      # window for the steepest sub-stretch
+# A feature is "notable" if it's EITHER steep OR a sustained gain — so a sharp
+# short pitch AND a long gradual drag both surface (the latter matters for HR
+# even at a gentle grade). Asymmetric grade/gain alone each miss one of them.
+_STEEP_GRADE = 4.0          # % avg grade that's notable regardless of length
+_MIN_STEEP_GAIN_M = 5.0     # ...but still needs a little gain (not a 20 m blip)
+_SUSTAINED_GAIN_M = 15.0    # gain/drop that's notable even when gentle
+_GENTLE_MIN_GRADE = 1.5     # ...as long as it's not near-flat drift
 
 
 def _grade_category(abs_grade: float) -> str:
@@ -284,9 +289,11 @@ def _detect(profile: dict, sign: int) -> list[dict]:
             j += 1
         gain = sign * (eles[ext] - eles[start])      # always positive
         length = dists[ext] - dists[start]
-        if length > 0 and gain >= _MIN_GAIN_M:
+        if length > 0:
             avg_grade = gain / length * 100
-            if avg_grade >= _MIN_AVG_GRADE:
+            steep = avg_grade >= _STEEP_GRADE and gain >= _MIN_STEEP_GAIN_M
+            sustained = gain >= _SUSTAINED_GAIN_M and avg_grade >= _GENTLE_MIN_GRADE
+            if steep or sustained:
                 max_grade = _max_grade_in(dists, eles, start, ext, sign)
                 start_km = dists[start] / 1000.0
                 end_km = dists[ext] / 1000.0
