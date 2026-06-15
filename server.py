@@ -3580,6 +3580,295 @@ def _deload_recovery_context(as_of: "date") -> dict:
 
 
 @mcp.tool()
+def recovery_prediction(lookback_sessions: int = 8) -> dict:
+    """Predict how many days it typically takes to return to baseline HRV
+    after a quality session, based on your personal historical pattern.
+
+    For each quality session in the last `lookback_sessions` quality runs,
+    finds how many days until HRV returned to within the normal baseline
+    band. Averages the measured ones to build a personal recovery profile,
+    then applies it to the most recent quality session to estimate when
+    you're likely fully recovered.
+
+    A "quality session" is detected from the plan's `planned_type`
+    (threshold / intervals / vo2 / race), the activity name, OR — as a
+    fallback for default-named hard runs and races — Garmin's
+    `training_effect_label` (VO2MAX / LACTATE_THRESHOLD /
+    ANAEROBIC_CAPACITY). This catches max-effort races logged under a
+    generic name (e.g. a 10k race named "Bærum Løping").
+
+    The "recovered" verdict is gated on today's *actual* HRV being back in
+    the baseline band — the predicted date merely passing is not treated
+    as recovered. This stays consistent with morning_check_in's
+    traffic-light HRV model. recovery_time_hours (Garmin's own estimate)
+    is surfaced for cross-checking.
+
+    Args:
+        lookback_sessions: Number of past quality sessions to analyse.
+            Default 8 — enough for a stable average without going too far
+            back in time. At least 2 measured sessions are needed for a
+            prediction.
+
+    Returns:
+        - typical_recovery_days: your personal average (float)
+        - confidence: 'low' / 'medium' / 'high' based on sample size
+        - last_quality_session: date and type of the most recent hard session
+        - predicted_recovered_by: estimated date of full HRV recovery
+        - already_recovered: True ONLY if today's HRV is in the baseline band
+        - today_hrv_status: today's HRV vs baseline (or 'no_data')
+        - garmin_recovery_time_hours: Garmin's own recovery estimate, if any
+        - sample: list of past sessions with their measured recovery days
+        - censored_sessions: count whose HRV had not returned within 7 days
+        - no_depression_sessions: count where HRV never dropped below baseline
+        - note: human-readable summary
+    """
+    import sqlite3 as _sq
+    from datetime import datetime as _dt, timedelta as _td
+
+    try:
+        _db = garmin_sync.DB_PATH
+
+        # ── 1. Find quality sessions ──────────────────────────────────
+        # Detect via plan label (planned_type), name hint, OR Garmin's
+        # training-effect label as a fallback for default-named hard runs.
+        _QUALITY_PLANNED = {"threshold", "intervals", "vo2", "race"}
+        _QUALITY_NAME = {"threshold", "intervals", "tempo", "race"}
+        _QUALITY_TE = {"VO2MAX", "LACTATE_THRESHOLD", "ANAEROBIC_CAPACITY"}
+
+        with _sq.connect(_db) as conn:
+            conn.row_factory = _sq.Row
+            acts = conn.execute("""
+                SELECT id, start_date_local, name, sport_type, avg_hr,
+                       planned_type, training_effect_label
+                FROM activities
+                WHERE sport_type = 'Run'
+                ORDER BY start_date_local DESC
+                LIMIT 120
+            """).fetchall()
+
+        def _quality_type(a) -> Optional[str]:
+            """Return the quality label for a session, or None if not hard."""
+            pt = (a["planned_type"] or "").lower()
+            if pt in _QUALITY_PLANNED:
+                return pt
+            hint = garmin_sync.name_hint(a["name"], a["sport_type"])
+            if hint in _QUALITY_NAME:
+                return hint
+            te = (a["training_effect_label"] or "").upper()
+            if te in _QUALITY_TE:
+                return te.lower()
+            return None
+
+        quality = []
+        for a in acts:
+            qt = _quality_type(a)
+            if qt is not None:
+                d = dict(a)
+                d["quality_type"] = qt
+                quality.append(d)
+            if len(quality) >= lookback_sessions + 2:
+                break
+
+        if not quality:
+            return {
+                "error": "No quality sessions found in recent history.",
+                "note": "Record some threshold, interval, or race sessions first.",
+            }
+
+        # ── 2. For each quality session, find days until HRV recovered ─
+        with _sq.connect(_db) as conn:
+            conn.row_factory = _sq.Row
+            wellness = conn.execute("""
+                SELECT date, hrv_overnight_avg, hrv_baseline_low, hrv_baseline_upper,
+                       hrv_status, recovery_time_hours
+                FROM wellness_daily
+                ORDER BY date ASC
+            """).fetchall()
+
+        wellness_by_date = {r["date"]: dict(r) for r in wellness}
+
+        def _hrv_in_baseline(w: Optional[dict]) -> Optional[bool]:
+            """True/False if HRV state is known for the day, None if unknown.
+
+            Unknown (missing day / no HRV reading) returns None so callers
+            can skip it rather than treating absence as 'not recovered'.
+            """
+            if not w:
+                return None
+            hrv = w.get("hrv_overnight_avg")
+            if hrv is None:
+                return None
+            lo = w.get("hrv_baseline_low")
+            hi = w.get("hrv_baseline_upper")
+            if lo and hi:
+                return lo <= hrv <= hi
+            # Fallback: use Garmin's status string
+            status = (w.get("hrv_status") or "").lower()
+            return status in ("balanced", "good")
+
+        sample = []
+        censored = 0          # HRV had not returned within the 7-day window
+        no_depression = 0     # HRV was never below baseline (no measurable dip)
+        for sess in quality[:lookback_sessions]:
+            sess_date = sess["start_date_local"][:10]
+
+            # Did this session actually depress HRV? If the day after is
+            # already in-baseline (and we have data for it), there is no
+            # measurable recovery to time — flag rather than score "1 day".
+            day1 = (_dt.strptime(sess_date, "%Y-%m-%d") + _td(days=1)).strftime("%Y-%m-%d")
+            day1_state = _hrv_in_baseline(wellness_by_date.get(day1))
+
+            recovery_days = None
+            saw_suppressed = False
+            for d in range(1, 8):
+                check_date = (
+                    _dt.strptime(sess_date, "%Y-%m-%d") + _td(days=d)
+                ).strftime("%Y-%m-%d")
+                state = _hrv_in_baseline(wellness_by_date.get(check_date))
+                if state is None:
+                    continue  # missing/unknown day — skip, don't penalise
+                if state is False:
+                    saw_suppressed = True
+                elif state is True:
+                    if saw_suppressed:
+                        recovery_days = d
+                    break
+
+            if recovery_days is not None:
+                sample.append({
+                    "date": sess_date,
+                    "session_type": sess["quality_type"],
+                    "name": sess["name"],
+                    "recovery_days": recovery_days,
+                })
+            elif not saw_suppressed and day1_state is True:
+                # HRV never dipped after this session — don't average a
+                # phantom "1 day" recovery; count it separately.
+                no_depression += 1
+            elif saw_suppressed:
+                # HRV was suppressed but had not returned within 7 days —
+                # a slow recovery. Counting it (not silently dropping) keeps
+                # the mean from being biased downward.
+                censored += 1
+
+        if len(sample) < 2:
+            note = (
+                "Not enough measured recoveries to build a pattern yet "
+                f"({len(sample)} of {len(quality)} quality sessions had a "
+                "suppression-then-return signal in the HRV record)."
+            )
+            if no_depression:
+                note += f" {no_depression} session(s) never depressed HRV."
+            if censored:
+                note += f" {censored} session(s) had not recovered within 7 days."
+            return {
+                "error": "Not enough HRV data to build a recovery pattern.",
+                "sessions_found": len(quality),
+                "sessions_with_measured_recovery": len(sample),
+                "no_depression_sessions": no_depression,
+                "censored_sessions": censored,
+                "note": note,
+            }
+
+        avg_recovery = round(sum(s["recovery_days"] for s in sample) / len(sample), 1)
+        n = len(sample)
+        confidence = "high" if n >= 6 else "medium" if n >= 3 else "low"
+
+        # ── 3. Apply to most recent quality session ────────────────────
+        last_sess = quality[0]
+        last_date = last_sess["start_date_local"][:10]
+        predicted_date = (
+            _dt.strptime(last_date, "%Y-%m-%d") + _td(days=round(avg_recovery))
+        ).strftime("%Y-%m-%d")
+
+        # "Recovered" is gated on today's ACTUAL HRV being in baseline — a
+        # passed predicted date is NOT sufficient. Use local date (UTC can
+        # roll to the wrong day 00:00-02:00 Norway time).
+        today_str = _dt.now().strftime("%Y-%m-%d")
+        today_wellness = wellness_by_date.get(today_str)
+        today_state = _hrv_in_baseline(today_wellness)
+        if today_state is True:
+            today_hrv_status = "in_baseline"
+        elif today_state is False:
+            today_hrv_status = "below_baseline"
+        else:
+            today_hrv_status = "no_data"
+
+        garmin_recovery_hours = (
+            today_wellness.get("recovery_time_hours") if today_wellness else None
+        )
+
+        already = today_state is True
+
+        note = (
+            f"Based on {n} measured session(s), your HRV typically recovers in "
+            f"{avg_recovery} days after a quality session. "
+        )
+        if already:
+            note += "Today's HRV is back in the baseline band — you're recovered."
+        elif today_state is False:
+            if predicted_date <= today_str:
+                note += (
+                    f"The predicted recovery date ({predicted_date}) has passed, "
+                    "but today's HRV is still below baseline — not yet recovered."
+                )
+            else:
+                note += (
+                    f"After your last quality session ({last_date}), expect full "
+                    f"recovery around {predicted_date}. Today's HRV is still below baseline."
+                )
+        else:
+            # No HRV reading for today — can't confirm recovery either way.
+            if predicted_date <= today_str:
+                note += (
+                    f"The predicted recovery date ({predicted_date}) has passed, but "
+                    "there's no HRV reading for today to confirm recovery — wear your "
+                    "watch overnight to verify."
+                )
+            else:
+                note += (
+                    f"After your last quality session ({last_date}), expect full "
+                    f"recovery around {predicted_date}."
+                )
+        if garmin_recovery_hours:
+            note += (
+                f" (Garmin's own recovery estimate today: {garmin_recovery_hours}h "
+                "remaining.)"
+            )
+        if censored:
+            note += (
+                f" Note: {censored} recent session(s) had not recovered within 7 days "
+                "and are excluded from the average (true recovery may be slightly longer)."
+            )
+        if no_depression:
+            note += (
+                f" {no_depression} session(s) never depressed HRV and are excluded."
+            )
+
+        return {
+            "typical_recovery_days": avg_recovery,
+            "confidence": confidence,
+            "sample_size": n,
+            "last_quality_session": {
+                "date": last_date,
+                "name": last_sess["name"],
+                "type": last_sess["quality_type"],
+            },
+            "predicted_recovered_by": predicted_date,
+            "already_recovered": already,
+            "today_hrv_status": today_hrv_status,
+            "garmin_recovery_time_hours": garmin_recovery_hours,
+            "censored_sessions": censored,
+            "no_depression_sessions": no_depression,
+            "sample": sample,
+            "note": note,
+        }
+
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+@mcp.tool()
 def weekly_retrospective(week_start: str) -> dict:
     """Combined weekly summary + plan compliance for one Mon-Sun week.
 
