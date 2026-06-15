@@ -1430,19 +1430,24 @@ def sync_activities(
     weeks_back: Optional[int] = None,
     backfill_links: bool = False,
     backfill_max: int = 100,
+    wellness_days: int = 10,
 ) -> dict:
-    """Pull new activities + HR streams + laps from Garmin into the local cache.
+    """Pull new activities + HR streams + laps + recent wellness into the cache.
 
-    Runs incrementally since the last sync. An incremental sync runs
-    automatically on every server startup, so `new_activities: 0` is normal
-    and just means nothing has been recorded since the last run — it does NOT
-    mean a recent activity is missing.
+    Runs incrementally since the last sync, and also refreshes the trailing
+    `wellness_days` of wellness (HRV, resting HR, sleep) so the recovery /
+    readiness tools stay current.
 
-    If a recent activity appears to be missing after sync returns 0:
-    1. Use `weekly_summary` for the relevant week to check the cache.
-       The activity is almost certainly already there under its Garmin ID.
-    2. Only call sync again (with force_full=True) if weekly_summary confirms
-       the activity is genuinely absent.
+    IMPORTANT — `new_activities: 0` does NOT mean the cache is stale or that a
+    recent activity is missing. It almost always means the activity was
+    already synced (e.g. by a prior sync or the startup sync) and there is
+    simply nothing new since then. To judge freshness, do NOT re-read the
+    `new_activities` count — instead check the `cache_newest_activity` and
+    `cache_newest_wellness` dates returned by this call (they are the actual
+    newest cached dates), or call `list_activities` and look at the top row.
+    Only escalate to `force_full=True` if those dates confirm a genuinely
+    missing recent activity. Re-syncing because the count was 0 is a common
+    mistake — verify the cached dates first.
 
     Args:
         force_full: If True, re-pull the default 12-week backfill window.
@@ -1461,13 +1466,20 @@ def sync_activities(
         backfill_max: Max activities to backfill per call (default 100).
             `remaining_without_detail` in the response tells you whether
             another round is needed.
+        wellness_days: Trailing days of wellness to refresh (default 10;
+            0 to skip). Historical wellness backfill is via
+            get_wellness_history.
 
-    Returns dict with new_activities count, streams_fetched count,
-    laps_fetched count, details_fetched count, last_sync timestamp, and
-    any per-activity errors. With backfill_links also details_fetched /
-    relinked / remaining_without_detail for the backfill pass.
+    Returns dict with new_activities, streams_fetched, laps_fetched,
+    details_fetched, wellness_fetched/wellness_cached, last_sync, per-item
+    errors, and — for freshness checks — `cache_newest_activity` and
+    `cache_newest_wellness` (the newest cached dates). With backfill_links
+    also details_fetched / relinked / remaining_without_detail.
     """
-    result = garmin_sync.run_sync(_client(), force_full=force_full, weeks_back=weeks_back)
+    result = garmin_sync.run_sync(
+        _client(), force_full=force_full, weeks_back=weeks_back,
+        wellness_days=wellness_days,
+    )
     if backfill_links and "error" not in result:
         result["backfill"] = garmin_sync.backfill_workout_links(
             _client(), max_activities=backfill_max
