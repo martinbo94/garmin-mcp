@@ -442,24 +442,50 @@ def fmt_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def pacing_plan(segments: list[dict], goal_time_s: float) -> dict:
-    """Even-EFFORT pacing for a goal time over a graded course.
+def pacing_plan(segments: list[dict], goal_time_s: float,
+                negative_split_pct: float = 0.0) -> dict:
+    """Even-EFFORT pacing for a goal time over a graded course, with an
+    optional negative-split bias.
 
-    Holds grade-adjusted effort constant: each km's target pace = a single
-    flat-equivalent 'effort pace' × that km's grade factor, scaled so the
-    total predicted time equals the goal. Uphill km are slower, downhill
-    faster, and the splits sum to the goal.
+    Base behaviour (negative_split_pct=0): holds grade-adjusted effort
+    constant — each km's target pace = a flat-equivalent 'effort pace' × that
+    km's grade factor, scaled so total time = goal. Uphill km slower, downhill
+    faster, splits sum to the goal.
+
+    With negative_split_pct=N, an additional pace bias ramps linearly from
+    slower at the start to faster at the finish (front-to-back swing of ~N%,
+    centred so the midpoint is unchanged), applied ON TOP of the grade factor
+    and renormalised so the total still equals the goal. So the back half runs
+    ~N% quicker than the front while the finish time is unchanged.
     """
-    denom = sum(grade_factor(s["avg_grade_pct"]) * s["distance_km"] for s in segments)
+    if not segments:
+        return {"error": "Course has no usable distance."}
+    total_km = sum(s["distance_km"] for s in segments)
+    if total_km <= 0:
+        return {"error": "Course has no usable distance."}
+
+    # Progression multiplier per km: linear from (1 + b) at the start to
+    # (1 - b) at the finish, keyed on the segment MIDPOINT's distance fraction.
+    # b is half the front-to-back swing.
+    b = max(0.0, negative_split_pct) / 100.0 / 2.0
+    cum_km = 0.0
+    prog = []
+    for s in segments:
+        mid_frac = (cum_km + s["distance_km"] / 2.0) / total_km
+        prog.append(1 + b - 2 * b * mid_frac)   # 1+b at frac=0 → 1-b at frac=1
+        cum_km += s["distance_km"]
+
+    factors = [grade_factor(s["avg_grade_pct"]) for s in segments]
+    # Renormalise so Σ(effort_pace · factor · prog · dist) == goal_time.
+    denom = sum(f * p * s["distance_km"] for f, p, s in zip(factors, prog, segments))
     if denom <= 0:
         return {"error": "Course has no usable distance."}
-    effort_pace_s = goal_time_s / denom  # flat-equivalent s/km
+    effort_pace_s = goal_time_s / denom
 
     plan = []
     cum_t = 0.0
-    for s in segments:
-        f = grade_factor(s["avg_grade_pct"])
-        pace_s = effort_pace_s * f
+    for s, f, p in zip(segments, factors, prog):
+        pace_s = effort_pace_s * f * p
         seg_t = pace_s * s["distance_km"]
         cum_t += seg_t
         plan.append({
@@ -472,9 +498,49 @@ def pacing_plan(segments: list[dict], goal_time_s: float) -> dict:
             "split_time": fmt_time(seg_t),
             "cumulative_time": fmt_time(cum_t),
         })
-    return {
+
+    out = {
         "effort_pace": fmt_pace(effort_pace_s),
         "effort_pace_s_per_km": round(effort_pace_s, 1),
         "predicted_finish_time": fmt_time(cum_t),
+        "negative_split_pct": negative_split_pct,
+        "strategy": ("even effort" if b == 0
+                     else f"negative split — effort ramps ~{negative_split_pct:g}% "
+                          "from front to back"),
         "per_km": plan,
     }
+    if b > 0:
+        # Report the split two ways: EFFORT (flat-equivalent, grade removed —
+        # this is where the negative split actually lives) and CLOCK (what the
+        # watch shows, which the terrain reshapes).
+        half = total_km / 2.0
+        cum_km = 0.0
+        acc = {"first": [0.0, 0.0, 0.0], "second": [0.0, 0.0, 0.0]}  # clock_t, eff_t, km
+        for s, f, p in zip(segments, factors, prog):
+            d = s["distance_km"]
+            clock_t = effort_pace_s * f * p * d
+            eff_t = effort_pace_s * p * d            # grade removed
+            side = "first" if cum_km + d / 2.0 <= half else "second"
+            acc[side][0] += clock_t
+            acc[side][1] += eff_t
+            acc[side][2] += d
+            cum_km += d
+
+        def _pace(t, km):
+            return fmt_pace(t / km) if km else None
+
+        out["half_split"] = {
+            "first_half_effort_pace": _pace(acc["first"][1], acc["first"][2]),
+            "second_half_effort_pace": _pace(acc["second"][1], acc["second"][2]),
+            "first_half_clock_pace": _pace(acc["first"][0], acc["first"][2]),
+            "second_half_clock_pace": _pace(acc["second"][0], acc["second"][2]),
+        }
+        out["note"] = (
+            "Negative split is in EFFORT — ease into the first half, finish "
+            "stronger; bank nothing early (the effort half-paces show this). The "
+            "CLOCK half-splits may not look negative if the course back-loads its "
+            "climbs (here the late hills keep the second half's watch pace ~even "
+            "despite the harder effort) — that's expected; run by effort, not the "
+            "split, on the closing climbs."
+        )
+    return out

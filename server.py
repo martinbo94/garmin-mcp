@@ -4236,6 +4236,7 @@ def analyze_race_course(
     gpx_path: str,
     goal_time: Optional[str] = None,
     goal_pace_min_per_km: Optional[str] = None,
+    negative_split_pct: float = 0.0,
 ) -> dict:
     """Analyze a race course from a GPX file and build a per-km pace plan.
 
@@ -4273,15 +4274,26 @@ def analyze_race_course(
     `course.warnings` is the quick-read list: the steep pitches first, then the
     sustained climbs. Each feature carries a plain-language `note`.
 
+    Pacing is even-EFFORT by default. Pass `negative_split_pct` (e.g. 2) to
+    bias toward a negative split: the plan keeps the same goal time but ramps
+    pace from easier at the start to faster at the finish, so the back half
+    runs ~that % quicker than the front. Recommended ~1-3% for a half/longer,
+    especially when the goal is ambitious relative to fitness or the runner
+    tends to fade late — going out conservative is the most common way to NOT
+    blow up. 0 = even effort.
+
     Args:
         gpx_path: path to a .gpx file on disk.
         goal_time / goal_pace_min_per_km: see above.
+        negative_split_pct: front-to-back pace swing as a percent (default 0 =
+            even effort). 2 ≈ back half ~2% faster than the front, same finish.
 
     Returns `course` (distance, ascent/descent/net, per-km gradient table,
-    steepest km, notable_climbs, notable_descents, warnings) and, when a goal is
-    given, `pacing` (effort pace, predicted finish, per-km targets + cumulative
-    splits). Each climb/descent carries start/end km, length, gain/drop, avg and
-    max grade, a difficulty category, and a `pace_model_reliable` flag.
+    steepest km, steep_pitches, notable_climbs, notable_descents, warnings) and,
+    when a goal is given, `pacing` (effort pace, predicted finish, strategy,
+    per-km targets + cumulative splits; plus half_split + a note when a negative
+    split is used). Each climb/descent carries start/end km, length, gain/drop,
+    avg and max grade, a difficulty category, and a `pace_model_reliable` flag.
     """
     import os as _os
     if not _os.path.isfile(gpx_path):
@@ -4360,7 +4372,7 @@ def analyze_race_course(
         goal_time_s = pace_s * dist_km
 
     if goal_time_s is not None:
-        plan = gpx_analysis.pacing_plan(segments, goal_time_s)
+        plan = gpx_analysis.pacing_plan(segments, goal_time_s, negative_split_pct)
         if "error" in plan:
             return plan
         plan["goal"] = {
