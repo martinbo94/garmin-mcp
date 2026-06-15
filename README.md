@@ -29,8 +29,8 @@ across sessions.
 │  │  WELLNESS       morning_check_in (HRV, sleep, HRR,      │  │
 │  │                 readiness), illness + stress + sleep     │  │
 │  │                                                         │  │
-│  │  CALCULATORS    pace, intervals, heat (dew-point) +     │  │
-│  │                 forecast_conditions (Open-Meteo)         │  │
+│  │  CALCULATORS    pace, intervals, heat (dew-point),      │  │
+│  │                 weather (Open-Meteo), GPX race pacing    │  │
 │  │                                                         │  │
 │  │  PLAN           get / save / materialize /              │  │
 │  │                 compare_vs_actual                        │  │
@@ -136,10 +136,11 @@ Restart Claude, then in a fresh session:
 > Let's set up my profile
 ```
 
-The profile setup (`user_profile_status` → `init_user_profile`) asks
-about max HR (required), optional lactate/VO2max test results, HR zones
-from Garmin Connect, race PRs, and athlete type (A/B/C). Only max HR is
-required — everything else can be skipped and added later.
+The profile setup (`user_profile_status` → `init_user_profile`) takes
+max HR (required) plus optional HR zone ceilings, LT1/LT2, VO2max, weight,
+and race PRs. Only max HR is required — everything else can be skipped and
+added later. (There's no fixed "athlete type" — the limiter, if known, is
+recorded as a revisable note; see `coach://plan_design`.)
 
 If you prefer to hand-write the profile instead:
 
@@ -170,8 +171,9 @@ normal.
 
 ```
 server.py                       # MCP entrypoint — all tools + resources
-garmin_sync.py                  # Garmin cache (SQLite), sync, weekly_summary
+garmin_sync.py                  # Garmin cache (SQLite), sync, weekly_summary, wellness
 plan.py                         # plan.json I/O + compliance comparison
+gpx_analysis.py                 # GPX course parsing + grade-adjusted race pacing
 requirements.txt
 .env.example                    # credential template
 .env                            # your secrets (gitignored)
