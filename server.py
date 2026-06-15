@@ -3009,25 +3009,44 @@ def morning_check_in() -> dict:
 def sleep_performance_correlation(
     days_back: int = 60,
     min_distance_km: float = 3.0,
+    session_type: str = "easy",
 ) -> dict:
-    """Find the relationship between sleep quality and running performance.
+    """Relate pre-run-night sleep to running performance, within one session class.
 
-    Joins run activities with wellness data for the same date. Splits
-    sessions into 'good sleep' (sleep_score >= 70 OR sleep >= 7 hours)
-    vs 'poor sleep' and compares average HR and pace between groups.
-    Also surfaces the 5 best performances (lowest pace) and their
-    associated sleep metrics.
+    Restricting to a single session class (default 'easy') is deliberate:
+    a raw all-runs comparison is dominated by session-type mix (good-sleep
+    days holding more easy runs makes that group look "slower" for reasons
+    that have nothing to do with sleep). Sessions are classified via
+    `classify_activity` (planned_type when linked, else the name hint).
+
+    Sleep is keyed to the night BEFORE the run. In this repo sleep_* fields
+    in wellness_daily are stored on the date the sleep STARTED, so the night
+    before a run on date D lives in the row dated D-1. `hrv_overnight_avg`
+    follows the opposite convention (it is "last night's" HRV as of the
+    morning of its row date), so the morning-of-run HRV lives in the row
+    dated D. The two are joined from their respective rows.
+
+    Within the chosen class this computes Pearson correlations of
+    sleep_score (and sleep hours) against avg_hr and pace, plus a
+    good-sleep vs poor-sleep mean comparison. Correlations and group means
+    are only reported when n is large enough to be defensible.
 
     Args:
         days_back: How many days of history to analyse. Default 60.
         min_distance_km: Minimum run distance to include. Default 3.0.
+        session_type: Session class to restrict to (e.g. 'easy',
+            'threshold', 'long', 'intervals'). Default 'easy'.
 
     Returns:
-        good_sleep_avg, poor_sleep_avg, best_performances, insight string,
-        and per-run data rows used for the analysis.
+        good_sleep_avg, poor_sleep_avg, correlations, best_performances,
+        insight string, and the per-run rows used for the analysis.
     """
     import sqlite3 as _sqlite3
     from datetime import date as _date, timedelta as _td
+
+    # Below this, group means / correlations are not presented as findings.
+    MIN_GROUP_N = 3
+    MIN_CORR_N = 5
 
     try:
         cutoff = (_date.today() - _td(days=days_back)).isoformat()
@@ -3041,15 +3060,27 @@ def sleep_performance_correlation(
                     a.id,
                     date(a.start_date_local) AS run_date,
                     a.name,
+                    a.sport_type,
+                    a.planned_type,
                     a.avg_hr,
                     a.moving_time_s,
                     a.distance_m,
-                    w.sleep_seconds,
-                    w.sleep_score,
-                    w.hrv_overnight_avg,
-                    w.resting_hr AS wellness_rhr
+                    ws.sleep_seconds,
+                    ws.sleep_score,
+                    ws.sleep_deep_s,
+                    ws.sleep_rem_s,
+                    ws.sleep_light_s,
+                    wh.hrv_overnight_avg,
+                    wh.resting_hr AS wellness_rhr
                 FROM activities a
-                LEFT JOIN wellness_daily w ON date(a.start_date_local) = w.date
+                -- sleep_* are stored on the date sleep started: the night
+                -- before the run is the row dated run_date - 1 day.
+                LEFT JOIN wellness_daily ws
+                       ON ws.date = date(a.start_date_local, '-1 day')
+                -- hrv_overnight_avg is "last night" as of its row's morning,
+                -- so the morning-of-run HRV is the row dated run_date.
+                LEFT JOIN wellness_daily wh
+                       ON wh.date = date(a.start_date_local)
                 WHERE a.sport_type = 'Run'
                   AND date(a.start_date_local) >= ?
                   AND a.distance_m >= ?
@@ -3060,7 +3091,18 @@ def sleep_performance_correlation(
                 (cutoff, min_dist_m),
             ).fetchall()
 
-        runs = [dict(r) for r in rows]
+        all_runs = [dict(r) for r in rows]
+
+        # Restrict to one session class so the comparison is controlled.
+        runs: list[dict] = []
+        for r in all_runs:
+            cls, src = garmin_sync.classify_activity(
+                r["name"], r["sport_type"], r["planned_type"]
+            )
+            r["classification"] = cls
+            r["classification_source"] = src
+            if cls == session_type:
+                runs.append(r)
 
         # Compute pace for each run
         for r in runs:
@@ -3106,15 +3148,55 @@ def sleep_performance_correlation(
         good_stats = _group_stats(good_sleep)
         poor_stats = _group_stats(poor_sleep)
 
-        # Best 5 performances = lowest pace (fastest), runs that have pace data
+        # Pearson correlations within the class. Only meaningful with enough
+        # paired observations and non-zero variance on both axes.
+        def _pearson(pairs: list[tuple[float, float]]) -> Optional[float]:
+            xs = [p[0] for p in pairs if p[0] is not None and p[1] is not None]
+            ys = [p[1] for p in pairs if p[0] is not None and p[1] is not None]
+            n = len(xs)
+            if n < MIN_CORR_N:
+                return None
+            mx = sum(xs) / n
+            my = sum(ys) / n
+            sxx = sum((x - mx) ** 2 for x in xs)
+            syy = sum((y - my) ** 2 for y in ys)
+            if sxx == 0 or syy == 0:
+                return None
+            sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+            return round(sxy / (sxx ** 0.5 * syy ** 0.5), 3)
+
+        correlations = {
+            "n_with_sleep_score": sum(
+                1 for r in runs_with_sleep if r.get("sleep_score") is not None
+            ),
+            "sleep_score_vs_avg_hr": _pearson(
+                [(r["sleep_score"], r["avg_hr"]) for r in runs_with_sleep]
+            ),
+            "sleep_score_vs_pace": _pearson(
+                [(r["sleep_score"], r["pace_s_per_km"]) for r in runs_with_sleep]
+            ),
+            "sleep_hours_vs_avg_hr": _pearson(
+                [((r["sleep_seconds"] / 3600) if r.get("sleep_seconds") else None,
+                  r["avg_hr"]) for r in runs_with_sleep]
+            ),
+        }
+
+        # Best 5 performances within the class = lowest pace (fastest).
         runs_with_pace = [r for r in runs if r.get("pace_s_per_km") is not None]
         best_5 = sorted(runs_with_pace, key=lambda r: r["pace_s_per_km"])[:5]
-        best_performances = [
-            {
+
+        def _run_row(r: dict) -> dict:
+            return {
+                "id": r["id"],
                 "date": r["run_date"],
                 "name": r["name"],
+                "classification": r["classification"],
+                "classification_source": r["classification_source"],
                 "distance_km": round(r["distance_m"] / 1000, 2),
-                "pace_s_per_km": round(r["pace_s_per_km"], 1),
+                "pace_s_per_km": (
+                    round(r["pace_s_per_km"], 1)
+                    if r.get("pace_s_per_km") is not None else None
+                ),
                 "avg_hr": r["avg_hr"],
                 "sleep_score": r["sleep_score"],
                 "sleep_hours": (
@@ -3126,8 +3208,9 @@ def sleep_performance_correlation(
                     "poor" if _has_sleep_data(r) else "no_data"
                 ),
             }
-            for r in best_5
-        ]
+
+        best_performances = [_run_row(r) for r in best_5]
+        per_run = [_run_row(r) for r in runs]
 
         # Build insight string
         def _fmt_pace(s: Optional[float]) -> str:
@@ -3139,67 +3222,74 @@ def sleep_performance_correlation(
 
         insight_parts: list[str] = []
         g_n, p_n = good_stats["n"], poor_stats["n"]
+        n_class = len(runs)
+        n_sleep = len(runs_with_sleep)
 
-        if g_n == 0 and p_n == 0:
+        if n_class == 0:
             insight_parts.append(
-                f"No runs with sleep data found in the last {days_back} days "
-                f"(>= {min_distance_km} km). Sync wellness data first."
+                f"No '{session_type}' runs found in the last {days_back} days "
+                f"(>= {min_distance_km} km). Try a different session_type or "
+                "widen the window."
             )
-        elif g_n == 0:
+        elif n_sleep == 0:
             insight_parts.append(
-                f"Only poor-sleep runs found ({p_n} sessions). "
-                "Need good-sleep sessions to compare."
-            )
-        elif p_n == 0:
-            insight_parts.append(
-                f"Only good-sleep runs found ({g_n} sessions). "
-                "Need poor-sleep sessions to compare."
+                f"Found {n_class} '{session_type}' runs but none have wellness "
+                "data for the night before. Sync wellness data first."
             )
         else:
-            pace_good = good_stats["avg_pace_s_per_km"]
-            pace_poor = poor_stats["avg_pace_s_per_km"]
-            hr_good = good_stats["avg_hr"]
-            hr_poor = poor_stats["avg_hr"]
             insight_parts.append(
-                f"Analysed {g_n + p_n} runs ({g_n} good-sleep, {p_n} poor-sleep) "
-                f"over the last {days_back} days."
+                f"Analysed {n_sleep} '{session_type}' runs with pre-run-night "
+                f"sleep data over the last {days_back} days "
+                f"({g_n} good-sleep, {p_n} poor-sleep)."
             )
-            if pace_good is not None and pace_poor is not None:
-                diff = round(pace_poor - pace_good, 1)
-                direction = "faster" if diff > 0 else "slower"
+            if g_n >= MIN_GROUP_N and p_n >= MIN_GROUP_N:
+                pace_good = good_stats["avg_pace_s_per_km"]
+                pace_poor = poor_stats["avg_pace_s_per_km"]
+                hr_good = good_stats["avg_hr"]
+                hr_poor = poor_stats["avg_hr"]
+                if pace_good is not None and pace_poor is not None:
+                    diff = round(pace_poor - pace_good, 1)
+                    direction = "faster" if diff > 0 else "slower"
+                    insight_parts.append(
+                        f"Good-sleep pace: {_fmt_pace(pace_good)} vs "
+                        f"poor-sleep: {_fmt_pace(pace_poor)} "
+                        f"({abs(diff):.1f}s/km {direction} on good sleep)."
+                    )
+                if hr_good is not None and hr_poor is not None:
+                    hr_diff = round(hr_poor - hr_good, 1)
+                    insight_parts.append(
+                        f"Good-sleep avg HR: {hr_good} bpm vs poor-sleep: "
+                        f"{hr_poor} bpm (delta {hr_diff:+.1f} bpm)."
+                    )
+            else:
                 insight_parts.append(
-                    f"Good-sleep pace: {_fmt_pace(pace_good)} vs "
-                    f"poor-sleep: {_fmt_pace(pace_poor)} "
-                    f"({abs(diff):.1f}s/km {direction} on good sleep)."
+                    f"Too few sessions per group to compare means "
+                    f"(good={g_n}, poor={p_n}, need >= {MIN_GROUP_N} each)."
                 )
-            if hr_good is not None and hr_poor is not None:
-                hr_diff = round(hr_poor - hr_good, 1)
+            corr_hr = correlations["sleep_score_vs_avg_hr"]
+            if corr_hr is not None:
                 insight_parts.append(
-                    f"Good-sleep avg HR: {hr_good} bpm vs poor-sleep: {hr_poor} bpm "
-                    f"(delta {hr_diff:+.1f} bpm)."
+                    f"Sleep-score vs avg-HR correlation r={corr_hr:+.2f} "
+                    f"(n={correlations['n_with_sleep_score']})."
                 )
-
-        best_sleep_quality_counts = {
-            "good": sum(1 for b in best_performances if b["sleep_quality"] == "good"),
-            "poor": sum(1 for b in best_performances if b["sleep_quality"] == "poor"),
-            "no_data": sum(1 for b in best_performances if b["sleep_quality"] == "no_data"),
-        }
-        if best_performances:
-            insight_parts.append(
-                f"Of the 5 best performances: "
-                f"{best_sleep_quality_counts['good']} on good sleep, "
-                f"{best_sleep_quality_counts['poor']} on poor sleep, "
-                f"{best_sleep_quality_counts['no_data']} with no sleep data."
-            )
+            else:
+                insight_parts.append(
+                    f"Not enough paired sleep-score observations for a "
+                    f"correlation (need >= {MIN_CORR_N})."
+                )
 
         return {
             "days_back": days_back,
             "min_distance_km": min_distance_km,
-            "total_runs_in_window": len(runs),
-            "runs_with_sleep_data": len(runs_with_sleep),
+            "session_type": session_type,
+            "total_runs_in_window": len(all_runs),
+            "runs_in_class": n_class,
+            "runs_with_sleep_data": n_sleep,
             "good_sleep_avg": good_stats,
             "poor_sleep_avg": poor_stats,
+            "correlations": correlations,
             "best_performances": best_performances,
+            "per_run": per_run,
             "insight": " ".join(insight_parts),
         }
 
