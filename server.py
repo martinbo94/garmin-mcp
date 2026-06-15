@@ -3609,12 +3609,25 @@ def recovery_prediction(lookback_sessions: int = 8) -> dict:
             back in time. At least 2 measured sessions are needed for a
             prediction.
 
+    This predicts recovery from your most recent QUALITY session (see
+    last_quality_session) — it is NOT a readiness check for right now and
+    does not look at easy runs. For "am I ready to train today" use
+    morning_check_in.
+
     Returns:
         - typical_recovery_days: your personal average (float)
         - confidence: 'low' / 'medium' / 'high' based on sample size
         - last_quality_session: date and type of the most recent hard session
         - predicted_recovered_by: estimated date of full HRV recovery
-        - already_recovered: True ONLY if today's HRV is in the baseline band
+        - recovery_status: one of
+            'recovered'        — today's HRV is confirmed in the baseline band
+            'not_recovered'    — today's HRV is confirmed below baseline
+            'likely_recovered' — predicted date has passed but there's no HRV
+                                 reading today to confirm (NOT a negative signal)
+            'recovering'       — still within the predicted window, unconfirmed
+        - already_recovered: legacy boolean; True ONLY for 'recovered'. Prefer
+            recovery_status — a False here can mean 'likely_recovered' (just
+            no data), not actual non-recovery.
         - today_hrv_status: today's HRV vs baseline (or 'no_data')
         - garmin_recovery_time_hours: Garmin's own recovery estimate, if any
         - sample: list of past sessions with their measured recovery days
@@ -3798,6 +3811,20 @@ def recovery_prediction(lookback_sessions: int = 8) -> dict:
             today_wellness.get("recovery_time_hours") if today_wellness else None
         )
 
+        # Tri-state recovery_status disambiguates the three distinct cases a
+        # bare boolean conflates — most importantly "no HRV today" must NOT
+        # read as "not recovered". Note this is recovery from the last
+        # QUALITY session (see last_quality_session), not readiness right now
+        # (use morning_check_in for that).
+        date_passed = predicted_date <= today_str
+        if today_state is True:
+            recovery_status = "recovered"            # HRV confirms in baseline
+        elif today_state is False:
+            recovery_status = "not_recovered"        # HRV confirms below baseline
+        elif date_passed:
+            recovery_status = "likely_recovered"     # date passed, no HRV to confirm
+        else:
+            recovery_status = "recovering"           # within predicted window, unconfirmed
         already = today_state is True
 
         note = (
@@ -3855,6 +3882,7 @@ def recovery_prediction(lookback_sessions: int = 8) -> dict:
                 "type": last_sess["quality_type"],
             },
             "predicted_recovered_by": predicted_date,
+            "recovery_status": recovery_status,
             "already_recovered": already,
             "today_hrv_status": today_hrv_status,
             "garmin_recovery_time_hours": garmin_recovery_hours,
