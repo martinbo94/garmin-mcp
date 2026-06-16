@@ -71,31 +71,6 @@ def sync_activities(
 
 
 @mcp.tool()
-def weekly_summary(start_date: str, end_date: str) -> dict:
-    """Per-week training summary from the local Garmin cache.
-
-    Returns `{"weeks": [...], "coverage": {...}}`. Each week entry covers
-    one Monday-Sunday week and contains total distance, run count, time
-    in each HR zone (computed from raw streams using current bpm
-    boundaries from `get_athlete_profile` / coach://user_profile — NOT
-    the local cache zones), and the list of activities with names,
-    descriptions, distance, HR, and a `classification_hint` derived
-    from naming patterns.
-
-    The `coverage` field reports cache extent and a `gap_warning` flag
-    when the requested range extends before the oldest cached activity —
-    use it to distinguish "no runs that week" from "we don't have data
-    that far back" (the local cache holds 12 weeks by default; call
-    `sync_activities(weeks_back=N)` to extend it).
-
-    Args:
-        start_date: 'YYYY-MM-DD' (inclusive)
-        end_date:   'YYYY-MM-DD' (inclusive)
-    """
-    return garmin_sync.weekly_summary(start_date, end_date)
-
-
-@mcp.tool()
 def list_activities(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -744,31 +719,77 @@ def detect_personal_records(
 
 
 @mcp.tool()
-def weekly_retrospective(week_start: str) -> dict:
-    """Combined weekly summary + plan compliance for one Mon-Sun week.
+def weekly_retrospective(
+    start_date: str,
+    end_date: Optional[str] = None,
+    with_compliance: bool = True,
+) -> dict:
+    """Per-week training summary, optionally with plan compliance.
 
-    Bundles `weekly_summary` (volume, zone time, sessions) with
-    `compare_plan_vs_actual` (compliance against plan.json) for a single
-    week. Use as a Sunday-evening reflection input — one tool call covers
-    both "what did I do" and "how close to plan was I".
+    The single weekly tool. It returns per-week volume, HR-zone time, and
+    the session list from the local Garmin cache (via the same engine as
+    the per-week summary), and can layer on plan compliance.
+
+    Two modes, selected by whether `end_date` is given:
+    - **Single week** (`end_date` omitted): `start_date` is treated as a
+      week_start and the Monday-Sunday week beginning on it is summarized.
+      The response carries `week_start`, `week_end`, and a `summary` block
+      for that one week. Use as a Sunday-evening reflection input — one
+      call covers both "what did I do" and "how close to plan was I".
+    - **Arbitrary range** (`end_date` given): summarizes every week in the
+      inclusive `start_date`..`end_date` range. The response carries
+      `weeks` (a list of per-week entries) over that span.
+
+    Each week entry covers one Monday-Sunday week and contains total
+    distance, run count, time in each HR zone (computed from raw streams
+    using current bpm boundaries from `get_athlete_profile` /
+    coach://user_profile — NOT the local cache zones), and the list of
+    activities with names, descriptions, distance, HR, and a
+    `classification_hint` derived from naming patterns.
+
+    The `coverage` field reports cache extent and a `gap_warning` flag
+    when the requested range extends before the oldest cached activity —
+    use it to distinguish "no runs that week" from "we don't have data
+    that far back" (the local cache holds 12 weeks by default; call
+    `sync_activities(weeks_back=N)` to extend it).
 
     Args:
-        week_start: 'YYYY-MM-DD' (typically the Monday of the week).
+        start_date: 'YYYY-MM-DD' (inclusive). When `end_date` is omitted,
+            this is the week_start (typically the Monday of the week).
+        end_date: 'YYYY-MM-DD' (inclusive). Omit for single-week mode.
+        with_compliance: When True (default), add a `plan_compliance` block
+            (`compare_plan_vs_actual` against plan.json) over the same
+            span. Set False for just the summary.
     """
     from datetime import date as _date, timedelta as _td
-    start = _date.fromisoformat(week_start)
-    end = start + _td(days=6)
+    start = _date.fromisoformat(start_date)
+    if end_date is None:
+        end = start + _td(days=6)
+        result = garmin_sync.weekly_summary(start.isoformat(), end.isoformat())
+        weeks = result["weeks"]
+        out: dict = {
+            "week_start": start_date,
+            "week_end": end.isoformat(),
+            "summary": weeks[0] if weeks else None,
+            "coverage": result["coverage"],
+        }
+        if with_compliance:
+            out["plan_compliance"] = plan_mod.compare_plan_vs_actual(
+                start.isoformat(), end.isoformat()
+            )
+        return out
+
+    end = _date.fromisoformat(end_date)
     result = garmin_sync.weekly_summary(start.isoformat(), end.isoformat())
-    weeks = result["weeks"]
-    return {
-        "week_start": week_start,
-        "week_end": end.isoformat(),
-        "summary": weeks[0] if weeks else None,
+    out = {
+        "weeks": result["weeks"],
         "coverage": result["coverage"],
-        "plan_compliance": plan_mod.compare_plan_vs_actual(
-            start.isoformat(), end.isoformat()
-        ),
     }
+    if with_compliance:
+        out["plan_compliance"] = plan_mod.compare_plan_vs_actual(
+            start.isoformat(), end.isoformat()
+        )
+    return out
 
 
 
