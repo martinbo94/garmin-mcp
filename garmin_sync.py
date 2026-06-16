@@ -1921,6 +1921,10 @@ _REP_SLICE_TOLERANCE_BPM = 3
 # trimmed_avg_hr — HR has not yet caught up to the effort in the first
 # seconds of a work rep.
 _HR_LAG_ONSET_SECONDS = 15
+# Within-rep drift is only computed when the post-onset (settled) portion of a
+# rep is at least this long — on shorter reps HR is still climbing throughout,
+# so a within-rep "drift" number would just be HR kinetics, not a signal.
+_MIN_DRIFT_SETTLED_SECONDS = 180
 
 
 def _lap_start_offset(lap: dict, activity_start_s: float) -> Optional[float]:
@@ -2043,16 +2047,27 @@ def _interval_analysis(
                 validated = abs(sliced_mean - lap_avg) <= _REP_SLICE_TOLERANCE_BPM
                 rep["samples_validated"] = validated
                 if validated:
-                    trimmed = [
-                        hr for off, hr in samples if off >= _HR_LAG_ONSET_SECONDS
+                    settled = [
+                        (off, hr) for off, hr in samples
+                        if off >= _HR_LAG_ONSET_SECONDS
                     ]
-                    if trimmed:
-                        rep["trimmed_avg_hr"] = round(statistics.mean(trimmed), 1)
-                    third = len(hr_vals) // 3
-                    if third >= 1:
-                        first_third = statistics.mean(hr_vals[:third])
-                        last_third = statistics.mean(hr_vals[-third:])
-                        rep["drift_bpm"] = round(last_third - first_third, 1)
+                    if settled:
+                        rep["trimmed_avg_hr"] = round(
+                            statistics.mean(hr for _, hr in settled), 1
+                        )
+                    # Within-rep drift is only meaningful on LONG reps, where HR
+                    # plateaus in the Golden Zone and a late climb signals going
+                    # out too hard. On short reps (e.g. 400 m / ~2 min) HR is
+                    # still rising the whole rep, so "drift" is just kinetics —
+                    # report null there and let across_rep_drift carry the signal.
+                    settled_span = settled[-1][0] - settled[0][0] if settled else 0
+                    third = len(settled) // 3
+                    if settled_span >= _MIN_DRIFT_SETTLED_SECONDS and third >= 1:
+                        svals = [hr for _, hr in settled]
+                        rep["drift_bpm"] = round(
+                            statistics.mean(svals[-third:])
+                            - statistics.mean(svals[:third]), 1
+                        )
 
             # Real time-in-zone over the drag lap, integrated from the same
             # timestamp-sliced samples (sample spacing from the offset deltas,
