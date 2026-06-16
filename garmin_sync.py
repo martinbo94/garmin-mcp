@@ -1339,6 +1339,68 @@ def _compute_morning_trends(today_metrics: dict, history: list[dict]) -> dict:
     }
 
 
+def _illness_signals(today: dict, history: list[dict]) -> dict:
+    """Acute illness-onset check: today vs the trailing 7-day mean.
+
+    Illness is a SUDDEN shift, so this deliberately uses the short window
+    (sustained drift is handled by wellness_baseline_comparison). Five
+    independent flags; 3+ = high, 2 = moderate. Computed from the data
+    morning_check_in already has — no extra fetch.
+    """
+    def mean(field):
+        vals = [d[field] for d in history if d.get(field) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    t_hrv, m_hrv = today.get("hrv_overnight_avg"), mean("hrv_overnight_avg")
+    t_rhr, m_rhr = today.get("resting_hr"), mean("resting_hr")
+    t_ss, m_ss = today.get("sleep_score"), mean("sleep_score")
+    t_sleep = today.get("sleep_seconds")
+    t_stress = today.get("avg_stress")
+
+    flagged: list[str] = []
+    hrv_drop = rhr_rise = ss_drop = None
+    if t_hrv is not None and m_hrv and m_hrv > 0:
+        hrv_drop = round((m_hrv - t_hrv) / m_hrv * 100, 1)
+        if hrv_drop > 15:
+            flagged.append("hrv_low")
+    if t_rhr is not None and m_rhr is not None:
+        rhr_rise = round(t_rhr - m_rhr, 1)
+        if rhr_rise > 5:
+            flagged.append("rhr_elevated")
+    if t_ss is not None and m_ss is not None:
+        ss_drop = round(m_ss - t_ss, 1)
+        if ss_drop > 10:
+            flagged.append("sleep_score_low")
+    if t_sleep is not None and t_sleep < 21_600:
+        flagged.append("sleep_short")
+    if t_stress is not None and t_stress > 60:
+        flagged.append("stress_high")
+
+    n = len(flagged)
+    risk = "high" if n >= 3 else "moderate" if n == 2 else "low"
+    note = {
+        "high": "Multiple acute illness signals — rest or very easy, reassess tomorrow.",
+        "moderate": "Two acute signals — consider easing intensity, weighed against how you feel.",
+        "low": "No meaningful acute illness signal.",
+    }[risk]
+    return {
+        "risk_level": risk,
+        "flag_count": n,
+        "flagged_signals": flagged,
+        "note": note,
+        "raw": {
+            "hrv_today": t_hrv, "hrv_7d_mean": m_hrv, "hrv_drop_pct": hrv_drop,
+            "rhr_today": t_rhr, "rhr_7d_mean": m_rhr, "rhr_rise_bpm": rhr_rise,
+            "sleep_score_today": t_ss, "sleep_score_7d_mean": m_ss,
+            "sleep_seconds_today": t_sleep, "avg_stress_today": t_stress,
+        },
+        "thresholds": {
+            "hrv_drop_pct": 15, "rhr_rise_bpm": 5, "sleep_score_drop": 10,
+            "sleep_hours": 6, "stress": 60,
+        },
+    }
+
+
 def morning_check_in_data(
     garmin_client,
     today_str: str,
@@ -1372,6 +1434,9 @@ def morning_check_in_data(
         # Long-baseline drift check: the 7-day trend above moves with a
         # sustained drift, so it can't see a multi-week elevation. This does.
         "baseline_comparison": wellness_baseline_comparison(as_of_date=today_str),
+        # Acute illness-onset flags (today vs 7-day mean) — folded in from the
+        # former standalone illness_risk_check tool.
+        "illness_signals": _illness_signals(today, history),
         "history_window": {"start": history_start, "end": history_end, "days": len(history)},
     }
 

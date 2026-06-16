@@ -58,151 +58,6 @@ def get_wellness_history(
 
 
 @mcp.tool()
-def illness_risk_check() -> dict:
-    """Scan today's wellness signals for early illness onset.
-
-    Combines five independent signals — HRV drop, RHR spike, low sleep
-    score, short sleep, and high stress — into a single risk rating.
-
-    Returns:
-    - `risk_level`: 'low' (0-1 flags), 'moderate' (2 flags), or
-      'high' (3+ flags — multiple illness signals present).
-    - `flagged_signals`: list of signal names that crossed the threshold.
-    - `recommendation`: plain-language action string.
-    - `raw_values`: dict with today's values, 7-day means, and thresholds
-      used. Nulls indicate the device wasn't worn or the field isn't
-      available for the current device.
-
-    Flag thresholds (all evidence-based heuristics):
-    - HRV: today >15% below 7-day mean.
-    - RHR: today >5 bpm above 7-day mean.
-    - Sleep score: today >10 points below 7-day mean.
-    - Sleep duration: <6 hours (<21 600 s).
-    - Avg stress: today >60 (moderate-high on Garmin's 0-100 scale).
-
-    Wellness data is read from the local cache (wellness_daily table) after
-    syncing the last 7 days; a short Garmin API call is made for today's
-    data if it isn't cached.
-    """
-    import math as _math
-    from datetime import date as _date, timedelta as _td
-
-    try:
-        today = _date.today()
-        seven_days_ago = today - _td(days=7)
-
-        # Sync the last 7 days into cache (fast — most days will be cached).
-        garmin_sync.sync_wellness_range(
-            _client(), seven_days_ago.isoformat(), today.isoformat()
-        )
-
-        # Read history (7 prior days, excluding today) for baseline means.
-        history_start = seven_days_ago.isoformat()
-        history_end = (today - _td(days=1)).isoformat()
-        hist_data = garmin_sync.wellness_history(history_start, history_end)
-        history_daily = hist_data.get("daily", [])
-
-        # Today's metrics — read from cache after the sync above.
-        today_row = garmin_sync._wellness_day_cached(today.isoformat())
-        if today_row is None:
-            # Fallback: fetch live if cache miss (shouldn't happen after sync).
-            today_row = garmin_sync._fetch_wellness_day(_client(), today.isoformat())
-
-        # ── Helper: arithmetic mean over a field across history rows ──────
-        def _mean(field: str) -> Optional[float]:
-            vals = [r[field] for r in history_daily if r.get(field) is not None]
-            return round(sum(vals) / len(vals), 2) if vals else None
-
-        # ── Collect today's values and 7-day means ─────────────────────────
-        today_hrv = today_row.get("hrv_overnight_avg") if today_row else None
-        today_rhr = today_row.get("resting_hr") if today_row else None
-        today_sleep_score = today_row.get("sleep_score") if today_row else None
-        today_sleep_s = today_row.get("sleep_seconds") if today_row else None
-        today_stress = today_row.get("avg_stress") if today_row else None
-
-        mean_hrv = _mean("hrv_overnight_avg")
-        mean_rhr = _mean("resting_hr")
-        mean_sleep_score = _mean("sleep_score")
-
-        # ── Check each signal ──────────────────────────────────────────────
-        flagged: list[str] = []
-
-        # HRV: flag if today is >15% below 7-day mean
-        hrv_flag = None
-        if today_hrv is not None and mean_hrv is not None and mean_hrv > 0:
-            hrv_drop_pct = (mean_hrv - today_hrv) / mean_hrv * 100
-            if hrv_drop_pct > 15:
-                flagged.append("hrv_low")
-            hrv_flag = round(hrv_drop_pct, 1)
-
-        # RHR: flag if today is >5 bpm above 7-day mean
-        rhr_flag = None
-        if today_rhr is not None and mean_rhr is not None:
-            rhr_rise = today_rhr - mean_rhr
-            if rhr_rise > 5:
-                flagged.append("rhr_elevated")
-            rhr_flag = round(rhr_rise, 1)
-
-        # Sleep score: flag if >10 points below 7-day mean
-        sleep_score_flag = None
-        if today_sleep_score is not None and mean_sleep_score is not None:
-            sleep_score_drop = mean_sleep_score - today_sleep_score
-            if sleep_score_drop > 10:
-                flagged.append("sleep_score_low")
-            sleep_score_flag = round(sleep_score_drop, 1)
-
-        # Sleep duration: flag if <6 hours (21600 seconds)
-        if today_sleep_s is not None and today_sleep_s < 21_600:
-            flagged.append("sleep_short")
-
-        # Stress: flag if avg_stress > 60
-        if today_stress is not None and today_stress > 60:
-            flagged.append("stress_high")
-
-        # ── Determine risk level ───────────────────────────────────────────
-        n = len(flagged)
-        if n >= 3:
-            risk_level = "high"
-            recommendation = "Rest day recommended — multiple illness signals present"
-        elif n == 2:
-            risk_level = "moderate"
-            recommendation = "Consider reducing intensity"
-        else:
-            risk_level = "low"
-            recommendation = "Train as planned"
-
-        return {
-            "date": today.isoformat(),
-            "risk_level": risk_level,
-            "flagged_signals": flagged,
-            "flag_count": n,
-            "recommendation": recommendation,
-            "raw_values": {
-                "hrv_today": today_hrv,
-                "hrv_7d_mean": mean_hrv,
-                "hrv_drop_pct": hrv_flag,
-                "hrv_threshold_pct": 15,
-                "rhr_today": today_rhr,
-                "rhr_7d_mean": mean_rhr,
-                "rhr_rise_bpm": rhr_flag,
-                "rhr_threshold_bpm": 5,
-                "sleep_score_today": today_sleep_score,
-                "sleep_score_7d_mean": mean_sleep_score,
-                "sleep_score_drop": sleep_score_flag,
-                "sleep_score_threshold": 10,
-                "sleep_seconds_today": today_sleep_s,
-                "sleep_hours_today": round(today_sleep_s / 3600, 1) if today_sleep_s is not None else None,
-                "sleep_short_threshold_hours": 6,
-                "avg_stress_today": today_stress,
-                "avg_stress_threshold": 60,
-                "history_days": len(history_daily),
-            },
-        }
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
-
-
-@mcp.tool()
 def stress_training_balance(days_back: int = 14) -> dict:
     """Combined training load + life stress analysis from Garmin wellness data.
 
@@ -448,27 +303,32 @@ def _extract_training_summary(readiness, status) -> dict:
 
 @mcp.tool()
 def morning_check_in() -> dict:
-    """Today's recovery snapshot — flattened metrics, 7-day trend deltas,
-    and Garmin's readiness/status assessments. All in one call.
+    """Today's recovery snapshot — the single readiness tool. Flattened
+    metrics, three complementary trend lenses, and Garmin's assessments.
 
     Returns:
     - `wellness.today`: flat HRV (overnight, weekly avg, baseline band,
       status), RHR, sleep (duration, score, deep/REM/light/awake),
       stress, body battery (high/low/at-wake), respiration, SpO2.
-    - `wellness.trends`: prior 7-day mean + delta + stdev + deviation
-      flag for each metric. Flag fires when today is >1σ outside the
-      trailing mean in the "bad" direction (HRV ↓, RHR ↑, sleep ↓,
-      stress ↑).
-    - `training_summary`: flat readiness score/level/feedback, ACWR,
-      acute load, recovery time, training status verbal (PRODUCTIVE /
-      MAINTAINING / etc.), VO2max, weekly load.
-    - `training_readiness_raw`, `training_status_raw`, `body_battery`:
-      the full Garmin payloads for anything not flattened above.
+    - `wellness.trends`: prior 7-day mean + delta + stdev + deviation flag
+      per metric (today >1σ outside the trailing mean in the bad direction).
+    - `wellness.baseline_comparison`: recent vs 90-day-median drift —
+      catches SUSTAINED multi-week drift the 7-day trend can't see (e.g.
+      RHR elevated for two weeks). Includes days-off-baseline counts.
+    - `wellness.illness_signals`: acute illness-onset check (today vs 7-day
+      mean across HRV/RHR/sleep/short-sleep/stress) → risk_level + flags.
+      Folded in from the former illness_risk_check tool.
+    - `training_summary`: flat readiness score/level/feedback, ACWR, acute
+      load, recovery_time_hours (Garmin's own recovery estimate), training
+      status verbal, VO2max, weekly load.
+    - `training_readiness_raw`, `training_status_raw`, `body_battery`: full
+      Garmin payloads for anything not flattened above.
 
-    Use to decide whether to do a planned quality session today or shift
-    it (e.g., HRV deviation_low + elevated RHR + low readiness → defer
-    threshold). For multi-day trends beyond 7 days, use
-    `get_wellness_history`.
+    Use to decide whether to do a planned quality session or shift it — but
+    weight the numbers per the athlete's context (for a sleep-disrupted
+    user, HRV/RHR are weak signals; body feel + performance lead, and the
+    long-baseline drift matters more than a single day). For trends beyond
+    7 days use `get_wellness_history`.
     """
     from datetime import date as _date, datetime as _dt, timedelta as _td, timezone as _tz
     g = _client()
