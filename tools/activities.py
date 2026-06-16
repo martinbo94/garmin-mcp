@@ -244,6 +244,41 @@ def activity_breakdown(activity_id: int) -> dict:
 
 
 @mcp.tool()
+def hr_time_in_buckets(
+    activity_id: int,
+    edges: Optional[list[int]] = None,
+    scope: str = "session",
+) -> dict:
+    """Time spent in custom HR (bpm) ranges for one cached activity.
+
+    Complements `activity_breakdown`'s zone time when you need bands that
+    don't line up with the Z1-Z5 boundaries — e.g. "how long over the
+    sub-threshold cap?" or "minutes above 190 bpm?". Time is integrated
+    from the raw HR stream using the true sample spacing (the stream's
+    elapsed-time deltas, NOT an assumed 1 Hz), so down-sampled streams are
+    handled correctly.
+
+    Args:
+        activity_id: Garmin activity id (must be in the local cache with an
+            HR stream — run sync_activities() if missing).
+        edges: Ascending bpm cut points. E.g. [175, 181, 186, 191] yields
+            buckets <175, 175-180, 181-185, 186-190, 191+. When omitted,
+            the user's HR-zone boundaries from coach://user_profile are
+            used (one bucket per zone).
+        scope: 'session' (default) bins the whole stream; 'work' bins only
+            the time inside work-rep (drag) lap windows — warmup, recovery,
+            and cooldown excluded — using the timestamp-sliced rep windows.
+
+    Returns: id, scope, edges (the resolved cut points), edges_source
+    ('custom' or 'hr_zones'), total_seconds, and `buckets` — a list of
+    {label, seconds, percent}. Compare the upper buckets against the
+    sub-threshold band / hard cap in coach://user_profile to judge how
+    much time was spent above the intended ceiling.
+    """
+    return garmin_sync.hr_time_in_buckets(activity_id, edges=edges, scope=scope)
+
+
+@mcp.tool()
 def running_form_trends(activities_to_analyze: int = 20) -> dict:
     """Track running dynamics (form) over recent runs using Garmin data.
 
