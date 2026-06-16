@@ -241,10 +241,8 @@ git.
 
 | Tool | What it does |
 |---|---|
-| `morning_check_in` | HRV, RHR, sleep, body battery, training readiness + 7-day trends |
-| `get_wellness_history` | Multi-day wellness trends |
-| `recovery_prediction` | Predicted days back to baseline HRV after a quality session |
-| `illness_risk_check` | Early illness-onset signals from today's wellness |
+| `morning_check_in` | The single readiness tool: today's metrics + 7-day trend + 90-day baseline drift + acute illness-signal flags + Garmin readiness |
+| `get_wellness_history` | Multi-day wellness trends + long-baseline drift check |
 | `sleep_performance_correlation` | Pre-run-night sleep vs performance, within one session class |
 | `stress_training_balance` | Training load vs life stress over a window |
 
