@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sqlite3
+import statistics
 import time
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -1368,6 +1369,9 @@ def morning_check_in_data(
     return {
         "today": today,
         "trends": _compute_morning_trends(today, history),
+        # Long-baseline drift check: the 7-day trend above moves with a
+        # sustained drift, so it can't see a multi-week elevation. This does.
+        "baseline_comparison": wellness_baseline_comparison(as_of_date=today_str),
         "history_window": {"start": history_start, "end": history_end, "days": len(history)},
     }
 
@@ -1449,6 +1453,112 @@ def wellness_history(start_date: str, end_date: str) -> dict:
             "hrv_mean": round(sum(hrv_vals) / len(hrv_vals), 1) if hrv_vals else None,
             "hrv_baseline_band": [baseline_low, baseline_upper] if baseline_low else None,
         },
+    }
+
+
+# ─── Recent-vs-long-baseline drift detection ──────────────────────────
+# A trailing 7-day average MOVES WITH a sustained drift: if RHR has been
+# elevated for two weeks, the 7-day mean is elevated too, so "today is near
+# the 7-day average" reads as fine while you're two weeks into a rise. This
+# compares the recent window against a long, drift-resistant baseline (the
+# MEDIAN over ~90 days — a two-week excursion is a minority of the window, so
+# it barely moves the median, unlike a mean) and reports HOW LONG the metric
+# has sat on the bad side. Reads the cache and assumes it holds full history.
+
+# Per-metric "off by a meaningful amount" floor (in the metric's own units);
+# the effective threshold is max(floor, 0.5 × baseline spread).
+_BASELINE_METRICS = [
+    # (field, label, higher_is_better, min_threshold)
+    ("resting_hr", "resting_hr", False, 2.0),       # bpm
+    ("hrv_overnight_avg", "hrv", True, 3.0),         # ms
+    ("avg_stress", "avg_stress", False, 4.0),
+    ("body_battery_at_wake", "body_battery_at_wake", True, 5.0),
+]
+
+
+def _compare_to_baseline(series, recent_days, higher_is_better, min_threshold):
+    """series: list of (date, value) oldest→newest, non-null. Compare the
+    recent_days mean to the median over the whole series, and count how long
+    the metric has sat on the unfavourable side."""
+    if len(series) < recent_days + 5:
+        return {"status": "insufficient_data", "n_baseline": len(series)}
+    vals = [v for _, v in series]
+    recent = vals[-recent_days:]
+    recent_mean = sum(recent) / len(recent)
+    baseline_median = statistics.median(vals)
+    spread = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    threshold = max(min_threshold, 0.5 * spread)
+    delta = recent_mean - baseline_median  # +ve = above baseline
+
+    # "off" = on the unfavourable side of baseline by more than the threshold.
+    def off_day(v):
+        return (baseline_median - v) >= threshold if higher_is_better \
+            else (v - baseline_median) >= threshold
+
+    recent_off = (delta <= -threshold) if higher_is_better else (delta >= threshold)
+    flag = "normal"
+    if recent_off:
+        flag = "suppressed" if higher_is_better else "elevated"
+
+    # consecutive days (from most recent) on the unfavourable side
+    consec = 0
+    for _, v in reversed(series):
+        if off_day(v):
+            consec += 1
+        else:
+            break
+    last14 = series[-14:]
+    days_off_14 = sum(1 for _, v in last14 if off_day(v))
+
+    return {
+        "recent_mean": round(recent_mean, 1),
+        "baseline_median": round(baseline_median, 1),
+        "baseline_spread": round(spread, 1),
+        "delta_vs_baseline": round(delta, 1),
+        "threshold": round(threshold, 1),
+        "flag": flag,                              # normal | elevated | suppressed
+        "consecutive_days_off_baseline": consec,
+        "days_off_baseline_last_14": days_off_14,
+        "n_baseline": len(vals),
+    }
+
+
+def wellness_baseline_comparison(
+    as_of_date: Optional[str] = None,
+    recent_days: int = 7,
+    baseline_days: int = 90,
+) -> dict:
+    """Recent wellness vs a long, drift-resistant baseline.
+
+    For each tracked metric (RHR, HRV, stress, body-battery-at-wake): the
+    recent_days mean, the baseline median over baseline_days, the delta, a
+    flag (elevated/suppressed/normal vs baseline), and — crucially — how many
+    days the metric has sat on the unfavourable side (consecutive, and within
+    the last 14). This catches multi-week drift that a trailing 7-day average
+    masks. Cache-only; assumes full history is present.
+    """
+    _init_db()
+    as_of = date.fromisoformat(as_of_date) if as_of_date else date.today()
+    start = (as_of - timedelta(days=baseline_days - 1)).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT date, resting_hr, hrv_overnight_avg, avg_stress, "
+            "body_battery_at_wake FROM wellness_daily "
+            "WHERE date BETWEEN ? AND ? ORDER BY date",
+            (start, as_of.isoformat()),
+        ).fetchall()
+
+    metrics = {}
+    for field, label, higher_better, floor in _BASELINE_METRICS:
+        series = [(r["date"], r[field]) for r in rows if r[field] is not None]
+        metrics[label] = _compare_to_baseline(series, recent_days, higher_better, floor)
+
+    return {
+        "as_of": as_of.isoformat(),
+        "recent_days": recent_days,
+        "baseline_days": baseline_days,
+        "metrics": metrics,
     }
 
 

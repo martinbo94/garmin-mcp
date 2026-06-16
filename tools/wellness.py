@@ -7,47 +7,53 @@ from core import _client, mcp
 
 @mcp.tool()
 def get_wellness_history(
-    start_date: str,
-    end_date: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     force_refetch: bool = False,
+    baseline_days: int = 90,
 ) -> dict:
     """Historical daily wellness metrics (HRV, RHR, sleep, stress, body battery)
-    with rolling averages.
+    with rolling averages AND a long-baseline drift check.
 
-    On first call for a date, the daily metrics are pulled from Garmin and
-    cached in coach_data/cache.db. Subsequent calls in the same range read
-    from the cache and are fast. A first 90-day backfill takes ~30-60s.
+    Defaults to the last 7 days when no dates are given. Reads the local
+    cache (assumed current with full history).
 
-    Rolling averages:
-    - **RHR:** simple 7-day mean (it's a low-noise signal).
-    - **HRV:** 7-day **geometric mean** (mean of ln(HRV), exp back).
-      HRV is roughly log-normally distributed; this is the right shape
-      per Altini's research and what HRV4Training uses.
+    The `baseline_comparison` block is the important part for spotting
+    SUSTAINED drift: a trailing 7-day average moves with the drift, so a
+    metric that's been elevated for two weeks still looks "within the 7-day
+    average." This compares the recent week against the MEDIAN over the last
+    `baseline_days` (~90) — drift-resistant — and reports how many days the
+    metric has sat on the bad side (consecutive + within the last 14). Use
+    this, not just the rolling mean, to judge whether e.g. RHR is genuinely
+    back to normal vs. still elevated against the real baseline.
+
+    Rolling averages (trailing, for the daily view):
+    - **RHR:** simple 7-day mean.
+    - **HRV:** 7-day **geometric mean** (HRV is ~log-normal; per Altini /
+      HRV4Training).
 
     Args:
-        start_date: 'YYYY-MM-DD' (inclusive).
-        end_date:   'YYYY-MM-DD' (inclusive).
-        force_refetch: If True, re-pull all days from Garmin even if cached.
+        start_date: 'YYYY-MM-DD' inclusive. Default: 7 days before end_date.
+        end_date:   'YYYY-MM-DD' inclusive. Default: today.
+        force_refetch: re-pull the detail range from Garmin even if cached.
+        baseline_days: window for the drift-resistant baseline (default 90).
 
-    Returns dict with:
-      - range: start/end/days
-      - daily: list of {date, resting_hr, hrv_overnight_avg, hrv_status,
-        hrv_baseline_low/upper, sleep_seconds, sleep_score, sleep stage
-        durations, avg_stress, body_battery_*, respiration_avg, spo2_avg,
-        recovery_time_hours}
-      - rolling: list of {date, rhr_7d_mean, hrv_7d_geomean}
-      - summary: min/max/mean for RHR and HRV across the range, plus the
-        most recent Garmin "balanced HRV" baseline band for context
-
-    Note: rows cached before a field was added to the schema will return
-    null for that field. Call with `force_refetch=True` for the relevant
-    range to backfill.
+    Returns: range, daily, rolling, summary (as before), plus
+    `baseline_comparison` (recent-vs-90d-median per metric, with flag +
+    days-off-baseline drift counts).
     """
+    from datetime import date as _date, timedelta as _td
+    end = end_date or _date.today().isoformat()
+    start = start_date or (_date.fromisoformat(end) - _td(days=6)).isoformat()
+
     sync_result = garmin_sync.sync_wellness_range(
-        _client(), start_date, end_date, force_refetch=force_refetch
+        _client(), start, end, force_refetch=force_refetch
     )
-    data = garmin_sync.wellness_history(start_date, end_date)
+    data = garmin_sync.wellness_history(start, end)
     data["sync"] = sync_result
+    data["baseline_comparison"] = garmin_sync.wellness_baseline_comparison(
+        as_of_date=end, baseline_days=baseline_days
+    )
     return data
 
 
