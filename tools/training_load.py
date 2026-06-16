@@ -690,7 +690,9 @@ def training_load(as_of_date: Optional[str] = None) -> dict:
     if deload.get("error"):
         parts.append("deload status unavailable")
     elif deload.get("is_deload"):
-        parts.append(f"in a {deload.get('deload_type', 'unknown')} deload")
+        dtype = deload.get("deload_type", "unknown")
+        article = "an" if dtype[:1].lower() in "aeiou" else "a"
+        parts.append(f"in {article} {dtype} deload")
     else:
         parts.append("not in a deload")
 
