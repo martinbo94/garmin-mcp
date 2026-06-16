@@ -20,25 +20,25 @@ across sessions.
 │  │                 swap / delete workouts                  │  │
 │  │                                                         │  │
 │  │  ACTIVITY DATA  sync from Garmin → SQLite cache         │  │
-│  │                 weekly_summary, list_activities,         │  │
-│  │                 activity_breakdown, query_activity_cache │  │
+│  │                 weekly_retrospective, list_activities,  │  │
+│  │                 activity_breakdown, query_activity_cache│  │
 │  │                                                         │  │
 │  │  ANALYSIS       progress / PRs / form / elevation /     │  │
-│  │                 ACWR / deload / taper / recovery         │  │
+│  │                 training_load (ACWR+deload) / taper     │  │
 │  │                                                         │  │
-│  │  WELLNESS       morning_check_in (HRV, sleep, HRR,      │  │
-│  │                 readiness), illness + stress + sleep     │  │
+│  │  WELLNESS       morning_check_in (readiness: HRV/RHR/   │  │
+│  │                 sleep, drift, illness), sleep-vs-perf   │  │
 │  │                                                         │  │
 │  │  CALCULATORS    pace, intervals, heat (dew-point),      │  │
-│  │                 weather (Open-Meteo), GPX race pacing    │  │
+│  │                 weather (Open-Meteo), GPX race pacing   │  │
 │  │                                                         │  │
 │  │  PLAN           get / save / materialize /              │  │
-│  │                 compare_vs_actual                        │  │
+│  │                 compare_vs_actual                       │  │
 │  │                                                         │  │
 │  │  RESOURCES      coach://user_profile                    │  │
 │  │  (markdown)     coach://training_philosophy             │  │
-│  │                 coach://classification                   │  │
-│  │                 coach://plan_design                      │  │
+│  │                 coach://classification                  │  │
+│  │                 coach://plan_design                     │  │
 │  └─────────────────────────────────────────────────────────┘  │
 └───────────────────────────────────────────────────────────────┘
                             │
@@ -224,9 +224,8 @@ git.
 | `sync_activities` | Pull new activities + HR streams + laps + recent wellness into the cache |
 | `list_activities` | Flat, filterable activity list (date, start time, distance, HR, pace, classification) |
 | `query_activity_cache` | Read-only SQL SELECT against the local cache for custom analysis |
-| `weekly_summary` | Per-week volume, sessions, time-in-zone |
 | `activity_breakdown` | One activity's zone breakdown + lap classification |
-| `weekly_retrospective` | `weekly_summary` + plan compliance for Sunday review |
+| `weekly_retrospective` | Per-week volume/sessions/time-in-zone, single week or a range, optionally with plan compliance (`with_compliance`) |
 | `progress_report` | Track one session type's HR/pace trend over time |
 | `detect_personal_records` | Scan cached runs for PRs at common distances |
 
@@ -244,14 +243,12 @@ git.
 | `morning_check_in` | The single readiness tool: today's metrics + 7-day trend + 90-day baseline drift + acute illness-signal flags + Garmin readiness |
 | `get_wellness_history` | Multi-day wellness trends + long-baseline drift check |
 | `sleep_performance_correlation` | Pre-run-night sleep vs performance, within one session class |
-| `stress_training_balance` | Training load vs life stress over a window |
 
 ### Training load & periodization
 
 | Tool | What it does |
 |---|---|
-| `training_load_balance` | Acute:chronic workload ratio (ACWR), rolling 7d/28d |
-| `deload_check` | Whether the current week is a recovery/deload week (plan-aware) |
+| `training_load` | One load view: ACWR (acute:chronic) + deload detection (plan-aware) + life-stress overlay |
 | `return_from_break` | Detect an inactivity gap and generate a ramp-back plan |
 | `taper_plan` | Race taper schedule from today to race day |
 | `double_day_advisor` | Whether to adopt double-threshold days (gated on base **or** informed opt-in) |
@@ -309,7 +306,7 @@ git.
 > summarize last week
 ```
 Claude reads `coach://classification` + `coach://user_profile`, calls
-`weekly_summary`, interprets zone distribution and flags deviations.
+`weekly_retrospective`, interprets zone distribution and flags deviations.
 
 ### Drafting a plan
 ```
