@@ -7,8 +7,7 @@ import plan as plan_mod
 from core import mcp
 
 
-@mcp.tool()
-def deload_check(as_of_date: Optional[str] = None) -> dict:
+def _deload(as_of_date: Optional[str] = None) -> dict:
     """Detect whether the current week is a recovery (deload) week.
 
     Queries the local activity cache for the last 5 weeks of runs and
@@ -290,8 +289,7 @@ def _deload_recovery_context(as_of: "date") -> dict:
 
 
 # ─── Training load balance (ACWR) ─────────────────────────────────────
-@mcp.tool()
-def training_load_balance(as_of_date: Optional[str] = None) -> dict:
+def _acwr(as_of_date: Optional[str] = None) -> dict:
     """Estimate the Acute:Chronic Workload Ratio (ACWR) from cached run history.
 
     Load metric is **run duration in minutes** (duration-only — there is no
@@ -451,6 +449,268 @@ def training_load_balance(as_of_date: Optional[str] = None) -> dict:
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}
 
+
+# ─── Stress / training balance overlay ────────────────────────────────
+def _stress_overlay(as_of_date: Optional[str] = None, days_back: int = 14) -> dict:
+    """Combined training load + life stress analysis from Garmin wellness data.
+
+    Queries the local cache for the last `days_back` days of wellness metrics
+    and activity data. Combines training minutes with daily stress score to
+    produce a holistic load picture — useful for spotting weeks where hard
+    training coincides with high life stress.
+
+    Stress conversion: each 10-point stress score counts as 1 "equivalent
+    minute" of training load (avg_stress / 10), giving a combined_load per day.
+
+    Returns:
+    - `days`: list of {date, training_min, avg_stress, body_battery_at_wake,
+      combined_load} for each day in the window.
+    - `rolling_7d`: list of {date, combined_load_7d_avg, training_min_7d_avg}
+      (7-day rolling averages, requires at least 4 data points).
+    - `high_stress_training_days`: count of days where avg_stress > 60 AND
+      training_minutes > 30 (hard training while stressed).
+    - `avg_daily_stress`, `avg_training_min`: simple means across the window.
+    - `best_recovery_day`: date with lowest avg_stress + highest body_battery_at_wake.
+    - `recommendation`: plain-language guidance based on the analysis.
+
+    Args:
+        as_of_date: 'YYYY-MM-DD' to end the window on a specific day (default
+            today). The window is the `days_back` days ending on this date.
+        days_back: How many calendar days to look back (default 14).
+    """
+    import sqlite3 as _sqlite3
+    from datetime import date as _date, timedelta as _td
+
+    try:
+        if days_back < 1:
+            return {"error": "days_back must be >= 1."}
+        today = _date.fromisoformat(as_of_date) if as_of_date else _date.today()
+        start = today - _td(days=days_back - 1)
+        start_str = start.isoformat()
+        end_str = today.isoformat()
+
+        # Query wellness data
+        with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            conn.row_factory = _sqlite3.Row
+            wellness_rows = conn.execute(
+                """
+                SELECT date, avg_stress, body_battery_low,
+                       body_battery_at_wake, recovery_time_hours
+                FROM wellness_daily
+                WHERE date BETWEEN ? AND ?
+                ORDER BY date
+                """,
+                (start_str, end_str),
+            ).fetchall()
+
+            # Query activity training load per day. Rowing/indoor sessions
+            # often have moving_time_s = 0 in Garmin's payload — fall back
+            # to elapsed_time_s so that load still counts.
+            activity_rows = conn.execute(
+                """
+                SELECT date(start_date_local) AS day,
+                       SUM(COALESCE(NULLIF(moving_time_s, 0), elapsed_time_s, 0))
+                           AS total_moving_s
+                FROM activities
+                WHERE date(start_date_local) BETWEEN ? AND ?
+                GROUP BY date(start_date_local)
+                """,
+                (start_str, end_str),
+            ).fetchall()
+
+        # Build activity lookup: date -> training_minutes
+        activity_by_date: dict[str, float] = {}
+        for row in activity_rows:
+            if row["total_moving_s"]:
+                activity_by_date[row["day"]] = round(row["total_moving_s"] / 60, 1)
+
+        # Build per-day records
+        days_list: list[dict] = []
+        for row in wellness_rows:
+            d = row["date"]
+            training_min = activity_by_date.get(d, 0.0)
+            avg_stress = row["avg_stress"]
+            stress_equiv = round((avg_stress / 10) if avg_stress is not None else 0.0, 1)
+            combined_load = round(training_min + stress_equiv, 1)
+            days_list.append({
+                "date": d,
+                "training_min": training_min,
+                "avg_stress": avg_stress,
+                "body_battery_at_wake": row["body_battery_at_wake"],
+                "combined_load": combined_load,
+            })
+
+        # Also fill in days that have activity data but no wellness row
+        wellness_dates = {r["date"] for r in wellness_rows}
+        for act_date, training_min in activity_by_date.items():
+            if act_date not in wellness_dates:
+                days_list.append({
+                    "date": act_date,
+                    "training_min": training_min,
+                    "avg_stress": None,
+                    "body_battery_at_wake": None,
+                    "combined_load": round(training_min, 1),
+                })
+
+        days_list.sort(key=lambda x: x["date"])
+
+        # Flag high-stress training days
+        high_stress_days = [
+            d for d in days_list
+            if (d["avg_stress"] or 0) > 60 and d["training_min"] > 30
+        ]
+
+        # Summary stats
+        stress_vals = [d["avg_stress"] for d in days_list if d["avg_stress"] is not None]
+        avg_daily_stress = round(sum(stress_vals) / len(stress_vals), 1) if stress_vals else None
+        training_vals = [d["training_min"] for d in days_list]
+        avg_training_min = round(sum(training_vals) / len(training_vals), 1) if training_vals else 0.0
+
+        # Best recovery day: score = body_battery_at_wake - avg_stress (higher = better)
+        best_recovery_day = None
+        best_score: float = float("-inf")
+        for d in days_list:
+            bb = d["body_battery_at_wake"]
+            stress = d["avg_stress"]
+            if bb is not None and stress is not None:
+                score = bb - stress
+                if score > best_score:
+                    best_score = score
+                    best_recovery_day = d["date"]
+
+        # 7-day rolling averages of combined_load and training_min
+        rolling_7d: list[dict] = []
+        min_data = 4
+        for i in range(len(days_list)):
+            win_start = max(0, i - 6)
+            window = days_list[win_start: i + 1]
+            cl_vals = [w["combined_load"] for w in window]
+            tr_vals = [w["training_min"] for w in window]
+            cl_avg = round(sum(cl_vals) / len(cl_vals), 1) if len(cl_vals) >= min_data else None
+            tr_avg = round(sum(tr_vals) / len(tr_vals), 1) if len(tr_vals) >= min_data else None
+            rolling_7d.append({
+                "date": days_list[i]["date"],
+                "combined_load_7d_avg": cl_avg,
+                "training_min_7d_avg": tr_avg,
+            })
+
+        # Recommendation
+        n_high = len(high_stress_days)
+        if n_high >= 3:
+            recommendation = (
+                f"{n_high} days this period combined hard training with high stress "
+                f"(avg_stress > 60 and > 30 min training) — consider lighter sessions "
+                f"on stressful days to avoid compounding fatigue."
+            )
+        elif n_high > 0:
+            recommendation = (
+                f"{n_high} day(s) combined hard training with high stress "
+                f"this period — watch for accumulated fatigue if this pattern persists."
+            )
+        elif avg_daily_stress is not None and avg_daily_stress > 55:
+            recommendation = (
+                f"Life stress is elevated (avg {avg_daily_stress}/100) — "
+                f"treat training load conservatively even on low-stress training days."
+            )
+        else:
+            recommendation = (
+                "Stress and training load look balanced over this window — "
+                "no pattern of compounding hard sessions with high life stress."
+            )
+
+        return {
+            "window": {"start": start_str, "end": end_str, "days_back": days_back},
+            "days": days_list,
+            "rolling_7d": rolling_7d,
+            "high_stress_training_days": n_high,
+            "avg_daily_stress": avg_daily_stress,
+            "avg_training_min": avg_training_min,
+            "best_recovery_day": best_recovery_day,
+            "recommendation": recommendation,
+        }
+
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+# ─── Merged training load tool ────────────────────────────────────────
+@mcp.tool()
+def training_load(as_of_date: Optional[str] = None) -> dict:
+    """Unified training-load readout: ACWR, deload status, and a stress overlay.
+
+    One call that composes three complementary views of recent training
+    volume against a baseline, each preserving its original computation:
+
+    - `acwr`: Acute:Chronic Workload Ratio from cached run history — acute
+      (rolling 7d) vs chronic (rolling 28d, weekly-equivalent), with zone,
+      recommendation, and a 4-block weekly_breakdown. Duration-only heuristic
+      (Gabbett-style 0.8/1.3/1.5 thresholds); a rough volume-trend sanity
+      check, not a validated injury predictor.
+    - `deload`: whether the current week is a recovery (deload) week —
+      current week's volume prorated to a full-week equivalent vs the 3-week
+      average (deload when projected <= 60% of average). Planned vs unplanned
+      is read from plan.json; includes an informational HRV/RHR
+      recovery_context.
+    - `stress_overlay`: per-day training load blended with daily life-stress
+      score over the 14 days ending on the as-of date — high-stress-training
+      days, best recovery day, and a balance recommendation.
+
+    Plus a top-level `summary` string with the headline (ACWR zone + whether
+    in a deload + any high-stress flag).
+
+    Args:
+        as_of_date: Optional 'YYYY-MM-DD' anchor for all three sections
+            (retrospectives/testing). Defaults to today. The stress overlay
+            window (14 days) ends on this date.
+
+    Returns:
+        - `summary`: one-line headline across the three sections.
+        - `acwr`: full ACWR output (acute/chronic/acwr/zone/recommendation/
+          weekly_breakdown).
+        - `deload`: full deload output (is_deload/deload_type/deload_ratio/
+          recovery_context/weekly_history/...).
+        - `stress_overlay`: full stress/training balance output for the
+          14-day window ending at the as-of date.
+    """
+    acwr = _acwr(as_of_date)
+    deload = _deload(as_of_date)
+    stress_overlay = _stress_overlay(as_of_date, days_back=14)
+
+    # ── Headline summary ──────────────────────────────────────────────
+    parts: list[str] = []
+    zone = acwr.get("zone")
+    acwr_val = acwr.get("acwr")
+    if zone:
+        parts.append(f"ACWR {acwr_val} ({zone})")
+    elif acwr.get("error"):
+        parts.append("ACWR unavailable")
+    else:
+        parts.append("ACWR: not enough history")
+
+    if deload.get("error"):
+        parts.append("deload status unavailable")
+    elif deload.get("is_deload"):
+        parts.append(f"in a {deload.get('deload_type', 'unknown')} deload")
+    else:
+        parts.append("not in a deload")
+
+    n_high = stress_overlay.get("high_stress_training_days")
+    if stress_overlay.get("error"):
+        parts.append("stress overlay unavailable")
+    elif n_high:
+        parts.append(f"{n_high} high-stress training day(s)")
+    else:
+        parts.append("no high-stress training days")
+
+    summary = "; ".join(parts) + "."
+
+    return {
+        "as_of_date": as_of_date or date.today().isoformat(),
+        "summary": summary,
+        "acwr": acwr,
+        "deload": deload,
+        "stress_overlay": stress_overlay,
+    }
 
 
 # ─── Taper planner ────────────────────────────────────────────────────
