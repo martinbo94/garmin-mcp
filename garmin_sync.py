@@ -1901,6 +1901,339 @@ def _session_category(
     return "easy"
 
 
+# ─── Per-rep interval analysis (timestamp-sliced) ─────────────────────
+# Minimum lap duration (s) for a "drag" lap to count as a real work rep in
+# the interval analysis. Garmin sometimes emits sub-2s ACTIVE auto-lap
+# fragments at the end of a session (e.g. a 0.6 s, 1 m "lap"); these pass
+# the HR validation trivially (single sample == Garmin avg) but are not
+# reps. This filter is local to the per-rep analysis ONLY — it does NOT
+# change _classify_laps or the existing `laps` output, which still report
+# every drag lap as before.
+_MIN_REP_SECONDS = 30
+
+# Tolerance (bpm) between the plain stream-sliced mean of a rep and Garmin's
+# authoritative lap average_heartrate. A larger gap means the timestamp slice
+# is misaligned, so reconstructed sample stats (trimmed mean, drift) are not
+# trustworthy and are suppressed (Task 3 validation guard).
+_REP_SLICE_TOLERANCE_BPM = 3
+
+# HR-lag onset window (s) trimmed from the start of a rep when computing
+# trimmed_avg_hr — HR has not yet caught up to the effort in the first
+# seconds of a work rep.
+_HR_LAG_ONSET_SECONDS = 15
+# Within-rep drift is only computed when the post-onset (settled) portion of a
+# rep is at least this long — on shorter reps HR is still climbing throughout,
+# so a within-rep "drift" number would just be HR kinetics, not a signal.
+_MIN_DRIFT_SETTLED_SECONDS = 180
+
+
+def _lap_start_offset(lap: dict, activity_start_s: float) -> Optional[float]:
+    """Elapsed-seconds offset of a lap's start within the activity stream.
+
+    Lap start timestamps come from Garmin's startTimeGMT (stored in the
+    `start_date_local` field) and are UTC. `activity_start_s` is the UTC
+    epoch of the activity start (the earliest lap's start). Returns the lap
+    start as elapsed seconds from t=0, matching the stream's `time` array.
+    """
+    lap_start_str = lap.get("start_date_local") or lap.get("start_date")
+    if not lap_start_str:
+        return None
+    s = lap_start_str.replace("+00:00", "Z")
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return dt.timestamp() - activity_start_s
+        except ValueError:
+            continue
+    return None
+
+
+def _activity_start_epoch(laps: list[dict]) -> Optional[float]:
+    """UTC epoch of the activity start, anchored to the earliest lap start.
+
+    The stream's elapsed-time array starts at 0 at the activity start, which
+    is the start of the first lap. Using the earliest lap timestamp as the
+    anchor lets every other lap be located in the stream by true timestamp.
+    """
+    epochs = []
+    for lap in laps:
+        lap_start_str = lap.get("start_date_local") or lap.get("start_date")
+        if not lap_start_str:
+            continue
+        s = lap_start_str.replace("+00:00", "Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                epochs.append(
+                    datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()
+                )
+                break
+            except ValueError:
+                continue
+    return min(epochs) if epochs else None
+
+
+def _rep_hr_samples(
+    lap: dict,
+    activity_start_s: float,
+    times: list,
+    hrs: list,
+) -> list[tuple[float, float]]:
+    """(elapsed_offset_within_rep, hr) samples inside one lap's window."""
+    offset_start = _lap_start_offset(lap, activity_start_s)
+    elapsed = lap.get("elapsed_time")
+    if offset_start is None or elapsed is None or not times or not hrs:
+        return []
+    offset_end = offset_start + elapsed
+    out: list[tuple[float, float]] = []
+    n = min(len(times), len(hrs))
+    for i in range(n):
+        t = times[i]
+        if t < offset_start:
+            continue
+        if t >= offset_end:
+            break
+        out.append((t - offset_start, hrs[i]))
+    return out
+
+
+def _interval_analysis(
+    classified: list[dict],
+    activity_start_s: Optional[float],
+    times: Optional[list],
+    hrs: Optional[list],
+    zones: list[tuple[int, int, str]],
+) -> Optional[dict]:
+    """Per-rep + work-summary analysis for sessions with work (drag) reps.
+
+    Returns None when there are no real work reps. Mean/peak HR come from
+    Garmin's authoritative per-lap fields; trimmed mean and drift are
+    reconstructed from the timestamp-sliced stream and are ONLY emitted when
+    the slice validates against Garmin's lap average (within tolerance).
+    """
+    drag_laps = [
+        lap for lap in classified
+        if lap.get("lap_type") == "drag"
+        and (lap.get("elapsed_time") or 0) >= _MIN_REP_SECONDS
+    ]
+    if not drag_laps:
+        return None
+
+    have_stream = (
+        activity_start_s is not None and times is not None and hrs is not None
+    )
+
+    work_reps: list[dict] = []
+    work_zone_secs = {z[2]: 0 for z in zones}
+
+    for idx, lap in enumerate(drag_laps, start=1):
+        avg_speed = lap.get("average_speed") or 0
+        pace = round(1000 / avg_speed, 1) if avg_speed > 0 else None
+        lap_avg = lap.get("average_heartrate")
+        rep: dict = {
+            "rep_index": idx,
+            "pace_s_per_km": pace,
+            "avg_hr": lap_avg,
+            "peak_hr": lap.get("max_heartrate"),
+            "trimmed_avg_hr": None,
+            "drift_bpm": None,
+            "samples_validated": False,
+        }
+
+        if have_stream:
+            samples = _rep_hr_samples(lap, activity_start_s, times, hrs)
+            hr_vals = [hr for _, hr in samples]
+            if hr_vals and lap_avg is not None:
+                sliced_mean = statistics.mean(hr_vals)
+                validated = abs(sliced_mean - lap_avg) <= _REP_SLICE_TOLERANCE_BPM
+                rep["samples_validated"] = validated
+                if validated:
+                    settled = [
+                        (off, hr) for off, hr in samples
+                        if off >= _HR_LAG_ONSET_SECONDS
+                    ]
+                    if settled:
+                        rep["trimmed_avg_hr"] = round(
+                            statistics.mean(hr for _, hr in settled), 1
+                        )
+                    # Within-rep drift is only meaningful on LONG reps, where HR
+                    # plateaus in the Golden Zone and a late climb signals going
+                    # out too hard. On short reps (e.g. 400 m / ~2 min) HR is
+                    # still rising the whole rep, so "drift" is just kinetics —
+                    # report null there and let across_rep_drift carry the signal.
+                    settled_span = settled[-1][0] - settled[0][0] if settled else 0
+                    third = len(settled) // 3
+                    if settled_span >= _MIN_DRIFT_SETTLED_SECONDS and third >= 1:
+                        svals = [hr for _, hr in settled]
+                        rep["drift_bpm"] = round(
+                            statistics.mean(svals[-third:])
+                            - statistics.mean(svals[:third]), 1
+                        )
+
+            # Real time-in-zone over the drag lap, integrated from the same
+            # timestamp-sliced samples (sample spacing from the offset deltas,
+            # not an assumed 1 Hz) so it stays aligned with the validated slice.
+            for i in range(len(samples) - 1):
+                dt = samples[i + 1][0] - samples[i][0]
+                if dt <= 0:
+                    continue
+                hr = samples[i][1]
+                for low, high, zname in zones:
+                    if low <= hr <= high:
+                        work_zone_secs[zname] += dt
+                        break
+
+        work_reps.append(rep)
+
+    rep_avgs = [r["avg_hr"] for r in work_reps if r["avg_hr"] is not None]
+    rep_peaks = [r["peak_hr"] for r in work_reps if r["peak_hr"] is not None]
+    work_total = sum(work_zone_secs.values())
+    work_zone_pcts = {
+        z: round(100 * s / work_total, 1) if work_total else 0
+        for z, s in work_zone_secs.items()
+    }
+
+    return {
+        "note": (
+            "Whole-session zone_secs / zone_pcts / avg_hr MIX IN warmup, "
+            "recoveries, and cooldown and are NOT the primary read for an "
+            "interval session — use work_reps and work_summary (drag laps only)."
+        ),
+        "work_reps": work_reps,
+        "work_summary": {
+            "rep_count": len(work_reps),
+            "avg_rep_hr": round(statistics.mean(rep_avgs), 1) if rep_avgs else None,
+            "avg_rep_peak_hr": (
+                round(statistics.mean(rep_peaks), 1) if rep_peaks else None
+            ),
+            "across_rep_drift_bpm": (
+                round(rep_avgs[-1] - rep_avgs[0], 1) if len(rep_avgs) >= 2 else None
+            ),
+            "work_zone_secs": work_zone_secs,
+            "work_zone_pcts": work_zone_pcts,
+        },
+    }
+
+
+def hr_time_in_buckets(
+    activity_id: int,
+    edges: Optional[list[int]] = None,
+    scope: str = "session",
+) -> dict:
+    """Bin HR-stream time into bpm buckets (data fn behind the MCP tool).
+
+    See the `hr_time_in_buckets` @mcp.tool wrapper for the full contract.
+    """
+    _init_db()
+    zones = _parse_zones()
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT a.id, a.start_date_local, s.time_json, s.hr_json
+            FROM activities a
+            LEFT JOIN streams s ON s.activity_id = a.id
+            WHERE a.id = ?
+            """,
+            (activity_id,),
+        ).fetchone()
+
+    if not row:
+        return {
+            "error": f"Activity {activity_id} not in local cache.",
+            "next_steps": ["Run sync_activities() to pull recent activities."],
+        }
+    if not row["time_json"] or not row["hr_json"]:
+        return {
+            "error": f"Activity {activity_id} has no HR stream cached.",
+            "next_steps": ["Run sync_activities() to (re)fetch the HR stream."],
+        }
+
+    times = json.loads(row["time_json"])
+    hrs = json.loads(row["hr_json"])
+
+    scope = scope if scope in ("session", "work") else "session"
+
+    # Build the [start, end) elapsed-offset windows that count toward the bins.
+    windows: Optional[list[tuple[float, float]]] = None
+    if scope == "work":
+        laps_raw = _cached_laps(activity_id) or []
+        classified = _classify_laps(laps_raw, zones)
+        activity_start_s = _activity_start_epoch(laps_raw)
+        windows = []
+        if activity_start_s is not None:
+            for lap in classified:
+                if lap.get("lap_type") != "drag":
+                    continue
+                if (lap.get("elapsed_time") or 0) < _MIN_REP_SECONDS:
+                    continue
+                offset_start = _lap_start_offset(lap, activity_start_s)
+                elapsed = lap.get("elapsed_time")
+                if offset_start is None or elapsed is None:
+                    continue
+                windows.append((offset_start, offset_start + elapsed))
+
+    # Resolve edges → ascending cut points. Default = inner HR-zone boundaries.
+    if edges:
+        cut_points = sorted(int(e) for e in edges)
+    else:
+        # Zone lower bounds excluding the first (so buckets are <Z2low,
+        # Z2..Z3low, ...). Each zone's low edge after the first.
+        cut_points = [z[0] for z in zones[1:]]
+
+    # Bucket labels: <c0, c0-(c1-1), ..., >=clast.
+    n_buckets = len(cut_points) + 1
+    bucket_secs = [0.0] * n_buckets
+
+    def _bucket_index(hr: float) -> int:
+        for i, c in enumerate(cut_points):
+            if hr < c:
+                return i
+        return n_buckets - 1
+
+    def _in_window(t: float) -> bool:
+        if windows is None:
+            return True
+        return any(s <= t < e for s, e in windows)
+
+    total_secs = 0.0
+    n = min(len(times), len(hrs))
+    for i in range(n - 1):
+        dt = times[i + 1] - times[i]
+        if dt <= 0:
+            continue
+        t = times[i]
+        if not _in_window(t):
+            continue
+        bucket_secs[_bucket_index(hrs[i])] += dt
+        total_secs += dt
+
+    def _label(i: int) -> str:
+        if i == 0:
+            return f"<{cut_points[0]}" if cut_points else "all"
+        if i == n_buckets - 1:
+            return f"{cut_points[-1]}+"
+        return f"{cut_points[i - 1]}-{cut_points[i] - 1}"
+
+    buckets = [
+        {
+            "label": _label(i),
+            "seconds": round(bucket_secs[i], 1),
+            "percent": round(100 * bucket_secs[i] / total_secs, 1) if total_secs else 0,
+        }
+        for i in range(n_buckets)
+    ]
+
+    return {
+        "id": row["id"],
+        "scope": scope,
+        "edges": cut_points,
+        "edges_source": "custom" if edges else "hr_zones",
+        "buckets": buckets,
+        "total_seconds": round(total_secs, 1),
+    }
+
+
 def activity_breakdown(activity_id: int) -> dict:
     """Lap-level breakdown + zone distribution for one cached activity.
 
@@ -1968,7 +2301,14 @@ def activity_breakdown(activity_id: int) -> dict:
     drag_laps = [lap for lap in classified if lap.get("lap_type") == "drag"]
     session_category = _session_category(zone_pcts, drag_laps, zones)
 
-    return {
+    # Interval-aware per-rep analysis (timestamp-sliced) — added only when the
+    # session has real work reps. Existing fields above are unchanged.
+    activity_start_s = _activity_start_epoch(laps_raw) if laps_raw else None
+    interval_analysis = _interval_analysis(
+        classified, activity_start_s, stream_times, stream_hrs, zones
+    )
+
+    result = {
         "id": row["id"],
         "date": row["start_date_local"][:10],
         "name": row["name"],
@@ -1989,3 +2329,11 @@ def activity_breakdown(activity_id: int) -> dict:
         "has_stream_data": row["time_json"] is not None,
         "lap_fetch_error": lap_fetch_error,
     }
+    if interval_analysis is not None:
+        result["zone_note"] = (
+            "This is an interval session — whole-session zone_secs / zone_pcts "
+            "/ avg_hr mix in warmup, recoveries, and cooldown. See "
+            "interval_analysis.work_summary for the work-only read."
+        )
+        result["interval_analysis"] = interval_analysis
+    return result
