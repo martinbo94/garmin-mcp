@@ -261,7 +261,8 @@ git.
 | `plan_interval_session` | Interval structure + rep distances from profile paces |
 | `forecast_conditions` | Weather (Open-Meteo) for a date/time; auto-locates from latest activity |
 | `heat_pace_adjustment` | Adjust pace for heat + humidity (dew-point method) |
-| `analyze_race_course` | GPX course analysis (sustained climbs/descents + short steep "wall" pitches) + grade-adjusted per-km race pacing for a goal (even-effort default, optional conservative-start negative-split) |
+| `analyze_race_course` | GPX course analysis (sustained climbs/descents + short steep "wall" pitches) + grade-adjusted per-km race pacing for a goal (even-effort default, optional conservative-start negative-split; `grade_model='personal'` uses your own fitted hill curve) |
+| `analyze_hill_response` | Fit your PERSONAL grade→pace curve from run history (how much you slow per 1% incline at easy effort); feeds `analyze_race_course` |
 
 ### Gear
 
