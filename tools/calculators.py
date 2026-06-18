@@ -724,11 +724,42 @@ def forecast_conditions(
 
 
 @mcp.tool()
+def analyze_hill_response(recompute: bool = False) -> dict:
+    """Fit the athlete's PERSONAL grade→pace response from their run history.
+
+    Derives how much THIS runner slows on hills at easy effort — a personal
+    Grade Adjusted Pace curve — by regressing HR on speed + gradient across
+    steady 60 s windows from their easy/long runs (run fixed effects, cardiac-
+    drift control, HR-lag absorbed by windowing). The HR-neutral slow-off per
+    +1% grade = -(grade coef / speed coef) in pace terms. Grounded in Minetti
+    2002 + GAP literature.
+
+    Use this to (a) answer "how much should I slow on uphills to hold effort"
+    with the runner's own number rather than a population average, and (b)
+    feed `analyze_race_course(grade_model='personal')` for personalised course
+    pacing. Result is cached to coach_data/grade_model.json; pass
+    recompute=True after syncing a lot of new outdoor runs.
+
+    Requires per-sample elevation/speed/distance streams — run
+    sync_activities(backfill_streams=True) once if older runs lack them.
+
+    Returns: slowoff_s_per_km_per_pct_up / speedup_..._down, a per-grade
+    pace_adjustment_curve, the fitted coefficients + r2, n_runs / n_windows,
+    operating pace, the well-supported grade range, and caveats. The factor is
+    fit at easy effort and used as a personal GAP (shape transfers; absolute
+    pace advisory), reliable only within the supported grade range.
+    """
+    import hill_model
+    return hill_model.compute_grade_response(recompute=recompute)
+
+
+@mcp.tool()
 def analyze_race_course(
     gpx_path: str,
     goal_time: Optional[str] = None,
     goal_pace_min_per_km: Optional[str] = None,
     negative_split_pct: float = 0.0,
+    grade_model: str = "heuristic",
 ) -> dict:
     """Analyze a race course from a GPX file and build a per-km pace plan.
 
@@ -788,6 +819,13 @@ def analyze_race_course(
         negative_split_pct: conservative-start effort bias as a percent
             (default 0 = even effort, the recommended default). ~1-2% is the
             sensible ceiling for a half/marathon; 0 for 5k/10k.
+        grade_model: 'heuristic' (default) uses the generic Minetti-family
+            grade adjustment; 'personal' uses the athlete's OWN fitted
+            grade→pace curve (see analyze_hill_response) — recommended when
+            available, since population GAP mis-estimates anyone off the mean.
+            Personal auto-fits+caches on first use; falls back to heuristic
+            with a note if it can't be fit. The returned `pacing.grade_model`
+            says which was used.
 
     Returns `course` (distance, ascent/descent/net, per-km gradient table,
     steepest km, steep_pitches, notable_climbs, notable_descents, warnings) and,
@@ -873,9 +911,34 @@ def analyze_race_course(
         goal_time_s = pace_s * dist_km
 
     if goal_time_s is not None:
-        plan = gpx_analysis.pacing_plan(segments, goal_time_s, negative_split_pct)
+        # Grade model: generic heuristic (default) or the athlete's own fitted
+        # curve (analyze_hill_response). Personal auto-computes+caches on first
+        # use; falls back to heuristic with a note if it can't be fit.
+        grade_fn = None
+        grade_model_note = None
+        if grade_model == "personal":
+            import hill_model
+            m = hill_model.load_grade_response() or hill_model.compute_grade_response()
+            if "error" in m:
+                grade_model_note = (
+                    "Requested personal grade model but it couldn't be fit ("
+                    + m["error"] + ") — used the generic heuristic instead."
+                )
+            else:
+                grade_fn = lambda g: hill_model.personal_grade_factor(g, m)
+                grade_model_note = (
+                    f"Using your personal grade curve (fit from {m['n_runs']} easy "
+                    f"runs; ~{m['slowoff_s_per_km_per_pct_up']:+.0f} s/km per +1% "
+                    f"uphill). Well-supported {m['grade_support_pct'][0]}.."
+                    f"{m['grade_support_pct'][1]}%; steeper is extrapolation."
+                )
+        plan = gpx_analysis.pacing_plan(
+            segments, goal_time_s, negative_split_pct, grade_factor_fn=grade_fn)
         if "error" in plan:
             return plan
+        plan["grade_model"] = "personal" if grade_fn else "heuristic"
+        if grade_model_note:
+            plan["grade_model_note"] = grade_model_note
         plan["goal"] = {
             "goal_time": gpx_analysis.fmt_time(goal_time_s),
             "implied_avg_pace": gpx_analysis.fmt_pace(goal_time_s / dist_km),

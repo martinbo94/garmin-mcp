@@ -14,3 +14,4 @@ coach_data/plan.json
 coach_data/deleted_templates_backup.json
 .flake8
 *.gpx
+coach_data/grade_model.json

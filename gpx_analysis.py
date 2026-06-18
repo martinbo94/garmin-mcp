@@ -443,9 +443,14 @@ def fmt_time(seconds: float) -> str:
 
 
 def pacing_plan(segments: list[dict], goal_time_s: float,
-                negative_split_pct: float = 0.0) -> dict:
+                negative_split_pct: float = 0.0,
+                grade_factor_fn=None) -> dict:
     """Even-EFFORT pacing for a goal time over a graded course, with an
     optional negative-split bias.
+
+    grade_factor_fn(grade_pct)->multiplier overrides the default generic
+    heuristic (e.g. the athlete's personal fitted curve). Default: the
+    module's `grade_factor`.
 
     Base behaviour (negative_split_pct=0): holds grade-adjusted effort
     constant — each km's target pace = a flat-equivalent 'effort pace' × that
@@ -475,7 +480,8 @@ def pacing_plan(segments: list[dict], goal_time_s: float,
         prog.append(1 + b - 2 * b * mid_frac)   # 1+b at frac=0 → 1-b at frac=1
         cum_km += s["distance_km"]
 
-    factors = [grade_factor(s["avg_grade_pct"]) for s in segments]
+    gf = grade_factor_fn or grade_factor
+    factors = [gf(s["avg_grade_pct"]) for s in segments]
     # Renormalise so Σ(effort_pace · factor · prog · dist) == goal_time.
     denom = sum(f * p * s["distance_km"] for f, p, s in zip(factors, prog, segments))
     if denom <= 0:
