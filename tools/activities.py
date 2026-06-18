@@ -12,6 +12,7 @@ def sync_activities(
     force_full: bool = False,
     weeks_back: Optional[int] = None,
     backfill_links: bool = False,
+    backfill_streams: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
 ) -> dict:
@@ -46,9 +47,17 @@ def sync_activities(
             those fields existed. One extra API call per activity —
             new activities get this automatically; this is only for
             history.
-        backfill_max: Max activities to backfill per call (default 100).
-            `remaining_without_detail` in the response tells you whether
-            another round is needed.
+        backfill_links: If True, also fetch workout-linkage detail for
+            cached activities synced before those fields existed (one API
+            call each). New activities get this automatically.
+        backfill_streams: If True, populate the elevation/pace/distance/
+            cadence stream columns for activities whose cached stream
+            predates them (one API call each). New activities get these
+            automatically; this is only for history. Use after this change
+            to enrich existing streams.
+        backfill_max: Max activities to backfill per call (default 100),
+            shared by both backfills. The `remaining_*` field in each
+            backfill result tells you whether another round is needed.
         wellness_days: Trailing days of wellness to refresh (default 10;
             0 to skip). Historical wellness backfill is via
             get_wellness_history.
@@ -56,8 +65,8 @@ def sync_activities(
     Returns dict with new_activities, streams_fetched, laps_fetched,
     details_fetched, wellness_fetched/wellness_cached, last_sync, per-item
     errors, and — for freshness checks — `cache_newest_activity` and
-    `cache_newest_wellness` (the newest cached dates). With backfill_links
-    also details_fetched / relinked / remaining_without_detail.
+    `cache_newest_wellness` (the newest cached dates). With backfill_links /
+    backfill_streams, also a `backfill` / `stream_backfill` block.
     """
     result = garmin_sync.run_sync(
         _client(), force_full=force_full, weeks_back=weeks_back,
@@ -65,6 +74,10 @@ def sync_activities(
     )
     if backfill_links and "error" not in result:
         result["backfill"] = garmin_sync.backfill_workout_links(
+            _client(), max_activities=backfill_max
+        )
+    if backfill_streams and "error" not in result:
+        result["stream_backfill"] = garmin_sync.backfill_streams(
             _client(), max_activities=backfill_max
         )
     return result
@@ -171,12 +184,23 @@ def query_activity_cache(
           laps_json: JSON array of laps, each with lap_index, lap_type
           ('wu'/'drag'/'pause'/'cd'/'lap'), distance_m, moving_time_s,
           avg_hr, max_hr, avg_speed_m_s.
-      streams(activity_id, time_json, hr_json)
-          Parallel JSON arrays of elapsed seconds and HR samples. These
-          are LARGE (thousands of points) — never SELECT them raw; use
-          json_each() to aggregate in SQL, e.g.:
-          SELECT avg(value) FROM streams, json_each(hr_json)
-          WHERE activity_id = 123.
+      streams(activity_id, time_json, hr_json, elevation_json, speed_json,
+                 distance_json, cadence_json)
+          Parallel JSON arrays, all the same length and index-aligned to
+          time_json (elapsed seconds): hr (bpm), elevation (m), speed (m/s),
+          distance (cumulative m), cadence (Garmin directRunCadence =
+          strides/min, i.e. ~half steps-per-minute — double for spm).
+          elevation/speed/distance/
+          cadence are NULL for streams cached before they were added —
+          sync_activities(backfill_streams=True) populates them; they're also
+          NULL per-sample for activities lacking a metric (e.g. indoor =
+          no elevation/GPS). These are LARGE (thousands of points) — never
+          SELECT them raw; use json_each() to aggregate, e.g. align HR and
+          elevation by position:
+          SELECT he.value AS hr, ee.value AS elev
+          FROM streams,
+               json_each(hr_json) he, json_each(elevation_json) ee
+          WHERE activity_id = 123 AND he.key = ee.key.
       wellness_daily(date, resting_hr, hrv_overnight_avg, hrv_weekly_avg,
                  hrv_status, hrv_baseline_low, hrv_baseline_upper,
                  sleep_seconds, sleep_score, sleep_deep_s, sleep_rem_s,

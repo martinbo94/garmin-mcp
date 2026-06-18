@@ -108,6 +108,10 @@ CREATE TABLE IF NOT EXISTS streams (
     activity_id INTEGER PRIMARY KEY,
     time_json TEXT NOT NULL,
     hr_json TEXT NOT NULL,
+    elevation_json TEXT,
+    speed_json TEXT,
+    distance_json TEXT,
+    cadence_json TEXT,
     FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
@@ -172,6 +176,13 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     "start_lon": "REAL",
 }
 
+_STREAMS_MIGRATION_COLUMNS = {
+    "elevation_json": "TEXT",
+    "speed_json": "TEXT",
+    "distance_json": "TEXT",
+    "cadence_json": "TEXT",
+}
+
 
 def _init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +191,7 @@ def _init_db() -> None:
         for table, columns in (
             ("wellness_daily", _WELLNESS_MIGRATION_COLUMNS),
             ("activities", _ACTIVITY_MIGRATION_COLUMNS),
+            ("streams", _STREAMS_MIGRATION_COLUMNS),
         ):
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             for col, col_type in columns.items():
@@ -248,10 +260,16 @@ def _garmin_list_activities(
 
 
 def _garmin_get_stream(garmin_client, activity_id: int) -> Optional[dict]:
-    """Fetch ~2s-resolution HR+elapsed stream from Garmin activity details.
+    """Fetch ~2s-resolution HR + elapsed stream (plus elevation, pace, distance,
+    cadence) from Garmin activity details.
 
-    Returns {"time": [...elapsed_s...], "heartrate": [...bpm...]} or None.
-    maxchart=6000 covers ~3.3 hours at 2s/sample.
+    Returns parallel arrays, all the same length, keyed:
+      time (elapsed s), heartrate (bpm), elevation (m), speed (m/s),
+      distance (cumulative m), cadence (spm).
+    Samples are kept where HR and elapsed are both present; the extra
+    metrics are aligned to those kept samples (None when a metric's
+    descriptor is absent or its value is missing for a sample). maxchart=6000
+    covers ~3.3 hours at 2s/sample. Returns None if there's no HR stream.
     """
     try:
         details = garmin_client.get_activity_details(str(activity_id), maxchart=6000)
@@ -266,16 +284,47 @@ def _garmin_get_stream(garmin_client, activity_id: int) -> Optional[dict]:
     elapsed_idx = descriptors.get("sumElapsedDuration")
     if hr_idx is None or elapsed_idx is None or not metrics:
         return None
+
+    # Optional extra metrics — aligned to the kept HR samples.
+    extra_idx = {
+        "elevation": descriptors.get("directElevation"),
+        "speed": descriptors.get("directSpeed"),
+        "distance": descriptors.get("sumDistance"),
+        "cadence": descriptors.get("directRunCadence"),
+    }
+
     elapsed_list: list[float] = []
     hr_list: list[float] = []
+    extra: dict[str, list] = {k: [] for k in extra_idx}
     for m in metrics:
         vals = m.get("metrics", [])
         hr = vals[hr_idx] if hr_idx < len(vals) else None
         elapsed = vals[elapsed_idx] if elapsed_idx < len(vals) else None
-        if hr is not None and elapsed is not None:
-            elapsed_list.append(elapsed)
-            hr_list.append(hr)
-    return {"time": elapsed_list, "heartrate": hr_list} if hr_list else None
+        if hr is None or elapsed is None:
+            continue
+        elapsed_list.append(elapsed)
+        hr_list.append(hr)
+        for key, idx in extra_idx.items():
+            v = vals[idx] if (idx is not None and idx < len(vals)) else None
+            extra[key].append(v)
+
+    if not hr_list:
+        return None
+    return {"time": elapsed_list, "heartrate": hr_list, **extra}
+
+
+def _stream_extra_json(stream: dict) -> tuple:
+    """Serialize the optional stream arrays (elevation, speed, distance,
+    cadence) to JSON in column order. Stores NULL when a whole array is
+    missing or entirely None (e.g. an indoor run with no elevation)."""
+    out = []
+    for key in ("elevation", "speed", "distance", "cadence"):
+        arr = stream.get(key)
+        if arr and any(v is not None for v in arr):
+            out.append(json.dumps(arr))
+        else:
+            out.append(None)
+    return tuple(out)
 
 
 def _garmin_get_laps(garmin_client, activity_id: int) -> list[dict]:
@@ -506,6 +555,54 @@ def backfill_workout_links(garmin_client, max_activities: int = 100) -> dict:
     }
 
 
+def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
+    """Populate the new stream columns (elevation/speed/distance/cadence) for
+    cached activities whose streams row predates them (elevation_json IS NULL).
+
+    Re-fetches the activity stream (one API call each), newest first, and
+    UPDATEs the four new columns. Existing time/hr arrays are left untouched.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [r[0] for r in conn.execute(
+            """
+            SELECT s.activity_id
+            FROM streams s JOIN activities a ON a.id = s.activity_id
+            WHERE s.elevation_json IS NULL
+            ORDER BY a.start_date_local DESC LIMIT ?
+            """,
+            (max_activities,),
+        )]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM streams WHERE elevation_json IS NULL"
+        ).fetchone()[0] - len(ids)
+
+    updated = 0
+    errors: list[str] = []
+    for act_id in ids:
+        try:
+            stream = _garmin_get_stream(garmin_client, act_id)
+        except Exception as e:
+            errors.append(f"stream {act_id}: {type(e).__name__}: {e}")
+            continue
+        if not stream:
+            continue
+        elev, speed, dist, cad = _stream_extra_json(stream)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE streams SET elevation_json=?, speed_json=?, "
+                "distance_json=?, cadence_json=? WHERE activity_id=?",
+                (elev, speed, dist, cad, act_id),
+            )
+        updated += 1
+
+    return {
+        "streams_updated": updated,
+        "remaining_without_streams": remaining,
+        "errors": errors,
+    }
+
+
 # ─── Location + weather (Open-Meteo) ──────────────────────────────────
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -708,8 +805,12 @@ def run_sync(
             if stream:
                 with sqlite3.connect(DB_PATH) as conn:
                     conn.execute(
-                        "INSERT OR IGNORE INTO streams (activity_id, time_json, hr_json) VALUES (?, ?, ?)",
-                        (act_id, json.dumps(stream["time"]), json.dumps(stream["heartrate"])),
+                        "INSERT OR IGNORE INTO streams (activity_id, time_json, "
+                        "hr_json, elevation_json, speed_json, distance_json, "
+                        "cadence_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (act_id, json.dumps(stream["time"]),
+                         json.dumps(stream["heartrate"]),
+                         *_stream_extra_json(stream)),
                     )
                 streams_count += 1
 
