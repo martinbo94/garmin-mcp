@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS streams (
     speed_json TEXT,
     distance_json TEXT,
     cadence_json TEXT,
+    extras_fetched_at TEXT,
     FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
@@ -181,6 +182,10 @@ _STREAMS_MIGRATION_COLUMNS = {
     "speed_json": "TEXT",
     "distance_json": "TEXT",
     "cadence_json": "TEXT",
+    # Marks a stream as processed for the extra columns — set even when a
+    # metric is legitimately absent (treadmill = no elevation/GPS), so the
+    # backfill terminates instead of re-fetching no-elevation rows forever.
+    "extras_fetched_at": "TEXT",
 }
 
 
@@ -568,13 +573,13 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
             """
             SELECT s.activity_id
             FROM streams s JOIN activities a ON a.id = s.activity_id
-            WHERE s.elevation_json IS NULL
+            WHERE s.extras_fetched_at IS NULL
             ORDER BY a.start_date_local DESC LIMIT ?
             """,
             (max_activities,),
         )]
         remaining = conn.execute(
-            "SELECT COUNT(*) FROM streams WHERE elevation_json IS NULL"
+            "SELECT COUNT(*) FROM streams WHERE extras_fetched_at IS NULL"
         ).fetchone()[0] - len(ids)
 
     updated = 0
@@ -586,13 +591,21 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
             errors.append(f"stream {act_id}: {type(e).__name__}: {e}")
             continue
         if not stream:
+            # No stream available — mark processed so it isn't retried forever.
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE streams SET extras_fetched_at=? WHERE activity_id=?",
+                    (datetime.now(timezone.utc).isoformat(), act_id),
+                )
             continue
         elev, speed, dist, cad = _stream_extra_json(stream)
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 "UPDATE streams SET elevation_json=?, speed_json=?, "
-                "distance_json=?, cadence_json=? WHERE activity_id=?",
-                (elev, speed, dist, cad, act_id),
+                "distance_json=?, cadence_json=?, extras_fetched_at=? "
+                "WHERE activity_id=?",
+                (elev, speed, dist, cad,
+                 datetime.now(timezone.utc).isoformat(), act_id),
             )
         updated += 1
 
@@ -807,10 +820,12 @@ def run_sync(
                     conn.execute(
                         "INSERT OR IGNORE INTO streams (activity_id, time_json, "
                         "hr_json, elevation_json, speed_json, distance_json, "
-                        "cadence_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "cadence_json, extras_fetched_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (act_id, json.dumps(stream["time"]),
                          json.dumps(stream["heartrate"]),
-                         *_stream_extra_json(stream)),
+                         *_stream_extra_json(stream),
+                         datetime.now(timezone.utc).isoformat()),
                     )
                 streams_count += 1
 

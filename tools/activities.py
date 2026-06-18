@@ -185,7 +185,7 @@ def query_activity_cache(
           ('wu'/'drag'/'pause'/'cd'/'lap'), distance_m, moving_time_s,
           avg_hr, max_hr, avg_speed_m_s.
       streams(activity_id, time_json, hr_json, elevation_json, speed_json,
-                 distance_json, cadence_json)
+                 distance_json, cadence_json, extras_fetched_at)
           Parallel JSON arrays, all the same length and index-aligned to
           time_json (elapsed seconds): hr (bpm), elevation (m), speed (m/s),
           distance (cumulative m), cadence (Garmin directRunCadence =
