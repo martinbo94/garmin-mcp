@@ -1273,7 +1273,6 @@ def _fetch_wellness_day(garmin_client, date_str: str) -> dict:
         s = garmin_client.get_stats(date_str)
         if s and isinstance(s, dict):
             out["resting_hr"] = s.get("restingHeartRate")
-            out["sleep_seconds"] = s.get("sleepingSeconds")
             out["avg_stress"] = s.get("averageStressLevel")
             out["body_battery_high"] = s.get("bodyBatteryHighestValue")
             out["body_battery_low"] = s.get("bodyBatteryLowestValue")
@@ -1291,7 +1290,12 @@ def _fetch_wellness_day(garmin_client, date_str: str) -> dict:
     except Exception:
         pass
 
-    # Sleep score + stage breakdown live under get_sleep_data, not get_stats.
+    # Sleep duration + score + stage breakdown ALL come from get_sleep_data,
+    # not get_stats. get_stats has a `sleepingSeconds` field but it's a
+    # different daily aggregate keyed to the calendar date and does NOT match
+    # the watch's reported sleep duration — use sleepTimeSeconds here so
+    # duration, score, and stages are one consistent record (sleepTimeSeconds
+    # == deep + rem + light, i.e. excludes awake time, matching the watch).
     # Sleep data is keyed to the date the sleep STARTED, i.e. typically the
     # date BEFORE the caller's "today" — caller decides which date to pass.
     try:
@@ -1300,6 +1304,7 @@ def _fetch_wellness_day(garmin_client, date_str: str) -> dict:
             dto = sd.get("dailySleepDTO") or {}
             scores = dto.get("sleepScores") or {}
             overall = scores.get("overall") or {}
+            out["sleep_seconds"] = dto.get("sleepTimeSeconds")
             out["sleep_score"] = overall.get("value")
             out["sleep_deep_s"] = dto.get("deepSleepSeconds")
             out["sleep_rem_s"] = dto.get("remSleepSeconds")
@@ -1520,7 +1525,6 @@ def _illness_signals(today: dict, history: list[dict]) -> dict:
 def morning_check_in_data(
     garmin_client,
     today_str: str,
-    yesterday_str: str,
     history_start: str,
     history_end: str,
 ) -> dict:
@@ -1530,16 +1534,11 @@ def morning_check_in_data(
     sync state, not stale cache), backed by the cached wellness_daily
     history for the prior week.
     """
+    # get_sleep_data(D) returns the sleep that ENDED the morning of date D
+    # (i.e. last night), so the sleep fields already on `today` ARE last
+    # night's sleep. No yesterday re-fetch needed — doing so would pull the
+    # night before last and report the wrong duration/score.
     today = _fetch_wellness_day(garmin_client, today_str)
-    # Sleep data is keyed to the date the sleep STARTED — for "last night",
-    # that's yesterday. Re-fetch and overwrite sleep_* from yesterday.
-    sleep_last_night = _fetch_wellness_day(garmin_client, yesterday_str)
-    for k in (
-        "sleep_seconds", "sleep_score",
-        "sleep_deep_s", "sleep_rem_s", "sleep_light_s", "sleep_awake_s",
-    ):
-        if sleep_last_night.get(k) is not None:
-            today[k] = sleep_last_night[k]
 
     # Make sure the 7-day window is in the cache before we trend on it.
     sync_wellness_range(garmin_client, history_start, history_end)

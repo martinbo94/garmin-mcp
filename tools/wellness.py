@@ -163,7 +163,7 @@ def morning_check_in() -> dict:
             return {"error": f"{type(e).__name__}: {e}"}
 
     wellness = garmin_sync.morning_check_in_data(
-        g, today.isoformat(), yesterday.isoformat(), history_start, history_end,
+        g, today.isoformat(), history_start, history_end,
     )
 
     training_readiness_raw = safe(g.get_training_readiness, today.isoformat())
@@ -199,11 +199,11 @@ def sleep_performance_correlation(
     `classify_activity` (planned_type when linked, else the name hint).
 
     Sleep is keyed to the night BEFORE the run. In this repo sleep_* fields
-    in wellness_daily are stored on the date the sleep STARTED, so the night
-    before a run on date D lives in the row dated D-1. `hrv_overnight_avg`
-    follows the opposite convention (it is "last night's" HRV as of the
-    morning of its row date), so the morning-of-run HRV lives in the row
-    dated D. The two are joined from their respective rows.
+    in wellness_daily are stored on the date the sleep ENDED (the morning of
+    that row's date), so the pre-run night for a run on date D lives in the
+    row dated D — the same convention as `hrv_overnight_avg` ("last night's"
+    HRV as of the morning of its row date). Both are joined from the row
+    dated D.
 
     Within the chosen class this computes Pearson correlations of
     sleep_score (and sleep hours) against avg_hr and pace, plus a
@@ -252,10 +252,12 @@ def sleep_performance_correlation(
                     wh.hrv_overnight_avg,
                     wh.resting_hr AS wellness_rhr
                 FROM activities a
-                -- sleep_* are stored on the date sleep started: the night
-                -- before the run is the row dated run_date - 1 day.
+                -- sleep_* are stored on the date the sleep ENDED (the
+                -- morning of that row's date), so the pre-run night for a
+                -- run on run_date is the row dated run_date itself — same
+                -- keying as hrv_overnight_avg below.
                 LEFT JOIN wellness_daily ws
-                       ON ws.date = date(a.start_date_local, '-1 day')
+                       ON ws.date = date(a.start_date_local)
                 -- hrv_overnight_avg is "last night" as of its row's morning,
                 -- so the morning-of-run HRV is the row dated run_date.
                 LEFT JOIN wellness_daily wh
