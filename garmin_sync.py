@@ -88,9 +88,27 @@ CREATE TABLE IF NOT EXISTS activities (
     workout_compliance INTEGER,
     detail_fetched_at TEXT,
     start_lat REAL,
-    start_lon REAL
+    start_lon REAL,
+    gear_uuid TEXT,
+    gear_name TEXT,
+    gear_fetched_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(start_date_local);
+
+-- Gear library (shoes etc.), Garmin = source of truth, cached so the gear
+-- tools read locally instead of hitting Garmin. Refreshed on every sync.
+CREATE TABLE IF NOT EXISTS gear (
+    uuid TEXT PRIMARY KEY,
+    name TEXT,
+    make_model TEXT,
+    type TEXT,
+    status TEXT,
+    in_use_since TEXT,
+    retired_at TEXT,
+    total_distance_km REAL,
+    total_activities INTEGER,
+    synced_at TEXT NOT NULL
+);
 
 -- Durable garmin_workout_id → planned type mapping. Written at materialize
 -- time and refreshed from plan.json on every sync, so completed activities
@@ -175,6 +193,12 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     "detail_fetched_at": "TEXT",
     "start_lat": "REAL",
     "start_lon": "REAL",
+    "gear_uuid": "TEXT",
+    "gear_name": "TEXT",
+    # Marks an activity as processed for gear — set even when no gear is
+    # assigned, so the backfill terminates instead of re-fetching gearless
+    # activities forever.
+    "gear_fetched_at": "TEXT",
 }
 
 _STREAMS_MIGRATION_COLUMNS = {
@@ -202,6 +226,10 @@ def _init_db() -> None:
             for col, col_type in columns.items():
                 if col not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+        # Created after the gear_uuid column is guaranteed to exist (above).
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_activities_gear ON activities(gear_uuid)"
+        )
 
 
 def _get_last_sync() -> Optional[datetime]:
@@ -506,6 +534,147 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
         )
 
 
+# ─── Gear (shoes etc.) ────────────────────────────────────────────────
+
+def _gear_display_name(item: dict) -> Optional[str]:
+    """Human-readable gear name from a Garmin gear record."""
+    name = (
+        item.get("customMakeModel")
+        or item.get("displayName")
+        or " ".join(
+            p for p in (item.get("gearMakeName"), item.get("gearModelName")) if p
+        ).strip()
+    )
+    return name or None
+
+
+def _fetch_activity_gear(garmin_client, act_id: int) -> tuple[Optional[str], Optional[str]]:
+    """Return (gear_uuid, gear_name) for an activity, preferring the shoe.
+
+    Garmin returns a list (an activity can have multiple gear items, e.g.
+    shoes + HR strap). For a running coach the shoe is what matters, so
+    pick the Shoes-type item; fall back to the first item otherwise.
+    Returns (None, None) when no gear is assigned.
+    """
+    items = garmin_client.get_activity_gear(act_id) or []
+    if not items:
+        return None, None
+    shoe = next(
+        (it for it in items if (it.get("gearTypeName") or "").lower() == "shoes"),
+        items[0],
+    )
+    return shoe.get("uuid"), _gear_display_name(shoe)
+
+
+def _store_activity_gear(act_id: int, gear_uuid: Optional[str], gear_name: Optional[str]) -> None:
+    """Write gear_uuid/gear_name and stamp gear_fetched_at (always, so a
+    gearless activity is not retried on every backfill)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE activities SET gear_uuid=?, gear_name=?, gear_fetched_at=? "
+            "WHERE id=?",
+            (gear_uuid, gear_name, datetime.now(timezone.utc).isoformat(), act_id),
+        )
+
+
+def sync_gear(garmin_client) -> dict:
+    """Refresh the local `gear` table from Garmin (the source of truth).
+
+    Pulls the gear library plus per-item mileage/activity-count stats so the
+    gear tools can read everything locally. Upserts by uuid; one stats call
+    per gear item.
+    """
+    _init_db()
+    profile_id = str(garmin_client.get_user_profile()["id"])
+    items = garmin_client.get_gear(profile_id) or []
+    now = datetime.now(timezone.utc).isoformat()
+    synced = 0
+    errors: list[str] = []
+    for it in items:
+        uuid = it.get("uuid")
+        if not uuid:
+            continue
+        total_km = None
+        total_acts = None
+        try:
+            stats = garmin_client.get_gear_stats(uuid) or {}
+            total_km = round(stats.get("totalDistance", 0) / 1000, 1)
+            total_acts = stats.get("totalActivities", 0)
+        except Exception as e:
+            errors.append(f"gear stats {uuid}: {type(e).__name__}: {e}")
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                INSERT INTO gear (
+                    uuid, name, make_model, type, status,
+                    in_use_since, retired_at, total_distance_km,
+                    total_activities, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(uuid) DO UPDATE SET
+                    name=excluded.name,
+                    make_model=excluded.make_model,
+                    type=excluded.type,
+                    status=excluded.status,
+                    in_use_since=excluded.in_use_since,
+                    retired_at=excluded.retired_at,
+                    total_distance_km=excluded.total_distance_km,
+                    total_activities=excluded.total_activities,
+                    synced_at=excluded.synced_at
+                """,
+                (
+                    uuid,
+                    _gear_display_name(it),
+                    it.get("customMakeModel"),
+                    it.get("gearTypeName"),
+                    it.get("gearStatusName"),
+                    (it.get("dateBegin") or "")[:10] or None,
+                    (it.get("dateEnd") or "")[:10] or None,
+                    total_km,
+                    total_acts,
+                    now,
+                ),
+            )
+        synced += 1
+    return {"gear_synced": synced, "errors": errors}
+
+
+def backfill_gear(garmin_client, max_activities: int = 100) -> dict:
+    """Fetch gear for cached activities that never got it (gear_fetched_at
+    IS NULL), newest first — one API call each. Activities with no gear are
+    still marked processed so they aren't retried forever.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [r[0] for r in conn.execute(
+            """
+            SELECT id FROM activities
+            WHERE gear_fetched_at IS NULL
+            ORDER BY start_date_local DESC LIMIT ?
+            """,
+            (max_activities,),
+        )]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE gear_fetched_at IS NULL"
+        ).fetchone()[0] - len(ids)
+
+    updated = 0
+    errors: list[str] = []
+    for act_id in ids:
+        try:
+            uuid, name = _fetch_activity_gear(garmin_client, act_id)
+            _store_activity_gear(act_id, uuid, name)
+            if uuid:
+                updated += 1
+        except Exception as e:
+            errors.append(f"gear {act_id}: {type(e).__name__}: {e}")
+
+    return {
+        "gear_fetched": updated,
+        "remaining_without_gear": remaining,
+        "errors": errors,
+    }
+
+
 def backfill_workout_links(garmin_client, max_activities: int = 100) -> dict:
     """Fetch detail fields for cached activities that never got them.
 
@@ -762,6 +931,7 @@ def run_sync(
     streams_count = 0
     laps_count = 0
     details_count = 0
+    gear_count = 0
     errors: list[str] = []
 
     for act in activities:
@@ -839,6 +1009,15 @@ def run_sync(
                 _store_laps(act_id, laps)
                 laps_count += 1
 
+        if is_cardio:
+            try:
+                uuid, name = _fetch_activity_gear(garmin_client, act_id)
+                _store_activity_gear(act_id, uuid, name)
+                if uuid:
+                    gear_count += 1
+            except Exception as e:
+                errors.append(f"gear {act_id}: {e}")
+
     # Refresh recent wellness so HRV/RHR/sleep stay current alongside
     # activities — activity sync alone leaves these stale, which makes the
     # recovery/readiness tools report phantom "no data". Failures here never
@@ -855,6 +1034,15 @@ def run_sync(
             errors.extend(w.get("errors", []))
         except Exception as e:
             errors.append(f"wellness: {type(e).__name__}: {e}")
+
+    # Refresh the gear library (status + mileage) so the gear tools read
+    # locally. Cheap (one list + one stats call per gear item) and failures
+    # never break activity sync.
+    gear_synced = 0
+    try:
+        gear_synced = sync_gear(garmin_client).get("gear_synced", 0)
+    except Exception as e:
+        errors.append(f"gear sync: {type(e).__name__}: {e}")
 
     _set_last_sync(sync_start)
 
@@ -874,6 +1062,8 @@ def run_sync(
         "streams_fetched": streams_count,
         "laps_fetched": laps_count,
         "details_fetched": details_count,
+        "activity_gear_fetched": gear_count,
+        "gear_synced": gear_synced,
         "wellness_fetched": wellness_fetched,
         "wellness_cached": wellness_cached,
         "errors": errors,
@@ -1122,7 +1312,7 @@ def list_activities(
             SELECT id, start_date_local, name, type, sport_type, distance_m,
                    moving_time_s, avg_hr, max_hr, total_elevation_gain,
                    planned_type, training_effect_label, workout_rpe,
-                   workout_feel, workout_compliance
+                   workout_feel, workout_compliance, gear_name
             FROM activities
             WHERE {' AND '.join(where)}
             ORDER BY start_date_local
@@ -1163,6 +1353,7 @@ def list_activities(
             "workout_rpe": r["workout_rpe"],
             "workout_feel": r["workout_feel"],
             "workout_compliance": r["workout_compliance"],
+            "gear_name": r["gear_name"],
         })
 
     matched = len(activities)

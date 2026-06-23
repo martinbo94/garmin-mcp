@@ -1,47 +1,57 @@
-"""Gear / equipment tools (Garmin = source of truth)."""
-from core import _client, mcp
+"""Gear / equipment tools.
+
+All reads come from the local cache (the `gear` and `activities` tables),
+populated by `sync_activities` / `run_sync`. These tools never call Garmin
+directly — run a sync to refresh gear status and mileage.
+"""
+import sqlite3
+
+import garmin_sync
+from core import mcp
 
 
-# ─── Gear / equipment (Garmin = source of truth) ──────────────────────
+def _gear_rows(active_only: bool = True) -> list[dict]:
+    garmin_sync._init_db()
+    with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        sql = "SELECT * FROM gear"
+        if active_only:
+            sql += " WHERE status = 'active'"
+        sql += " ORDER BY total_distance_km DESC"
+        return [dict(r) for r in conn.execute(sql)]
+
+
+# ─── Gear / equipment (read from local cache) ─────────────────────────
 @mcp.tool()
 def list_gear(active_only: bool = True, with_stats: bool = True) -> list[dict]:
     """List your Garmin gear (shoes etc.) with status and mileage.
 
+    Reads the local `gear` cache (refreshed on every sync) — does not call
+    Garmin. If gear looks stale or missing, run `sync_activities`.
+
     Args:
         active_only: If True (default), only return active (non-retired) gear.
         with_stats: If True (default), include total_distance_km and
-            total_activities per item. Adds one API call per gear item —
-            fast for typical libraries, but can be slow for very large
-            histories.
+            total_activities per item.
 
     Returns list of dicts: uuid, name, make_model, type, status,
     in_use_since, retired_at, and (when with_stats=True)
     total_distance_km and total_activities.
     """
-    g = _client()
-    profile_id = str(g.get_user_profile()["id"])
-    items = g.get_gear(profile_id) or []
-
     out: list[dict] = []
-    for it in items:
-        if active_only and it.get("gearStatusName") != "active":
-            continue
+    for r in _gear_rows(active_only=active_only):
         rec = {
-            "uuid": it.get("uuid"),
-            "name": it.get("displayName") or it.get("customMakeModel"),
-            "make_model": it.get("customMakeModel"),
-            "type": it.get("gearTypeName"),
-            "status": it.get("gearStatusName"),
-            "in_use_since": (it.get("dateBegin") or "")[:10] or None,
-            "retired_at": (it.get("dateEnd") or "")[:10] or None,
+            "uuid": r["uuid"],
+            "name": r["name"],
+            "make_model": r["make_model"],
+            "type": r["type"],
+            "status": r["status"],
+            "in_use_since": r["in_use_since"],
+            "retired_at": r["retired_at"],
         }
-        if with_stats and rec["uuid"]:
-            try:
-                stats = g.get_gear_stats(rec["uuid"])
-                rec["total_distance_km"] = round(stats.get("totalDistance", 0) / 1000, 1)
-                rec["total_activities"] = stats.get("totalActivities", 0)
-            except Exception as e:
-                rec["stats_error"] = f"{type(e).__name__}: {e}"
+        if with_stats:
+            rec["total_distance_km"] = r["total_distance_km"]
+            rec["total_activities"] = r["total_activities"]
         out.append(rec)
     return out
 
@@ -53,9 +63,10 @@ def shoe_wear_check(
 ) -> dict:
     """Check shoe mileage against wear thresholds and flag shoes nearing retirement.
 
-    Typical running shoe lifespan is 500-800 km depending on the model,
-    surface, and runner weight. Racing shoes and carbon-plated supershoes
-    wear faster (~300-500 km).
+    Reads the local `gear` cache (refreshed on every sync) — does not call
+    Garmin. Typical running shoe lifespan is 500-800 km depending on the
+    model, surface, and runner weight. Racing shoes and carbon-plated
+    supershoes wear faster (~300-500 km).
 
     Args:
         warning_km: Flag as WARNING above this distance. Default 500 km.
@@ -69,28 +80,11 @@ def shoe_wear_check(
           estimated sessions remaining (based on recent avg session distance)
         - `action_needed`: True if any shoe is warning or critical
     """
-    g = _client()
-    profile_id = str(g.get_user_profile()["id"])
-    items = g.get_gear(profile_id) or []
-
     shoes = []
-    for it in items:
-        if it.get("gearStatusName") != "active":
-            continue
-        if it.get("gearTypeName") not in ("shoes", "running_shoes", None):
-            # Include all active gear — Garmin uses varying type names
-            pass
-        uuid = it.get("uuid")
-        name = it.get("displayName") or it.get("customMakeModel") or "Unknown shoe"
-        km = 0.0
-        activities = 0
-        if uuid:
-            try:
-                stats = g.get_gear_stats(uuid)
-                km = round(stats.get("totalDistance", 0) / 1000, 1)
-                activities = stats.get("totalActivities", 0)
-            except Exception:
-                pass
+    for r in _gear_rows(active_only=True):
+        km = r["total_distance_km"] or 0.0
+        activities = r["total_activities"] or 0
+        name = r["name"] or "Unknown shoe"
 
         if km >= critical_km:
             status = "critical"
@@ -113,7 +107,7 @@ def shoe_wear_check(
             "avg_session_km": avg_session_km,
             "km_to_warning": round(km_to_warning, 1),
             "sessions_to_warning": sessions_to_warning,
-            "in_use_since": (it.get("dateBegin") or "")[:10] or None,
+            "in_use_since": r["in_use_since"],
         })
 
     shoes.sort(key=lambda s: s["total_distance_km"], reverse=True)
@@ -143,14 +137,46 @@ def shoe_wear_check(
 def get_gear_for_activity(activity_id: int) -> dict:
     """Return the gear (e.g. shoe) used for a specific activity.
 
-    Useful for reasoning about shoe wear or rotation patterns ("which
-    shoes were on yesterday's run?", "which shoe has the most threshold
-    work on it?").
+    Reads the local cache — the gear captured for the activity during sync,
+    joined to the gear library for status/mileage. Does not call Garmin.
+    Useful for reasoning about shoe wear or rotation patterns ("which shoes
+    were on yesterday's run?", "which shoe has the most threshold work?").
 
-    Takes a Garmin activity_id — find it in the Garmin Connect URL
-    (`connect.garmin.com/modern/activity/<id>`) or via
-    `sync_activities` + `weekly_summary`.
+    Returns a dict with the activity's gear_uuid / gear_name and, when the
+    gear is in the local library, its make_model, type, status,
+    total_distance_km and total_activities. `gear_fetched` is False when the
+    activity hasn't been gear-synced yet (run sync_activities(backfill_gear=
+    True)); gear_uuid is None when the activity simply has no gear assigned.
     """
-    return _client().get_activity_gear(activity_id)
-
-
+    garmin_sync._init_db()
+    with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, name, gear_uuid, gear_name, gear_fetched_at "
+            "FROM activities WHERE id = ?",
+            (activity_id,),
+        ).fetchone()
+        if row is None:
+            return {"error": f"Activity {activity_id} not in cache — run sync_activities."}
+        result = {
+            "activity_id": row["id"],
+            "activity_name": row["name"],
+            "gear_uuid": row["gear_uuid"],
+            "gear_name": row["gear_name"],
+            "gear_fetched": row["gear_fetched_at"] is not None,
+        }
+        if row["gear_uuid"]:
+            g = conn.execute(
+                "SELECT make_model, type, status, total_distance_km, "
+                "total_activities FROM gear WHERE uuid = ?",
+                (row["gear_uuid"],),
+            ).fetchone()
+            if g:
+                result.update({
+                    "make_model": g["make_model"],
+                    "type": g["type"],
+                    "status": g["status"],
+                    "total_distance_km": g["total_distance_km"],
+                    "total_activities": g["total_activities"],
+                })
+        return result
