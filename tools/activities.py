@@ -256,6 +256,21 @@ def activity_breakdown(activity_id: int) -> dict:
       "at-threshold" | "vo2" — useful for compliance scoring against
       the plan. Refine ambiguous edges via coach://classification.
     - `classification_hint`: name-pattern hint (deterministic 90% case).
+    - `interval_analysis` (present only for sessions with work reps):
+      `work_reps` (per rep: pace, avg_hr, **peak_hr**, trimmed_avg_hr,
+      drift_bpm, and **zone_secs** = time in each HR zone), a
+      `work_summary` (work-only zone distribution + across-rep drift),
+      and a `how_to_present` block.
+
+    HOW TO ANALYZE AN INTERVAL SESSION (read `how_to_present` in the
+    payload and follow it): lead with a per-rep table of pace / avg_hr /
+    **peak_hr** / **zone_secs**, then the work-only zone distribution.
+    Do NOT headline avg_hr or trimmed_avg_hr — HR lags effort ~45-60s, so
+    on short reps (<~3 min) the average is dragged down by the climb and
+    understates the stimulus. Judge those reps by peak_hr and by time
+    at/above the target band (zone_secs in Z4+). A rep whose peak sits at
+    LT2 / in Z4 was effectively at threshold even if its average looks
+    sub-threshold — surface that, don't bury it under a low average.
 
     The activity must be in the local cache. If `error` is
     returned with `next_steps`, call `sync_activities()` (or
