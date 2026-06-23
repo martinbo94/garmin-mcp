@@ -2151,6 +2151,7 @@ def _interval_analysis(
             "peak_hr": lap.get("max_heartrate"),
             "trimmed_avg_hr": None,
             "drift_bpm": None,
+            "zone_secs": None,
             "samples_validated": False,
         }
 
@@ -2187,6 +2188,9 @@ def _interval_analysis(
             # Real time-in-zone over the drag lap, integrated from the same
             # timestamp-sliced samples (sample spacing from the offset deltas,
             # not an assumed 1 Hz) so it stays aligned with the validated slice.
+            # Accumulated both per-rep (so the over-the-band story is visible
+            # rep-by-rep, not just in aggregate) and into the work totals.
+            rep_zone_secs = {z[2]: 0 for z in zones}
             for i in range(len(samples) - 1):
                 dt = samples[i + 1][0] - samples[i][0]
                 if dt <= 0:
@@ -2194,8 +2198,11 @@ def _interval_analysis(
                 hr = samples[i][1]
                 for low, high, zname in zones:
                     if low <= hr <= high:
+                        rep_zone_secs[zname] += dt
                         work_zone_secs[zname] += dt
                         break
+            if any(rep_zone_secs.values()):
+                rep["zone_secs"] = {z: round(s) for z, s in rep_zone_secs.items()}
 
         work_reps.append(rep)
 
@@ -2213,6 +2220,34 @@ def _interval_analysis(
             "recoveries, and cooldown and are NOT the primary read for an "
             "interval session — use work_reps and work_summary (drag laps only)."
         ),
+        "how_to_present": {
+            "lead_with": (
+                "A per-rep table: pace, avg_hr, peak_hr, and zone_secs (time "
+                "in each zone). Then work_zone_pcts for the overall work "
+                "distribution. Do NOT headline avg_hr / trimmed_avg_hr alone — "
+                "on its own it hides what the reps actually cost."
+            ),
+            "hr_lag_caveat": (
+                "HR lags effort by ~45-60s, so on short reps (<~3 min, e.g. "
+                "400m) HR spends the first half climbing through Z1/Z2 and "
+                "often peaks AFTER the rep ends. avg_hr and trimmed_avg_hr are "
+                "therefore dragged DOWN by the climb and systematically "
+                "understate the stimulus. Judge short reps by peak_hr and by "
+                "zone_secs at/above the target band, NOT by the average."
+            ),
+            "read_intensity_vs_intent": (
+                "Compare peak_hr and the zone_secs distribution to the user's "
+                "intended band (sub-threshold target = Z3; at/above Z4 = "
+                "over the band). Reps whose peak sits at LT2 / in Z4 were "
+                "effectively threshold, even when the average looks sub-"
+                "threshold. Quantify the over-band time (sum of zone_secs in "
+                "Z4+) — that is the honest measure of how hard it really was."
+            ),
+            "fade": (
+                "Use across_rep_drift_bpm (last vs first rep avg) and the "
+                "trend in peak_hr to judge fade/control across the session."
+            ),
+        },
         "work_reps": work_reps,
         "work_summary": {
             "rep_count": len(work_reps),
