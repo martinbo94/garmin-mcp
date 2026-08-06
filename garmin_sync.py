@@ -900,7 +900,11 @@ _NAME_PATTERNS = [
     ("intervals", re.compile(
         r"intervall|interval|pyramide|pyramid|vo2|speed.?work|track", re.I)),
     ("race", re.compile(
-        r"stafett|etappe|race|parkrun|\bfun run\b|\b5k\b|\b10k\b|\bhalf marathon\b|\bmarathon\b", re.I)),
+        # (?!\s?pace) keeps workout names like "3x800m race pace" out.
+        r"stafett|etappe|race(?!\s?pace)|parkrun|\bfun run\b|\b5k\b|\b10k\b|\bhalf marathon\b"
+        # Norwegian race-name suffixes: Fornebuløpet, Bislettmila, Oslo Maraton.
+        # \b after løpet/mila keeps "løpetur"/"milaXX" from matching.
+        r"|\bmarathon\b|løpet\b|mila\b|maraton", re.I)),
     # Keep last so the more specific patterns above win (e.g. "Long easy").
     ("easy", re.compile(
         r"easy run|rolig tur|recovery run", re.I)),
@@ -966,6 +970,72 @@ def _parse_zones() -> list[tuple[int, int, str]]:
     return zones
 
 
+def _parse_intensity_anchors(
+    zones: Optional[list[tuple[int, int, str]]] = None,
+) -> dict:
+    """Bpm anchors for intensity judgment from coach_data/user_profile.md.
+
+    Returns {"sub_band_low", "sub_band_high", "hard_cap", "lt2_hr",
+    "source"}. Profile values win; zone-derived estimates fill any gaps
+    (hard cap ≈ Z4 low + 2, LT2 ≈ Z4 low + 6, band ≈ Z3 low → Z4 low) so
+    callers always get usable numbers.
+
+    These anchors deliberately do NOT line up with the Z1-Z5 boundaries:
+    Z4 typically straddles the hard cap (e.g. Z4 = 188-198 vs cap 190),
+    so "time in Z4" mixes at-cap sub-threshold work with genuinely
+    over-threshold work. Intensity verdicts must use these bpm anchors,
+    not zone shares.
+    """
+    if zones is None:
+        try:
+            zones = _parse_zones()
+        except OSError:
+            zones = []
+    try:
+        text = USER_PROFILE_PATH.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+
+    lt2 = hard_cap = band_low = band_high = None
+    for line in text.splitlines():
+        if lt2 is None:
+            m = re.search(r"LT2 HR[^|]*\|\s*\**(\d+)\s*bpm", line)
+            if m:
+                lt2 = int(m.group(1))
+        if hard_cap is None:
+            # [^:|] excludes the easy-run "Hard cap: LT1 = ..." wording.
+            m = re.search(r"Hard cap[^:|]*\|\s*\**(\d+)\s*bpm", line)
+            if m:
+                hard_cap = int(m.group(1))
+        if band_low is None:
+            m = re.search(
+                r"training target:\s*(\d+)\s*[–\-]\s*(\d+)", line, re.IGNORECASE
+            ) or re.search(
+                r"sub-threshold[^|]*\|\s*\**~?(\d+)\s*[–\-]\s*(\d+)\s*bpm",
+                line,
+                re.IGNORECASE,
+            )
+            if m:
+                band_low, band_high = int(m.group(1)), int(m.group(2))
+
+    z3_low = zones[2][0] if len(zones) >= 3 else 178
+    z4_low = zones[3][0] if len(zones) >= 4 else 188
+    source = "profile" if any(v is not None for v in (lt2, hard_cap, band_low)) else "zones"
+    if band_low is None:
+        band_low, band_high = z3_low, z4_low
+    if hard_cap is None:
+        hard_cap = (lt2 - 4) if lt2 is not None else z4_low + 2
+    if lt2 is None:
+        lt2 = z4_low + 6
+    return {
+        "sub_band_low": band_low,
+        "sub_band_high": band_high,
+        "hard_cap": hard_cap,
+        "lt2_hr": lt2,
+        "source": source,
+    }
+
+
 # ─── Weekly summary query ─────────────────────────────────────────────
 def weekly_summary(start_date: str, end_date: str) -> dict:
     """Per-week aggregates from the local cache.
@@ -974,7 +1044,12 @@ def weekly_summary(start_date: str, end_date: str) -> dict:
     coach://user_profile at query time, so retests automatically apply.
 
     Returns a dict with:
+    - `volume_note`: reminder that run_* and cross_* are separate volumes.
     - `weeks`: list of per-week aggregates (only weeks with activities).
+      Volume is split by sport: run_distance_m/run_moving_time_s/
+      run_session_count (running only) vs cross_distance_m/
+      cross_moving_time_s/cross_session_count (all other sports).
+      zone_secs and the activities list span ALL sports.
     - `coverage`: cache extent metadata (oldest/newest activity dates,
       requested range, and `gap_warning` True if the request extends
       before the cache's oldest record). Use this to distinguish "no
@@ -1012,10 +1087,15 @@ def weekly_summary(start_date: str, end_date: str) -> dict:
             "activities": [],
             "zone_secs": {z: 0 for z in zone_names},
             "below_z1_secs": 0,
-            "total_distance_m": 0.0,
-            "total_moving_time_s": 0,
+            # Running and cross-training are SEPARATE volumes — never sum
+            # them into one "total". zone_secs/activities include all sports.
+            "run_distance_m": 0.0,
+            "run_moving_time_s": 0,
+            "cross_distance_m": 0.0,
+            "cross_moving_time_s": 0,
             "session_count": 0,
             "run_session_count": 0,
+            "cross_session_count": 0,
         })
 
         act_zones = {z: 0 for z in zone_names}
@@ -1053,13 +1133,23 @@ def weekly_summary(start_date: str, end_date: str) -> dict:
         })
         if r["type"] == "Run":
             bucket["run_session_count"] += 1
-            bucket["total_distance_m"] += r["distance_m"] or 0
-            bucket["total_moving_time_s"] += r["moving_time_s"] or 0
+            bucket["run_distance_m"] += r["distance_m"] or 0
+            bucket["run_moving_time_s"] += r["moving_time_s"] or 0
+        else:
+            bucket["cross_session_count"] += 1
+            bucket["cross_distance_m"] += r["distance_m"] or 0
+            bucket["cross_moving_time_s"] += r["moving_time_s"] or 0
         bucket["session_count"] += 1
 
     oldest = extent["oldest"] if extent else None
     gap_warning = bool(oldest and start_date < oldest)
     return {
+        "volume_note": (
+            "run_* fields are RUNNING ONLY; cross_* fields are everything "
+            "else (ski, bike, ...). zone_secs and the activities list span "
+            "ALL sports. When reporting weekly volume, state running and "
+            "cross-training separately — never one combined total."
+        ),
         "weeks": list(weeks.values()),
         "coverage": {
             "cache_oldest_activity": oldest,
@@ -1762,11 +1852,14 @@ def _classify_laps(
 
     Heuristic (two-pass):
     - Primary: a lap is a "drag" if avg_hr is in Z3+ AND moving_time >= 30s.
-    - HR-lag rescue: if a lap has max_hr in Z3+ AND its pace is within
-      30 sec/km of the median pace of primary drags, it's reclassified
-      as a drag. This catches the common case where the first rep's avg
-      HR sits just below Z3 because HR hadn't caught up yet — pace + max
-      both confirm it was actually a working rep.
+    - HR-lag rescue: if a lap has max_hr in Z3+ AND its pace is no more
+      than 30 sec/km SLOWER than the median pace of primary drags, it's
+      reclassified as a drag. This catches the common case where the
+      first rep's avg HR sits just below Z3 because HR hadn't caught up
+      yet — pace + max both confirm it was actually a working rep. Faster
+      laps are always eligible: on hilly terrain a downhill rep can be
+      much faster than the median without being a recovery (recoveries
+      are slower than the work, never faster).
     - If no drags exist → all laps are "easy" (continuous easy run).
     - Otherwise: laps before first drag = "wu", after last drag = "cd",
       between drags = "pause".
@@ -1809,7 +1902,7 @@ def _classify_laps(
             moving = lap.get("moving_time") or 0
             if moving < 30 or speed <= 0 or mx_zi is None or mx_zi < 2:
                 continue
-            if abs(1000.0 / speed - median_pace) <= 30:
+            if 1000.0 / speed - median_pace <= 30:
                 is_drag[i] = True
 
     out: list[dict] = []
@@ -1946,33 +2039,49 @@ def _session_category(
     zone_pcts: dict,
     drag_laps: list[dict],
     zones: list[tuple[int, int, str]],
+    anchors: Optional[dict] = None,
+    work_summary: Optional[dict] = None,
+    session_band: Optional[dict] = None,
+    session_total: float = 0,
 ) -> str:
     """Heuristic session classification anchored to the Bakken framework.
 
     Returns 'easy' | 'sub-threshold' | 'at-threshold' | 'vo2'.
 
-    Uses both drag AVG (Bakken-discipline signal) AND drag MAX (true
-    within-rep intensity). Drag avg alone hides VO2-style sessions where
-    each rep spikes briefly into Z5 — the time at Z5 is short, but the
-    stimulus IS top-end. Drag max captures that.
+    Intensity verdicts are anchored to the profile's bpm anchors
+    (sub-threshold band / hard cap / LT2 via _parse_intensity_anchors),
+    NOT zone boundaries — Z4 straddles the hard cap, so zone shares
+    cannot separate at-cap sub-threshold work from over-threshold work.
+    When stream-sliced work time is available it outranks momentary
+    peaks: a couple of HR samples brushing LT2 in a hill do not make a
+    threshold session — sustained SECONDS at/above LT2 do.
 
     Decision order:
     1. Z5 share >= 5% → 'vo2' (sustained top-end work).
     2. Drag count >= 3 and >= 50% of drags peak in Z5 → 'vo2' (short-rep
        VO2 style where peaks are brief but cover most reps).
-    3. Drag count >= 3 and >= 50% of drags peak >= LT2 → 'at-threshold'
-       (reps consistently broke into Z4 by the end — beyond Bakken
-       sub-threshold discipline).
-    4. Drags exist and median drag avg HR > hard_cap (≈ LT2-4) →
-       'at-threshold' (drag avg itself crossed Bakken's hard cap).
-    5. Drags exist and median drag avg in Z3+ → 'sub-threshold'.
-    6. No drag signal, but Z4 share >= 25% → 'at-threshold' (continuous
-       tempo-style session without distinct rep structure).
-    7. No drag signal, Z3 share >= 10% → 'sub-threshold'.
-    8. Else → 'easy'.
+    3. SHORT reps only (median drag < 180 s, where HR lag drags both the
+       averages and time-in-band down): drag count >= 3 and >= 50% of
+       drags peak >= LT2 → 'at-threshold'. On long reps a momentary peak
+       at LT2 is normal HR behavior (hills, rep endings) and does NOT
+       reclassify — the stream-time rule below judges those.
+    4. Stream-sliced work time (when work_summary has band_secs and
+       work >= 300 s — a lone stride must not classify a session): time
+       at/above LT2 >= max(120 s, 10% of work) OR time above the hard
+       cap >= 40% of work → 'at-threshold'. Minutes at LT2 = threshold
+       work; isolated peak-seconds stay sub-threshold.
+    5. Drags exist and median drag avg HR > hard cap → 'at-threshold'.
+    6. Drags exist and median drag avg >= sub-band low (≈ Z3 low) →
+       'sub-threshold'.
+    7. No drag signal, stream band data available: LT2 time >= 15% or
+       over-cap time >= 25% → 'at-threshold'; in-band time >= 10% or Z3
+       share >= 10% → 'sub-threshold'; else 'easy'.
+    8. No drag signal, no stream: Z4 share >= 25% → 'at-threshold';
+       Z3 share >= 10% → 'sub-threshold'.
+    9. Else → 'easy'.
 
     The 50% drag-max thresholds require >= 3 drags to be meaningful;
-    sessions with only 1-2 drags fall through to the avg-based rules.
+    sessions with only 1-2 drags fall through to the time/avg rules.
     """
     z3 = zone_pcts.get("Z3", 0)
     z4 = zone_pcts.get("Z4", 0)
@@ -1982,21 +2091,35 @@ def _session_category(
         return "vo2"
 
     z3_low = zones[2][0] if len(zones) >= 3 else 178
-    z4_low = zones[3][0] if len(zones) >= 4 else 188
     z5_low = zones[4][0] if len(zones) >= 5 else 198
-    hard_cap = z4_low + 2  # Bakken's documented hard cap ≈ LT2 - 4
-    lt2_est = z4_low + 6   # LT2 ≈ Z4 midpoint for typical user zones
+    anchors = anchors or _parse_intensity_anchors(zones)
+    hard_cap = anchors["hard_cap"]
+    lt2 = anchors["lt2_hr"]
+    band_low = anchors["sub_band_low"]
 
     avgs = [lap["average_heartrate"] for lap in drag_laps if lap.get("average_heartrate") is not None]
     maxes = [lap["max_heartrate"] for lap in drag_laps if lap.get("max_heartrate") is not None]
+    durations = [lap.get("elapsed_time") or 0 for lap in drag_laps]
+    median_dur = sorted(durations)[len(durations) // 2] if durations else 0
 
     # Within-rep peak signals (need >= 3 drags for the share to be meaningful).
     if len(maxes) >= 3:
         peaks_in_z5 = sum(1 for m in maxes if m >= z5_low)
         if peaks_in_z5 / len(maxes) >= 0.5:
             return "vo2"
-        peaks_at_lt2 = sum(1 for m in maxes if m >= lt2_est)
-        if peaks_at_lt2 / len(maxes) >= 0.5:
+        if median_dur < 180:
+            peaks_at_lt2 = sum(1 for m in maxes if m >= lt2)
+            if peaks_at_lt2 / len(maxes) >= 0.5:
+                return "at-threshold"
+
+    work_band = (work_summary or {}).get("band_secs") or {}
+    work_total = (work_summary or {}).get("work_total_secs") or 0
+    # Share-based rules need a real work volume — a single sub-minute
+    # surge (a stride) must not classify the whole session.
+    if work_total >= 300:
+        if work_band.get("at_or_above_lt2", 0) >= max(120, 0.10 * work_total):
+            return "at-threshold"
+        if work_band.get("over_cap", 0) >= 0.40 * work_total:
             return "at-threshold"
 
     if avgs:
@@ -2004,10 +2127,20 @@ def _session_category(
         median_avg = sorted_avgs[len(sorted_avgs) // 2]
         if median_avg > hard_cap:
             return "at-threshold"
-        if median_avg >= z3_low:
+        if median_avg >= min(band_low, z3_low):
             return "sub-threshold"
         # Median drag avg is in Z2 — drags are likely noisy false-positives.
-        # Fall through to aggregate-zone fallback below.
+        # Fall through to aggregate fallback below.
+
+    if session_band is not None and session_total > 0:
+        if (
+            session_band.get("at_or_above_lt2", 0) >= 0.15 * session_total
+            or session_band.get("over_cap", 0) >= 0.25 * session_total
+        ):
+            return "at-threshold"
+        if session_band.get("in_band", 0) >= 0.10 * session_total or z3 >= 10:
+            return "sub-threshold"
+        return "easy"
 
     if z4 >= 25:
         return "at-threshold"
@@ -2117,6 +2250,7 @@ def _interval_analysis(
     times: Optional[list],
     hrs: Optional[list],
     zones: list[tuple[int, int, str]],
+    anchors: Optional[dict] = None,
 ) -> Optional[dict]:
     """Per-rep + work-summary analysis for sessions with work (drag) reps.
 
@@ -2136,9 +2270,15 @@ def _interval_analysis(
     have_stream = (
         activity_start_s is not None and times is not None and hrs is not None
     )
+    anchors = anchors or _parse_intensity_anchors(zones)
+    band_low = anchors["sub_band_low"]
+    band_high = anchors["sub_band_high"]
+    hard_cap = anchors["hard_cap"]
+    lt2 = anchors["lt2_hr"]
 
     work_reps: list[dict] = []
     work_zone_secs = {z[2]: 0 for z in zones}
+    work_band_secs = {"in_band": 0.0, "over_cap": 0.0, "at_or_above_lt2": 0.0}
 
     for idx, lap in enumerate(drag_laps, start=1):
         avg_speed = lap.get("average_speed") or 0
@@ -2152,6 +2292,7 @@ def _interval_analysis(
             "trimmed_avg_hr": None,
             "drift_bpm": None,
             "zone_secs": None,
+            "band_secs": None,
             "samples_validated": False,
         }
 
@@ -2190,7 +2331,15 @@ def _interval_analysis(
             # not an assumed 1 Hz) so it stays aligned with the validated slice.
             # Accumulated both per-rep (so the over-the-band story is visible
             # rep-by-rep, not just in aggregate) and into the work totals.
+            # band_secs uses the profile's bpm anchors instead of zone
+            # boundaries — Z4 straddles the hard cap, so zone_secs alone
+            # can't separate at-cap from over-threshold time. The three
+            # counters are independent flags, NOT a partition: over_cap and
+            # at_or_above_lt2 overlap (LT2 > cap ⇒ LT2 time is also over
+            # cap), and the sliver between band top and cap (e.g. 189-190)
+            # counts in none of them — they don't sum to rep/work time.
             rep_zone_secs = {z[2]: 0 for z in zones}
+            rep_band_secs = {"in_band": 0.0, "over_cap": 0.0, "at_or_above_lt2": 0.0}
             for i in range(len(samples) - 1):
                 dt = samples[i + 1][0] - samples[i][0]
                 if dt <= 0:
@@ -2201,8 +2350,17 @@ def _interval_analysis(
                         rep_zone_secs[zname] += dt
                         work_zone_secs[zname] += dt
                         break
+                if band_high is not None and band_low <= hr <= band_high:
+                    rep_band_secs["in_band"] += dt
+                if hr > hard_cap:
+                    rep_band_secs["over_cap"] += dt
+                if hr >= lt2:
+                    rep_band_secs["at_or_above_lt2"] += dt
             if any(rep_zone_secs.values()):
                 rep["zone_secs"] = {z: round(s) for z, s in rep_zone_secs.items()}
+                rep["band_secs"] = {k: round(s) for k, s in rep_band_secs.items()}
+                for k, s in rep_band_secs.items():
+                    work_band_secs[k] += s
 
         work_reps.append(rep)
 
@@ -2222,26 +2380,44 @@ def _interval_analysis(
         ),
         "how_to_present": {
             "lead_with": (
-                "A per-rep table: pace, avg_hr, peak_hr, and zone_secs (time "
-                "in each zone). Then work_zone_pcts for the overall work "
-                "distribution. Do NOT headline avg_hr / trimmed_avg_hr alone — "
-                "on its own it hides what the reps actually cost."
+                "A per-rep table: pace, avg_hr, peak_hr, and band_secs (time "
+                "in the sub-threshold band / over the hard cap / at-or-above "
+                "LT2). Then work_summary.band_secs for the work-only totals. "
+                "Do NOT headline avg_hr / trimmed_avg_hr alone — on its own "
+                "it hides what the reps actually cost."
+            ),
+            "band_vs_zones": (
+                "Intensity verdicts come from band_secs (bpm-anchored to the "
+                "user's sub-threshold band, hard cap, and LT2 — see "
+                "band_anchors_bpm), NOT from zone_secs: Z4 straddles the hard "
+                "cap, so 'time in Z4' mixes at-cap sub-threshold work with "
+                "over-threshold work and overstates how hard the session was. "
+                "The three band_secs counters are independent flags, not a "
+                "partition — at_or_above_lt2 is a subset of over_cap, time "
+                "between the band top and the cap counts in neither, and "
+                "they do NOT sum to total time. For finer bpm slicing call "
+                "hr_time_in_buckets(scope='work', edges=[...])."
             ),
             "hr_lag_caveat": (
-                "HR lags effort by ~45-60s, so on short reps (<~3 min, e.g. "
+                "HR lags effort by ~45-60s, so on SHORT reps (<~3 min, e.g. "
                 "400m) HR spends the first half climbing through Z1/Z2 and "
                 "often peaks AFTER the rep ends. avg_hr and trimmed_avg_hr are "
-                "therefore dragged DOWN by the climb and systematically "
-                "understate the stimulus. Judge short reps by peak_hr and by "
-                "zone_secs at/above the target band, NOT by the average."
+                "therefore dragged DOWN by the climb and understate the "
+                "stimulus — judge short reps by peak_hr plus band_secs. On "
+                "LONG reps (>~3 min) HR has settled, so avg and band_secs are "
+                "the honest read there."
             ),
             "read_intensity_vs_intent": (
-                "Compare peak_hr and the zone_secs distribution to the user's "
-                "intended band (sub-threshold target = Z3; at/above Z4 = "
-                "over the band). Reps whose peak sits at LT2 / in Z4 were "
-                "effectively threshold, even when the average looks sub-"
-                "threshold. Quantify the over-band time (sum of zone_secs in "
-                "Z4+) — that is the honest measure of how hard it really was."
+                "Judge over-band work by SECONDS, not peaks: "
+                "band_secs.at_or_above_lt2 is threshold time, "
+                "band_secs.over_cap is drift beyond the sub-threshold "
+                "ceiling. A long rep whose peak briefly brushes the cap or "
+                "LT2 (a hill, the rep ending) is normal HR behavior — it "
+                "does NOT make the rep 'effectively threshold' unless "
+                "meaningful time (minutes, not seconds) sits at/above LT2. "
+                "Before reclassifying a sub-threshold session as threshold, "
+                "check work_summary.band_secs and say how many seconds were "
+                "actually over."
             ),
             "fade": (
                 "Use across_rep_drift_bpm (last vs first rep avg) and the "
@@ -2260,6 +2436,20 @@ def _interval_analysis(
             ),
             "work_zone_secs": work_zone_secs,
             "work_zone_pcts": work_zone_pcts,
+            "work_total_secs": round(work_total, 1),
+            "band_anchors_bpm": {
+                "sub_band": (
+                    f"{band_low}-{band_high}" if band_high is not None else f"{band_low}+"
+                ),
+                "hard_cap": hard_cap,
+                "lt2": lt2,
+                "source": anchors["source"],
+            },
+            "band_secs": {k: round(s) for k, s in work_band_secs.items()},
+            "band_pcts": {
+                k: round(100 * s / work_total, 1) if work_total else 0
+                for k, s in work_band_secs.items()
+            },
         },
     }
 
@@ -2417,13 +2607,18 @@ def activity_breakdown(activity_id: int) -> dict:
             ],
         }
 
+    anchors = _parse_intensity_anchors(zones)
     zone_secs = {z[2]: 0 for z in zones}
     below_z1 = 0
+    session_band: Optional[dict] = None
     stream_times: Optional[list[int]] = None
     stream_hrs: Optional[list[int]] = None
     if row["time_json"] and row["hr_json"]:
         stream_times = json.loads(row["time_json"])
         stream_hrs = json.loads(row["hr_json"])
+        session_band = {"in_band": 0.0, "over_cap": 0.0, "at_or_above_lt2": 0.0}
+        band_low = anchors["sub_band_low"]
+        band_high = anchors["sub_band_high"]
         for i in range(len(stream_times) - 1):
             dt = stream_times[i + 1] - stream_times[i]
             hr = stream_hrs[i]
@@ -2435,6 +2630,12 @@ def activity_breakdown(activity_id: int) -> dict:
                     break
             if not placed:
                 below_z1 += dt
+            if band_high is not None and band_low <= hr <= band_high:
+                session_band["in_band"] += dt
+            if hr > anchors["hard_cap"]:
+                session_band["over_cap"] += dt
+            if hr >= anchors["lt2_hr"]:
+                session_band["at_or_above_lt2"] += dt
 
     total = sum(zone_secs.values()) + below_z1
     zone_pcts = {z: round(100 * s / total, 1) if total else 0 for z, s in zone_secs.items()}
@@ -2449,15 +2650,25 @@ def activity_breakdown(activity_id: int) -> dict:
     classified = _classify_laps(laps_raw, zones)
     lap_summary = _summarize_laps(classified, None, stream_times, stream_hrs, zones)
     drag_laps = [lap for lap in classified if lap.get("lap_type") == "drag"]
-    session_category = _session_category(zone_pcts, drag_laps, zones)
 
     # Interval-aware per-rep analysis (timestamp-sliced) — added only when the
-    # session has real work reps. Existing fields above are unchanged.
+    # session has real work reps. Runs before classification so the category
+    # can be judged on stream-sliced work seconds, not momentary lap peaks.
     activity_start_s = _activity_start_epoch(laps_raw) if laps_raw else None
     interval_analysis = _interval_analysis(
-        classified, activity_start_s, stream_times, stream_hrs, zones
+        classified, activity_start_s, stream_times, stream_hrs, zones, anchors
+    )
+    session_category = _session_category(
+        zone_pcts,
+        drag_laps,
+        zones,
+        anchors=anchors,
+        work_summary=interval_analysis["work_summary"] if interval_analysis else None,
+        session_band=session_band,
+        session_total=total,
     )
 
+    hint = name_hint(row["name"], row["sport_type"])
     result = {
         "id": row["id"],
         "date": row["start_date_local"][:10],
@@ -2469,16 +2680,48 @@ def activity_breakdown(activity_id: int) -> dict:
         "moving_time_s": row["moving_time_s"],
         "avg_hr": row["avg_hr"],
         "max_hr": row["max_hr"],
-        "classification_hint": name_hint(row["name"], row["sport_type"]),
+        "classification_hint": hint,
         "session_category": session_category,
         "zone_secs": zone_secs,
         "zone_pcts": zone_pcts,
+        "band_anchors_bpm": {
+            "sub_band": (
+                f"{anchors['sub_band_low']}-{anchors['sub_band_high']}"
+                if anchors["sub_band_high"] is not None
+                else f"{anchors['sub_band_low']}+"
+            ),
+            "hard_cap": anchors["hard_cap"],
+            "lt2": anchors["lt2_hr"],
+            "source": anchors["source"],
+        },
+        "band_secs": (
+            {k: round(s) for k, s in session_band.items()}
+            if session_band is not None
+            else None
+        ),
         "below_z1_secs": below_z1,
         "laps": lap_summary,
         "lap_count": len(lap_summary),
         "has_stream_data": row["time_json"] is not None,
         "lap_fetch_error": lap_fetch_error,
     }
+    # Race detection: name patterns rarely help (Garmin default-names races
+    # "Bærum Løping"), so also flag on effort — >=15 min at/above LT2 does
+    # not occur in any Bakken-framework training session, only in races/TTs.
+    race_effort = (
+        session_band is not None
+        and session_band.get("at_or_above_lt2", 0) >= 900
+    )
+    if hint == "race" or race_effort:
+        result["race_note"] = (
+            "This is a RACE (or race-level effort: sustained time at/above "
+            "LT2 that no planned session in this framework contains). "
+            "session_category describes physiological load — a race reading "
+            "'vo2' or 'at-threshold' is expected and correct, NOT an "
+            "unplanned hard training session or a zone violation. Races "
+            "<~60 min run at/above LT2 by design; do not use race avg HR to "
+            "recalibrate the user's zones or LT2."
+        )
     if interval_analysis is not None:
         result["zone_note"] = (
             "This is an interval session — whole-session zone_secs / zone_pcts "

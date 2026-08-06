@@ -252,25 +252,39 @@ def activity_breakdown(activity_id: int) -> dict:
       drags), "wu" (warmup before first drag), "cd" (cooldown after
       last drag), or "easy" (continuous easy run, no drags found).
     - `zone_secs` + `zone_pcts`: time in each HR zone (Z1-Z5).
+    - `band_anchors_bpm` + `band_secs`: session time measured against the
+      user's bpm anchors — inside the sub-threshold band, above the hard
+      cap, and at/above LT2. **These, not Z1-Z5 shares, are the intensity
+      verdict**: Z4 straddles the hard cap, so "time in Z4" mixes at-cap
+      sub-threshold work with over-threshold work. Note the three
+      counters are independent flags, not a partition: `at_or_above_lt2`
+      ⊂ `over_cap`, time between the band top and the cap counts in
+      neither, and they don't sum to the total.
     - `session_category`: heuristic "easy" | "sub-threshold" |
-      "at-threshold" | "vo2" — useful for compliance scoring against
-      the plan. Refine ambiguous edges via coach://classification.
+      "at-threshold" | "vo2" — judged on stream-sliced SECONDS at/above
+      LT2 and over the cap, not momentary peaks. Useful for compliance
+      scoring; refine ambiguous edges via coach://classification.
     - `classification_hint`: name-pattern hint (deterministic 90% case).
+    - `race_note` (present when the name or the effort — >=15 min at/above
+      LT2 — marks a race): read it and follow it. A race categorized "vo2"
+      / "at-threshold" is expected load, not a training-zone violation,
+      and race HR must not be used to recalibrate zones or LT2.
     - `interval_analysis` (present only for sessions with work reps):
-      `work_reps` (per rep: pace, avg_hr, **peak_hr**, trimmed_avg_hr,
-      drift_bpm, and **zone_secs** = time in each HR zone), a
-      `work_summary` (work-only zone distribution + across-rep drift),
-      and a `how_to_present` block.
+      `work_reps` (per rep: pace, avg_hr, peak_hr, trimmed_avg_hr,
+      drift_bpm, `zone_secs`, and **`band_secs`** = seconds in-band /
+      over-cap / at-or-above-LT2), a `work_summary` (work-only zone +
+      band distribution, across-rep drift), and a `how_to_present` block.
 
     HOW TO ANALYZE AN INTERVAL SESSION (read `how_to_present` in the
     payload and follow it): lead with a per-rep table of pace / avg_hr /
-    **peak_hr** / **zone_secs**, then the work-only zone distribution.
-    Do NOT headline avg_hr or trimmed_avg_hr — HR lags effort ~45-60s, so
-    on short reps (<~3 min) the average is dragged down by the climb and
-    understates the stimulus. Judge those reps by peak_hr and by time
-    at/above the target band (zone_secs in Z4+). A rep whose peak sits at
-    LT2 / in Z4 was effectively at threshold even if its average looks
-    sub-threshold — surface that, don't bury it under a low average.
+    peak_hr / band_secs, then work_summary.band_secs. Judge intensity by
+    SECONDS at/above LT2 and over the cap — a long rep whose peak briefly
+    brushes LT2 (a hill, the rep ending) is normal HR behavior, NOT a
+    threshold rep. Only short reps (<~3 min) are judged by peak_hr, since
+    HR lag (~45-60s) drags their averages and time-in-band down. Before
+    calling a sub-threshold session "at threshold", state how many
+    seconds actually sat at/above LT2; for finer bpm slicing use
+    `hr_time_in_buckets(scope="work", edges=[...])`.
 
     The activity must be in the local cache. If `error` is
     returned with `next_steps`, call `sync_activities()` (or
@@ -315,6 +329,85 @@ def hr_time_in_buckets(
     much time was spent above the intended ceiling.
     """
     return garmin_sync.hr_time_in_buckets(activity_id, edges=edges, scope=scope)
+
+
+@mcp.tool()
+def update_activity(
+    activity_id: int,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict:
+    """Edit a completed activity's title and/or description on Garmin Connect.
+
+    This is the write path back onto a finished activity. Use it to pin
+    session context where every later reader will find it — treadmill +
+    heat ("varmt/fuktig, lav band-% delvis termisk"), illness, terrain,
+    why a session was cut short, RPE notes. `weekly_retrospective` and
+    `activity_breakdown` read the cached description, so a note saved
+    here survives across sessions without relying on chat memory.
+
+    Both fields optional; pass at least one. The change is written to
+    Garmin Connect AND to the local cache row in the same call — no
+    resync needed, later tool calls see it immediately.
+
+    ⚠ `description` REPLACES the existing text. To append, take the
+    current text from the returned `old` value (or activity_breakdown)
+    and include it in the new string.
+
+    Args:
+        activity_id: Garmin activity id (must be in the local cache —
+            run sync_activities() first if missing).
+        name: New activity title, or None to leave unchanged.
+        description: New description/notes, or None to leave unchanged.
+
+    Returns: id plus per-field {old, new} for what changed.
+    """
+    import sqlite3
+
+    if name is None and description is None:
+        return {"error": "Pass at least one of `name` or `description`."}
+
+    garmin_sync._init_db()
+    with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, name, description FROM activities WHERE id = ?",
+            (activity_id,),
+        ).fetchone()
+    if not row:
+        return {
+            "error": f"Activity {activity_id} not in local cache.",
+            "next_steps": ["Run sync_activities() to pull recent activities."],
+        }
+
+    # Garmin's activity endpoint accepts a partial PUT — same pattern the
+    # garminconnect library uses for set_activity_name.
+    payload: dict = {"activityId": activity_id}
+    if name is not None:
+        payload["activityName"] = name
+    if description is not None:
+        payload["description"] = description
+    g = _client()
+    url = f"{g.garmin_connect_activity}/{activity_id}"
+    g.client.put("connectapi", url, json=payload, api=True)
+
+    sets, params = [], []
+    if name is not None:
+        sets.append("name = ?")
+        params.append(name)
+    if description is not None:
+        sets.append("description = ?")
+        params.append(description)
+    params.append(activity_id)
+    with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        conn.execute(f"UPDATE activities SET {', '.join(sets)} WHERE id = ?", params)
+
+    result: dict = {"id": activity_id, "updated": {}}
+    if name is not None:
+        result["updated"]["name"] = {"old": row["name"], "new": name}
+    if description is not None:
+        result["updated"]["description"] = {"old": row["description"], "new": description}
+    return result
 
 
 @mcp.tool()
@@ -814,12 +907,16 @@ def weekly_retrospective(
       inclusive `start_date`..`end_date` range. The response carries
       `weeks` (a list of per-week entries) over that span.
 
-    Each week entry covers one Monday-Sunday week and contains total
-    distance, run count, time in each HR zone (computed from raw streams
-    using current bpm boundaries from `get_athlete_profile` /
-    coach://user_profile — NOT the local cache zones), and the list of
-    activities with names, descriptions, distance, HR, and a
-    `classification_hint` derived from naming patterns.
+    Each week entry covers one Monday-Sunday week. **Volume fields are
+    split by sport and must be reported separately**: `run_distance_m` /
+    `run_moving_time_s` / `run_session_count` cover RUNNING ONLY, while
+    `cross_distance_m` / `cross_moving_time_s` / `cross_session_count`
+    cover everything else (ski, bike, ...). Never add them into one
+    combined "total km". `zone_secs` and the `activities` list span ALL
+    sports (zone time computed from raw streams using current bpm
+    boundaries from `get_athlete_profile` / coach://user_profile — NOT
+    the local cache zones). Activities carry names, descriptions,
+    distance, HR, and a `classification_hint` from naming patterns.
 
     The `coverage` field reports cache extent and a `gap_warning` flag
     when the requested range extends before the oldest cached activity —
