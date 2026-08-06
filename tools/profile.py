@@ -444,9 +444,11 @@ def init_user_profile(
         "## Quality session HR targets",
         "",
         "### Easy / aerobic base",
-        "- Aim for average HR in Z1 / low-mid Z2.",
-        f"- **Hard cap: {easy_cap} bpm** "
-        f"({'LT1 from test' if lt1_hr else '~84% max HR estimate'}).",
+        f"- Aim: the whole run below ~70% of max HR (≈ {round(max_hr * 0.70)} bpm) — "
+        "Bakken's rule is universal, 'uansett nivå'.",
+        f"- **Absolute ceiling: {easy_cap} bpm** "
+        f"({'LT1 from test' if lt1_hr else '~84% max HR estimate'}); above this is "
+        "unambiguously gray zone.",
         "",
         "### Threshold reps (Bakken sub-threshold)",
         "",

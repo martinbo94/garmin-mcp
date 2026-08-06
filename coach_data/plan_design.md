@@ -65,24 +65,26 @@ chapter 7 prescription:
 | Z5 (high intensity) | 5-10% | ~20-30 min |
 
 These are the target bands when planning a week and when reviewing
-compliance after.
+compliance after. (Z3-Z4 is a weekly-time accounting bucket; the session
+HR target itself is the 178-188 band, not all of Z4.)
 
 ## Reference 5-hour week (Bakken's chapter 7 layout)
 
 | Day | Session | Notes |
 |---|---|---|
 | Mon | **Rest** | Full recovery from weekend |
-| Tue | **Threshold "støtte"** | 6×6 min, or 10-12×3 min with 1 min jog. Long-rep sub-threshold. |
-| Wed | Easy 40-60 min | *"Så slakk at den nesten føles feil."* Hard cap at LT1. |
-| Thu | **Threshold "hoved"** | 3-4×10 min, or another long-rep variation. The most balanced session of the week. |
-| Fri | **Rest** or short easy | Strategic rest. Skip if 4 rest days/week feels excessive. |
-| Sat | **X-økt (flex slot)** | Varies — see below. NOT a fixed third threshold. |
+| Tue | **Threshold "støtte"** | 6×6 min, or 10-12×3 min with 1 min jog. Medium-length reps — the support session. |
+| Wed | Easy 40-60 min | *"Så sakte at det nesten føles feil."* Talk effortlessly. |
+| Thu | **Threshold "hoved"** | 3-4×10 min, or a long varying-tempo session. One of the **most taxing** sessions of the week ("en av de mest belastende") — max once per week. |
+| Fri | **Rest** or short easy | Strategic rest. Book caveat: some respond poorly to a fully free day before Saturday quality — rotate if so. |
+| Sat | **X-økt (flex slot)** | Varies — see below. Not a *fixed* third threshold, but a third threshold session is a book-sanctioned option for the slot. |
 | Sun | **Long easy** | 60-120 min, distance-specific to goal race. |
 
 Two threshold + one flex + one long + two rest + one easy.
 
-Strength training is a separate add-on, ideally Mon/Wed/Fri or other
-non-threshold day.
+Strength training goes on or after quality days (or the Mon rest day at
+low load) — the book shields easy days completely ("rolig løping …
+ingenting annet").
 
 ## Pause conventions
 
@@ -92,9 +94,10 @@ Bakken's defaults:
 - **15-30 sec** (45/15, 30/30 etc.) — standing or very slow jog both fine.
 - **45-90 sec** — slow jog. Default for 200 m – 1 km repeats and 4-6 min
   threshold reps.
-- **2-3 min** — walk or very easy jog ("lett gå pause"). For longer reps
-  (8-10 min) or when reps are at the harder end of the band.
-- **3-5 min between BLOCKS** of intervals — walking + breathing reset.
+- **90 sec - 2 min** — walk or very easy jog ("lett gå pause"). For the
+  longest reps: the book gives 10+ min intervals **1:30-2 min** pause
+  (4×10 min with 90 sec). Don't over-rest long reps.
+- **~3 min between BLOCKS** of intervals — walking + breathing reset.
 
 Shorter pauses at the same rep design = more sustained accumulation
 (tempo-like). Longer pauses = more "drypp" effect (sharper individual
@@ -108,14 +111,21 @@ The X-økt is the **single most important variation lever** in this
 structure. Rotate the content across weeks to keep adaptation moving
 without escalating the other days:
 
-- **45/15 short-rep work** — 15-30 reps at sub-threshold pace
-- **Hills** — 8-12 × 200-400 m hill repeats, controlled effort
-- **Smart Strides** — 5-6 × 100 m strides slightly above threshold after
-  a short main set
+- **Progressive 45/15** — 15-20 reps, progressive effort from 10 km
+  toward 5 km pace (the X-økt form runs *over* threshold; the
+  sub-threshold 45/15 is a threshold-session use, not an X-økt)
+- **Hills** — 8-15 × ~200 m hill repeats, intensity well over threshold;
+  optionally periodized over 6-8 weeks (60-100 m → 200 m → 600-800 m)
 - **Race-specific work** — closer to race day. 6×1k at goal pace, mile
   reps, race-pace progressions
-- **Long marathon-pace block** — for HM/marathon goals, 10-15 km steady
-  at goal pace (one of the few cases where continuous tempo beats intervals)
+- **Test race / testløp** — part of the book's rotation
+- **A third threshold session** — book-sanctioned alternative for the slot
+- **Marathon-specific progressive run** — for HM/marathon goals: 16-20 km
+  progressive with *varying* tempo around threshold (build from below
+  threshold toward it; brief stretches just over, "pauses" run just
+  under). One of the few cases where continuous work beats intervals —
+  but NEVER a steady goal-pace grind: 10-15 km steady at HM pace is ~an
+  hour at-threshold and breaks the framework.
 - **Easy or skipped** — deload weeks, or when recovery is marginal
 
 A pattern that works for a 12-week block: rotate through 45/15, hills,
@@ -126,13 +136,18 @@ race-specific, deload-easy → repeats.
 When the current week's load feels too easy, options (in roughly
 ascending complexity):
 
-1. **Ren volumøkning** — increase easy mileage. Add 10-15 min to easy
-   runs or extend long run. Cheapest progression, least disruptive.
+1. **Ren volumøkning** — increase easy mileage, in the book's priority
+   order: (a) MORE easy sessions, (b) lengthen existing easy runs,
+   (c) longer warmup/cooldown around quality. Cheapest progression,
+   least disruptive.
 2. **Lengre terskeløkter** — extend threshold session length. Progression:
    4×6 → 5×6 → 6×6 → 4×8 → 5×8 → 6×8. Same HR target, more total
-   work-time per session.
-3. **Spesialvarianter (X-økt)** — make the X-økt harder (longer 45/15,
-   race-specific pace work, hill volume).
+   work-time per session. With repeated green readiness signals: add
+   extra reps — never intensity.
+3. **Spesialvarianter** — the book's list: kombinasjonsøkter (easy run
+   straight into 45/15), steg-intervaller, active pauses, blandingsøkter
+   — "kjent territorium koblet sammen". NOT "make the X-økt harder":
+   added intensity is explicitly excluded as a load-increase lever.
 4. **Forsiktig dobbel terskel** — light double-threshold day. ONLY if
    the gatekeeping criteria in `coach://training_philosophy` are met.
    Not default.
@@ -159,8 +174,8 @@ prescriptions (scale rep counts down for amateur volume):
 |---|---|---|
 | **5 km** | Hill repeats (8-10 × 60-75 sec) or 30/30 blocks | Speed/strength bias; the fast end matters |
 | **10 km** | Threshold variation (2-3 × progressive 10 min) + 6-8 × 30/30 | Mixed: sustained threshold + short overspeed |
-| **Half marathon** | 3 × 12-15 min sub-threshold + 120 min long easy | Endurance-biased threshold accumulation |
-| **Marathon** | "Hovedøkter": 4 × 10 min sub-threshold + 120 min long easy | Long sub-threshold work, no overspeed |
+| **Half marathon** | 3 × 12-15 min sub-threshold, **or** 40-60 min continuous threshold in varying tempo | Endurance-biased threshold accumulation. The Sunday long run grows separately — it is not part of the X-økt. |
+| **Marathon** | Progressive "maratonspesifikke" runs (16-20 km total, varying tempo around threshold), or kombinasjonsløp: 1-2 h easy (<70% max HR) finishing directly into 10-15 × 45/15 at threshold intensity — **always followed by a fully easy day** | Long sub-threshold work, no overspeed. Continuous variable-tempo variants take over as main focus in the marathon-specific weeks. |
 
 The pattern: shorter races bias toward overspeed and hills; longer
 races bias toward longer sub-threshold reps and aerobic capacity. The
@@ -170,16 +185,16 @@ distance-tunes the block.
 ## 5 km race-prep X-økt progression (7-week build)
 
 Bakken's specific Saturday progression for the 7 weeks leading into a
-5 km race. Scale rep counts down for amateur volume; intensities and
-intervals as written:
+5 km race. Scale rep counts down for amateur volume. (Source page was
+OCR'd from a skewed photo — treat exact numbers as approximate.)
 
 | Weeks before race | X-økt |
 |---|---|
 | 7 weeks out | 8-12 × 200-300 m @ 3-5 km pace, 45-60 sec rest |
 | 6 weeks out | 6-10 × 400 m @ 3-5 km pace, ~90 sec rest |
 | 5 weeks out | 4-6 × 800 m @ 3-5 km pace, 2-3 min rest |
-| 2-4 weeks out | **4-8 × 1000 m @ 3-5 km pace, 2-3 min rest** (the keystone session) — optionally finish with 3-5 × 300 m controlled overspeed |
-| 1 week out | Reduce: shorter intervals 200-300 m at race pace, 5-7 reps |
+| 2-4 weeks out | **4-6 × 1000 m @ 3-5 km pace, ~3 min rest** (the keystone session) |
+| 1 week out | Reduce: fewer 1000 m reps, or return to shorter intervals (200-300 m) |
 | Race week | Light shake-out + race day |
 
 For 10 km, halve the weekly progression intensity and keep more
@@ -196,8 +211,8 @@ across ~14 weeks:
 | **1. 5/10 km focus** | 1-3 | Sharpen the fast end first. Short reps, hills, threshold. |
 | **2. HM focus** | 4-7 | Shift toward sustained threshold (5×8 min, 3-4×10 min) + longer continuous tempo. Build long run. |
 | **3. Marathon-specific** | 8-11 | 4-10 min sub-threshold reps, **long runs include marathon-pace blocks**, weekly long stretches toward 30+ km. |
-| **4. Taper** | 12-13 | Volume drops 25-40%. Intensity preserved with short sharp sessions (e.g. 20 × 1 min). |
-| **5. Recovery (post-race)** | After race | 2-3 weeks pure easy / no quality. Hard reset. |
+| **4. Taper** | 12-13 | Volume, session count and length come down; muscles still get stimuli via **very light** short-interval sessions (e.g. 20 × 1 min, "svært lette"). Everything points at the race. |
+| **5. Recovery (post-race)** | After race | 2-3 weeks: rest + easy runs **plus short light intervals with short rests** to restart the body ("for raskt å få kroppen i gang igjen") — not strictly zero quality. |
 
 Note: chapter 8 details this for high-volume runners (6-8+ h/week). At
 amateur volume, compress the phases and skip the late-cycle marathon-pace
@@ -283,43 +298,60 @@ Key rules:
 - **Build over 4-6 weeks max**; longer adds injury risk faster than
   fitness.
 
-Most amateurs at 40-60 km/week shouldn't do this — the base is too low
-for the additional load to be productive. Worth considering when weekly
-volume is already sustained at 60+ km and you want to break through.
+House caution (not a book gate — the book presents top-up weeks for its
+4-6 h/week audience without a volume floor): at low absolute volume the
+same stimulus is available more safely via the four load-increase
+alternatives above; consider a dedicated top-up block mainly when volume
+is already sustained and you want a distinct overload phase, and end it
+~4 weeks before a race.
 
 ## Periodization staircase (multi-block career arc)
 
 Beyond a single 12-week block, Bakken describes a multi-block
 progression for runners who stick with the method over months/years:
 
-1. **First 3-4 months:** Flat structure with sub-threshold work.
+1. **First 4-8 months:** Flat structure with sub-threshold work.
    Normalize the musculature to the Golden Zone, build base.
 2. **Next phase:** Introduce 45/15 and 5-7 min threshold progressions
    alongside the standard long-rep work.
 3. **Then:** Systematic block periodization with full sub-threshold
    variation across rep designs.
-4. **Eventually:** Add double-threshold experiments if criteria met.
+4. **Eventually:** Choose the periodization model that keeps YOU
+   injury-free and progressing — flat, blocks, or progressive X-økt.
+   (Double-threshold experiments are a separate track with their own
+   gates; see `coach://training_philosophy`.)
 
 This applies once you've done several singles-method blocks
 successfully. For a first Bakken-style block, **stay in step 1**.
 
 ## When periodization fails
 
-Bakken's personal anecdote (VM 2002): over-did threshold across a block,
-arrived at race week tired with stale HR and lactate response. Recovery
-took **5 full days of pure rolig running** (no quality) before signs
-returned to normal.
+Bakken's personal anecdote (between Bislett Games and the World
+Championships): mid-competition-season, his threshold *speed started
+falling*. The cause was NOT threshold work — *"Jeg hadde trent for mange
+intensive intervaller for tett"* and *"Problemet var ikke
+terskeltreningen i seg selv — det var at jeg hadde forlatt den for
+tidlig og for brått da konkurransesesongen startet."* The emergency fix
+was a 5-day altitude stay at Galdhøpiggen; the lesson is **gradual
+transitions between phases** and, when form stalls, returning TOWARD the
+threshold base — more threshold, more easy — not adding more hard
+sessions. ("Mange kjenner at formen stagnerer rett over en formtopp, og
+svarer med å legge inn flere harde økter, mer belastning, mer nytt" —
+that response is the mistake.)
 
-Signals that a block has overshot:
+Signals that a block has overshot (house list, aligned with the book's
+warning chapter):
 - Resting HR elevated 5+ bpm above baseline for multiple days
 - Pace at same HR slower than 2 weeks prior (despite no apparent reason)
 - Persistent leg heaviness that doesn't resolve in a single rest day
-- Lactate-equivalent feel: threshold session HR climbs unusually fast
+- Threshold-session HR climbs unusually fast for the pace
 - Sleep quality degraded
 
-Recovery move: **drop all quality for 4-7 days**, keep only easy
-mileage. This isn't a "lighter week" — it's a reset. Resume at a
-slightly lower starting point than where the block was when it broke.
+Recovery move: cut the *intensive* work first and fall back to easy
+running plus, once freshness returns, controlled sub-threshold — the
+framework's base is the recovery vehicle, not the thing to remove.
+A few fully easy days (~5) may be needed before signs normalize; resume
+at a slightly lower starting point than where the block broke.
 
 ## Drafting the plan — practical checklist
 
