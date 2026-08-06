@@ -2,6 +2,7 @@
 from datetime import date
 from typing import Optional
 
+import garmin_sync
 from core import EndCondition, IntervalSet, Step, _client, mcp
 
 
@@ -104,11 +105,35 @@ def _wrap_workout(name: str, all_steps: list, description: Optional[str]) -> dic
     return workout
 
 
+def _register_created_workout(workout_id: int, name: str) -> None:
+    """Record an MCP-created workout id in the local registry.
+
+    Garmin's API exposes nothing that distinguishes templates created
+    programmatically from ones the user made by hand in the app, so we
+    keep our own ledger. cleanup_workout_templates only ever deletes
+    ids found here — the user's hand-made templates (e.g. generic
+    "5x5") are structurally protected.
+    """
+    import sqlite3
+
+    with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS created_workouts ("
+            "workout_id INTEGER PRIMARY KEY, name TEXT, "
+            "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO created_workouts (workout_id, name) VALUES (?, ?)",
+            (workout_id, name),
+        )
+
+
 def _upload(workout: dict) -> int:
     result = _client().upload_workout(workout)
     workout_id = result.get("workoutId") if isinstance(result, dict) else None
     if not workout_id:
         raise RuntimeError(f"Upload returned no workout_id: {result!r}")
+    _register_created_workout(int(workout_id), workout.get("workoutName") or "")
     return int(workout_id)
 
 
@@ -207,4 +232,114 @@ def delete_workout_template(workout_id: int) -> str:
     """Delete a workout template entirely (also unschedules it from all dates)."""
     _client().delete_workout(workout_id)
     return f"Deleted workout {workout_id}."
+
+
+@mcp.tool()
+def cleanup_workout_templates(dry_run: bool = True) -> dict:
+    """Delete Garmin Connect workout templates that no FUTURE scheduled
+    workout references — completed sessions' templates, old blocks,
+    one-offs.
+
+    Why this matters: the watch only holds ~25 structured workouts. Stale
+    templates crowd out upcoming sessions, so today's scheduled økt can
+    silently fail to appear on the watch. Run this as part of the weekly
+    review to keep the Connect list lean.
+
+    ⚠ PROCESS (encoded from user feedback): ALWAYS run with
+    dry_run=True first, show the user the itemized `would_delete` list
+    (names, grouped), and only re-run with dry_run=False after they have
+    confirmed the actual items — approval of a count is not approval of
+    the contents.
+
+    Safety:
+    - Anything scheduled from today onward is never touched.
+    - Only templates in the local `created_workouts` registry (ids this
+      MCP created itself) are ever deleted — Garmin's API cannot
+      distinguish hand-made from programmatic templates, so the user's
+      own templates (e.g. generic "5x5") come back as
+      `unmanaged_skipped` and are left alone.
+    - Completed *activities* are separate objects and are unaffected.
+    Note: deletion in Connect does NOT clean the on-watch Treningsøkter
+    list — orphaned entries on the device persist until a Garmin
+    Express/USB sync or manual deletion on the watch.
+
+    Args:
+        dry_run: True (default) = report only; False = actually delete.
+
+    Returns: total, keeping, `unmanaged_skipped`, and
+    `would_delete`/`deleted` + `failed` lists of {workout_id, name,
+    created}.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    from tools.scheduling import list_scheduled_workouts as _lsw
+
+    g = _client()
+    all_w: list[dict] = []
+    start = 0
+    while True:
+        batch = g.get_workouts(start, 100) or []
+        all_w.extend(batch)
+        if len(batch) < 100:
+            break
+        start += 100
+
+    today = _date.today()
+    horizon = today + _td(days=730)
+    future = _lsw(today.isoformat(), horizon.isoformat())
+    fut_ids = {w["workout_id"] for w in future}
+
+    import sqlite3 as _sqlite3
+
+    with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        try:
+            registry = {
+                r[0] for r in conn.execute("SELECT workout_id FROM created_workouts")
+            }
+        except _sqlite3.OperationalError:
+            registry = set()
+
+    seen: set = set()
+    candidates = [
+        {
+            "workout_id": w["workoutId"],
+            "name": w.get("workoutName"),
+            "created": (w.get("createdDate") or "")[:10],
+        }
+        for w in all_w
+        if w["workoutId"] not in fut_ids
+        and not (w["workoutId"] in seen or seen.add(w["workoutId"]))
+    ]
+    stale = [c for c in candidates if c["workout_id"] in registry]
+    unmanaged = [c for c in candidates if c["workout_id"] not in registry]
+
+    result: dict = {
+        "total_templates": len(all_w),
+        "keeping_future_scheduled": len(all_w) - len(candidates),
+        "unmanaged_skipped": unmanaged,
+        "dry_run": dry_run,
+    }
+    if dry_run:
+        result["would_delete"] = stale
+        result["next_step"] = (
+            "Show the user this list grouped by `created`; re-run with "
+            "dry_run=False only after they confirm the items."
+        )
+        return result
+
+    deleted, failed = [], []
+    for w in stale:
+        try:
+            g.delete_workout(w["workout_id"])
+            deleted.append(w)
+        except Exception as e:
+            failed.append({**w, "error": f"{type(e).__name__}: {e}"})
+    result["deleted"] = deleted
+    result["failed"] = failed
+    result["watch_note"] = (
+        "Connect is clean, but the watch's own Treningsøkter list keeps "
+        "orphaned entries until a Garmin Express/USB sync or manual "
+        "on-device deletion."
+    )
+    return result
 
