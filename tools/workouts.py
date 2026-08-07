@@ -245,11 +245,10 @@ def cleanup_workout_templates(dry_run: bool = True) -> dict:
     silently fail to appear on the watch. Run this as part of the weekly
     review to keep the Connect list lean.
 
-    ⚠ PROCESS (encoded from user feedback): ALWAYS run with
-    dry_run=True first, show the user the itemized `would_delete` list
-    (names, grouped), and only re-run with dry_run=False after they have
-    confirmed the actual items — approval of a count is not approval of
-    the contents.
+    ⚠ PROCESS: ALWAYS run with dry_run=True first, show the user the
+    itemized `would_delete` list (names, grouped), and only re-run with
+    dry_run=False after they have confirmed the actual items — approval
+    of a count is not approval of the contents.
 
     Safety:
     - Anything scheduled from today onward is never touched.

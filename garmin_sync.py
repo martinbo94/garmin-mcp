@@ -2706,8 +2706,9 @@ def activity_breakdown(activity_id: int) -> dict:
         "lap_fetch_error": lap_fetch_error,
     }
     # Race detection: name patterns rarely help (Garmin default-names races
-    # "Bærum Løping"), so also flag on effort — >=15 min at/above LT2 does
-    # not occur in any Bakken-framework training session, only in races/TTs.
+    # like any other run, e.g. "<City> Løping"), so also flag on effort —
+    # >=15 min at/above LT2 does not occur in any Bakken-framework training
+    # session, only in races/TTs.
     race_effort = (
         session_band is not None
         and session_band.get("at_or_above_lt2", 0) >= 900

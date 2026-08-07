@@ -193,8 +193,7 @@ Bakken's third "frame" is to vary *inside* the Golden Zone over a block:
   long (8-12 min) reps across weeks so the body sees different stimuli at
   the same HR target.
 - **Intensity micro-variation:** progress sessions across a block from
-  the lower end of the sub-threshold band (~180 bpm) toward the upper
-  end (~188 bpm).
+  the lower end of the sub-threshold band toward the upper end.
 - **Recovery variation:** longer rests (90-120s) for the harder end of
   the band, shorter rests (30-45s) for the easier end or for short reps.
 - **Terrain variation:** track, road, light trail, hill — same HR target,
@@ -333,12 +332,13 @@ prinsippet gjelder uansett nivå. For mange mosjonister betyr det
 5:30-6:30 min/km, kanskje saktere — og det er helt riktig."* The gray
 zone (70-80%) is a bad trade: the effect barely rises, the load does.
 
-- **Aim: the whole run below ~70% of max HR** (Z1 / bottom of Z2 — for
-  this user ≈ 150 bpm). Upward drift on long runs happens; rein it in
-  rather than budgeting for it.
+- **Aim: the whole run below ~70% of max HR** (Z1 / bottom of Z2 — see
+  `coach://user_profile` for the bpm). Upward drift on long runs
+  happens; rein it in rather than budgeting for it.
 - **Absolute ceiling: LT1.** Anything above LT1 is unambiguously gray
-  zone. (Using lab-measured LT1 as the hard ceiling is our lab-anchored
-  adaptation; the book's own stated rule is the stricter 70%.)
+  zone. (Using lab-measured LT1 as the hard ceiling is this framework's
+  lab-anchored adaptation; the book's own stated rule is the stricter
+  70%.)
 - **Purpose:** aerobic base, economy, recovery — not a moderate workout.
 
 See `coach://user_profile` for your easy-cap bpm. The real signal isn't
@@ -392,8 +392,8 @@ is too easy-heavy for this dose. The adjusted distribution:
 | Z5 (true high intensity) | **5-10%** | ~20-30 min |
 
 (Z3-Z4 in this table is a weekly-time *accounting* bucket; the session HR
-target itself is the 178-188 band — the part of Z4 above the 190 hard cap
-is not part of the target.)
+target itself is the profile's sub-threshold band — the part of Z4 above
+the hard cap is not part of the target.)
 
 These are the bands Claude should check against when reviewing weekly
 summaries. They override the looser "Z1-2: 60-80% / Z3-4: 20-35% / Z5:
@@ -471,8 +471,8 @@ amateurs — a double **every other week** is "more than enough" inside
 the 5-hour week, and the entry ladder starts with easy+threshold on the
 same day (morning 2-6 min reps / evening 30 s-1 min reps, the two days
 around it fully easy). High weekly volume (70+ km) and 8-12 weeks of
-consistent sub-threshold singles are OUR advisory context before
-recommending it, not book requirements.
+consistent sub-threshold singles are additional advisory context used
+here, not book requirements.
 
 Preconditions before recommending:
 - The four book criteria above, all true.
@@ -517,9 +517,10 @@ kan gi"*:
 
 **Wearable metrics are corroboration only** (via `morning_check_in`):
 Garmin readiness, HRV, resting-HR trend, sleep, body battery can prompt
-a yellow flag — but the active warm-up test and body feel decide. (For
-this user specifically, HRV/RHR are chronically confounded and weighted
-LOW; see user profile/memory.)
+a yellow flag — but the active warm-up test and body feel decide.
+(Wearable HRV/RHR are easily confounded by fragmented sleep, illness,
+and life stress; any athlete-specific weighting belongs in
+`coach://user_profile`.)
 
 House rule (not book): two consecutive yellow/red days → skip the
 planned quality session; the framework only works if you can repeat
@@ -558,8 +559,8 @@ sessions (shorter reps, less total volume); shorter easy runs at higher
 frequency; more explosive elements (sprint/strength tolerated well);
 progressive threshold sessions that are allowed to finish through the
 threshold; and every 2-3 weeks a week without threshold focus at all.
-(Current user shows no such signs — this section exists so the check is
-made deliberately, not assumed.)
+(This section exists so the check is made deliberately per athlete, not
+assumed.)
 
 ---
 

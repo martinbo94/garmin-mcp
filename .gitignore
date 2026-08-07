@@ -22,3 +22,4 @@ bakken_bok_transcript/
 coach_data/manual_workouts_backup.json
 coach_data/*.bak-*
 consolidate_garmin_templates.py
+coach_data/grade_model.json

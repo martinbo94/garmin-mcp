@@ -363,9 +363,13 @@ new (seconds), 45-60 s for a cold 12-week backfill. `new_activities: 0`
 means "already up to date," not stale — the sync result returns
 `cache_newest_activity` / `cache_newest_wellness` to confirm freshness.
 
-**Zone calibration:** HR zones live in `coach_data/user_profile.md`. When
-Garmin's zones change, update the table verbatim. Zone time is recomputed
-from raw streams on every query, so updates apply retroactively.
+**Zone calibration:** HR zones and intensity anchors (sub-threshold
+band, hard cap, LT2) live in `coach_data/user_profile.md` — every
+intensity judgment in the tools is parsed from there at query time, so
+the framework docs stay generic and your numbers drive everything. When
+Garmin's zones change, update the table verbatim. Zone time is
+recomputed from raw streams on every query, so updates apply
+retroactively.
 
 **Plan persistence:** `coach_data/plan.json` is the source of truth for
 intent. Garmin calendar is operational state. The two can drift if you
@@ -380,17 +384,6 @@ template in Connect does NOT remove it from the watch's local workout
 list (verified on a Forerunner 265 — not even a Garmin Express USB sync
 does); orphaned entries are cosmetic and can be deleted on-device, and
 on-watch deletion never propagates back to Connect.
-
-**How calibrated vs. generic is this?** The *code* is user-agnostic:
-every intensity judgment is anchored to values parsed from your own
-`coach_data/user_profile.md` (gitignored), with zone-based fallbacks.
-The *framework docs* (`training_philosophy.md`, `plan_design.md`) are
-the Bakken method with the author's calibration woven in as a worked
-example — concrete bpm numbers like the 178-188 sub-threshold band are
-the author's, not universal. To use this repo yourself: run the profile
-setup (your numbers land in the gitignored profile and drive all tools
-automatically), and read the framework docs' bpm examples as "replace
-with your own band" — the principles transfer, the numbers don't.
 
 **Local-only:** runs on your machine. Not reachable from Claude on phone
 or web without remote hosting (which is out of scope for this project).

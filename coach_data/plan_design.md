@@ -66,7 +66,7 @@ chapter 7 prescription:
 
 These are the target bands when planning a week and when reviewing
 compliance after. (Z3-Z4 is a weekly-time accounting bucket; the session
-HR target itself is the 178-188 band, not all of Z4.)
+HR target itself is the profile's sub-threshold band, not all of Z4.)
 
 ## Reference 5-hour week (Bakken's chapter 7 layout)
 
@@ -298,7 +298,7 @@ Key rules:
 - **Build over 4-6 weeks max**; longer adds injury risk faster than
   fitness.
 
-House caution (not a book gate — the book presents top-up weeks for its
+Caution — this repo's guidance, not a book gate (the book presents top-up weeks for its
 4-6 h/week audience without a volume floor): at low absolute volume the
 same stimulus is available more safely via the four load-increase
 alternatives above; consider a dedicated top-up block mainly when volume
@@ -339,8 +339,8 @@ sessions. ("Mange kjenner at formen stagnerer rett over en formtopp, og
 svarer med å legge inn flere harde økter, mer belastning, mer nytt" —
 that response is the mistake.)
 
-Signals that a block has overshot (house list, aligned with the book's
-warning chapter):
+Signals that a block has overshot (this repo's checklist, aligned with
+the book's warning chapter):
 - Resting HR elevated 5+ bpm above baseline for multiple days
 - Pace at same HR slower than 2 weeks prior (despite no apparent reason)
 - Persistent leg heaviness that doesn't resolve in a single rest day
