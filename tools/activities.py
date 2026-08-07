@@ -13,6 +13,7 @@ def sync_activities(
     weeks_back: Optional[int] = None,
     backfill_links: bool = False,
     backfill_streams: bool = False,
+    backfill_gear: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
 ) -> dict:
@@ -55,6 +56,9 @@ def sync_activities(
             predates them (one API call each). New activities get these
             automatically; this is only for history. Use after this change
             to enrich existing streams.
+        backfill_gear: If True, fetch the gear (shoe) used for cached
+            activities that never got it (one API call each). New activities
+            get this automatically; this is only for history.
         backfill_max: Max activities to backfill per call (default 100),
             shared by both backfills. The `remaining_*` field in each
             backfill result tells you whether another round is needed.
@@ -78,6 +82,10 @@ def sync_activities(
         )
     if backfill_streams and "error" not in result:
         result["stream_backfill"] = garmin_sync.backfill_streams(
+            _client(), max_activities=backfill_max
+        )
+    if backfill_gear and "error" not in result:
+        result["gear_backfill"] = garmin_sync.backfill_gear(
             _client(), max_activities=backfill_max
         )
     return result
@@ -120,7 +128,8 @@ def list_activities(
     Each activity row: id, date, start_time ('HH:MM'), name, sport_type,
     distance_km, moving_time_s, avg_hr, max_hr, elevation_gain_m,
     pace_per_km ('M:SS'), classification_hint, classification_source,
-    training_effect_label, workout_rpe, workout_feel, workout_compliance.
+    training_effect_label, workout_rpe, workout_feel, workout_compliance,
+    gear_name (the shoe used; null if unassigned or not yet gear-synced).
 
     classification_hint is the planned type from the training plan when
     the activity was run from a materialized workout
@@ -168,7 +177,8 @@ def query_activity_cache(
                  avg_hr, max_hr, total_elevation_gain, synced_at,
                  associated_workout_id, planned_type,
                  training_effect_label, workout_rpe, workout_feel,
-                 workout_compliance, detail_fetched_at)
+                 workout_compliance, detail_fetched_at,
+                 gear_uuid, gear_name)
           associated_workout_id: Garmin workout template the activity
           executed (null for free runs). planned_type: the plan's label
           for that workout (threshold/easy/long/...) — ground truth for
@@ -176,6 +186,14 @@ def query_activity_cache(
           post-workout self-evaluation (0-100). workout_compliance:
           Garmin execution score. training_effect_label: Garmin's
           physiological auto-label — response signal, not intent.
+          gear_uuid/gear_name: the shoe used (joins gear.uuid); null when
+          no gear was assigned or the activity isn't gear-synced yet
+          (sync_activities(backfill_gear=True) populates history).
+      gear(uuid, name, make_model, type, status, in_use_since,
+                 retired_at, total_distance_km, total_activities, synced_at)
+          Gear library (shoes etc.), status='active'/'retired'. Join
+          activities.gear_uuid = gear.uuid to attribute mileage by
+          session type, e.g. threshold km per shoe.
       workout_type_map(garmin_workout_id, planned_type, workout_name,
                  plan_name, planned_date, updated_at)
           Durable workout_id → planned type mapping, written at
