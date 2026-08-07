@@ -206,6 +206,7 @@ git.
 | `create_continuous_run` | Easy / long / tempo (single-step) |
 | `create_interval_workout` | Threshold / VO2 / structured intervals |
 | `delete_workout_template` | Remove a template |
+| `cleanup_workout_templates` | Delete templates no future schedule references (dry-run default; only touches templates this MCP created — hand-made ones are never deleted) |
 
 ### Scheduling
 
@@ -224,8 +225,10 @@ git.
 | `sync_activities` | Pull new activities + HR streams + laps + recent wellness into the cache |
 | `list_activities` | Flat, filterable activity list (date, start time, distance, HR, pace, classification) |
 | `query_activity_cache` | Read-only SQL SELECT against the local cache for custom analysis |
-| `activity_breakdown` | One activity's zone breakdown + lap classification |
-| `weekly_retrospective` | Per-week volume/sessions/time-in-zone, single week or a range, optionally with plan compliance (`with_compliance`) |
+| `activity_breakdown` | One activity's lap classification, per-rep analysis, and time measured against the profile's bpm anchors (sub-threshold band / hard cap / LT2) — session category judged on seconds at intensity, not momentary HR peaks; races auto-flagged |
+| `hr_time_in_buckets` | Time in custom bpm ranges (e.g. 175-180, 181-185, …) for one activity, whole session or work reps only |
+| `update_activity` | Edit a completed activity's title/description on Garmin Connect (pin session context — treadmill, heat, illness — where every later reader finds it) |
+| `weekly_retrospective` | Per-week volume/sessions/time-in-zone (running and cross-training reported separately), single week or a range, optionally with plan compliance (`with_compliance`) |
 | `progress_report` | Track one session type's HR/pace trend over time |
 | `detect_personal_records` | Scan cached runs for PRs at common distances |
 
@@ -287,7 +290,7 @@ git.
 | `get_plan` | Read current `plan.json` |
 | `summarize_plan` | Preview per-week structure before saving |
 | `save_plan` | Write `plan.json` |
-| `materialize_plan` | Push planned workouts to Garmin calendar |
+| `materialize_plan` | Push planned workouts to Garmin calendar — identical sessions share one template, and `from_date`/`to_date` enable the recommended one-week-at-a-time cadence |
 | `compare_plan_vs_actual` | Compliance per workout (type + ±15% distance) |
 
 ## MCP resources
@@ -315,10 +318,17 @@ Claude reads `coach://classification` + `coach://user_profile`, calls
 > one long run. Race goal in week 12.
 ```
 
-### Pushing the plan to Garmin
+### Pushing the plan to Garmin (weekly cadence)
 ```
-> materialize the plan
+> materialize this week
 ```
+Materialize ONE week at a time rather than a whole block: most watches
+only hold ~25 structured workouts, and a fully-materialized multi-month
+plan crowds today's session off the device. The Monday routine is
+`materialize_plan(from_date=<monday>, to_date=<sunday>)` +
+`cleanup_workout_templates` (shows an itemized dry-run list first) to
+drop completed templates. The rest of the plan stays in `plan.json`
+until its week arrives.
 
 ### Morning readiness check
 ```
@@ -361,6 +371,26 @@ from raw streams on every query, so updates apply retroactively.
 intent. Garmin calendar is operational state. The two can drift if you
 reschedule a lot — compliance comparison still works against the original
 plan.
+
+**Watch workout limit:** many Garmin watches sync at most ~25 structured
+workouts from Connect. Keep the Connect template list lean (weekly
+materialization + `cleanup_workout_templates`) or the day's scheduled
+session can silently fail to appear on the device. Note that deleting a
+template in Connect does NOT remove it from the watch's local workout
+list (verified on a Forerunner 265 — not even a Garmin Express USB sync
+does); orphaned entries are cosmetic and can be deleted on-device, and
+on-watch deletion never propagates back to Connect.
+
+**How calibrated vs. generic is this?** The *code* is user-agnostic:
+every intensity judgment is anchored to values parsed from your own
+`coach_data/user_profile.md` (gitignored), with zone-based fallbacks.
+The *framework docs* (`training_philosophy.md`, `plan_design.md`) are
+the Bakken method with the author's calibration woven in as a worked
+example — concrete bpm numbers like the 178-188 sub-threshold band are
+the author's, not universal. To use this repo yourself: run the profile
+setup (your numbers land in the gitignored profile and drive all tools
+automatically), and read the framework docs' bpm examples as "replace
+with your own band" — the principles transfer, the numbers don't.
 
 **Local-only:** runs on your machine. Not reachable from Claude on phone
 or web without remote hosting (which is out of scope for this project).
