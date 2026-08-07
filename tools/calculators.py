@@ -643,7 +643,7 @@ def forecast_conditions(
     defaults to your most recent outdoor activity's GPS coordinates (cached
     from sync; falls back to a one-off Garmin lookup if the cache has none
     yet), so you normally don't pass lat/lon at all — it follows you (e.g.
-    Bærum vs. Spain). When `base_pace_min_per_km` is given it feeds the
+    Norway vs. Spain). When `base_pace_min_per_km` is given it feeds the
     fetched conditions straight into `heat_pace_adjustment`.
 
     Args:

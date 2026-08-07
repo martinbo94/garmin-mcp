@@ -724,7 +724,10 @@ def taper_plan(
 ) -> dict:
     """Generate a race taper schedule from today to race day.
 
-    Applies standard percentage-based taper reductions:
+    Applies standard percentage-based taper reductions (the percentages
+    are coaching convention, not Bakken's — the book's formtopping rule
+    is qualitative: cut volume/length/session count while the muscles
+    keep getting light stimuli, e.g. very light 20 × 1 min sessions):
     - Marathon (>35 km):        3-week taper — Week -3: 80%, Week -2: 60%, Week -1: 40%
     - Half/10k (10–35 km):      2-week taper — Week -2: 70%, Week -1: 40%
     - 5k and shorter (<10 km):  1-week taper — Week -1: 60%
@@ -805,8 +808,8 @@ def taper_plan(
              "Reduce long run to ~13-15 km. Keep one quality sub-threshold session at normal pace but fewer reps. Eliminate second quality session."),
             (2, 0.60, 4, "One short quality session (20-25 min of reps), long run ≤12 km",
              "Drop long run to 12 km or less. Quality session: short reps only (e.g. 4-5 × 4 min). No tempo runs."),
-            (1, 0.40, 3, "2-3 short easy runs + 1 × 10-15 min strides session",
-             "Race week — all easy. Optional strides mid-week to keep legs sharp. No quality work after Thursday."),
+            (1, 0.40, 3, "2-3 short easy runs + one very light short-interval session (e.g. 20 × 1 min, 'svært lett')",
+             "Race week — easy, but not stimulus-free: Bakken's formtopping reintroduces very light 20 × 1 min-style sessions so the muscles keep getting stimuli. No hard work after Thursday."),
         ]
     elif race_distance_km >= 10:
         # Half marathon / 10k: 2-week taper
@@ -1003,13 +1006,17 @@ def return_from_break() -> dict:
             elif week_num == 2:
                 notes = (
                     "Continue building aerobic base. "
-                    "Optional: one gentle fartlek with 4-6 short pickups (30s each) "
-                    "only if week 1 felt effortless."
+                    "Optional: a reduced-volume short-rep session (e.g. 8-12 × 45/15 "
+                    "or 15/45-30/30 at controlled sub-threshold effort) only if week 1 "
+                    "felt effortless — the book's return vehicle is frequent light "
+                    "45/15 alongside progressing easy runs, not long reps."
                 )
             else:
                 notes = (
                     f"Week {week_num}: quality sessions allowed. "
-                    "Introduce one sub-threshold session (e.g. 3×8 min at sub-threshold pace). "
+                    "Re-enter via 45/15-style short reps first (the book's return "
+                    "vehicle — half the reps still give useful stimulus), then "
+                    "reintroduce long reps (e.g. 3×8 min) once short reps feel normal. "
                     "Keep remaining sessions easy."
                 )
 
@@ -1062,10 +1069,15 @@ def double_day_advisor(
     base is already in place. The default for everyone is Singles, NOT doubles.
 
     See coach_data/training_philosophy.md → "Advanced variant:
-    double-threshold days". Preconditions (per the doc):
-    - Sustained ~70+ km/week (ideally 100+).
-    - >= 8-12 weeks of consistent sub-threshold singles.
-    - Goal race >= 10k (less benefit for a pure 5k focus).
+    double-threshold days". Bakken's OWN gate (the book's "Advarsel") is
+    qualitative, not volumetric — confirm with the user: full control of
+    intensity around threshold; extended injury-free period; tolerance
+    for double sessions generally; discipline to abstain when it doesn't
+    feel right. The book has NO volume gate and explicitly opens doubles
+    to amateurs (a double every OTHER week is "more than enough" in the
+    5-hour week). House advisory context on top:
+    - Weekly volume (advisory only — low volume is not a blocker).
+    - >= 8-12 weeks of consistent sub-threshold singles (house rule).
     - The USER explicitly wants to try it (informed opt-in).
 
     ELIGIBILITY — base OR informed opt-in (not both required):
@@ -1108,9 +1120,9 @@ def double_day_advisor(
     import sqlite3 as _sqlite3
     from datetime import date as _date, timedelta as _td
 
-    # Precondition thresholds (from training_philosophy.md).
-    MIN_WEEKLY_KM = 70.0          # sustained 70+ km/week (ideally 100+)
-    MIN_CONSISTENT_WEEKS = 8      # >= 8-12 weeks of consistency
+    # Thresholds (house guidance; the book itself has NO volume gate).
+    ADVISORY_WEEKLY_KM = 70.0     # volume is advisory context, never a blocker
+    MIN_CONSISTENT_WEEKS = 8      # >= 8-12 weeks of consistency (house rule)
     CONSISTENT_WEEK_FLOOR_KM = 40.0  # a week "counts" only if it has real volume
 
     try:
@@ -1179,7 +1191,7 @@ def double_day_advisor(
         consistent_weeks = sum(1 for v in baseline_km if v >= CONSISTENT_WEEK_FLOOR_KM)
 
         if target_weekly_km is None:
-            target_weekly_km = round(avg_weekly_km * 1.05, 1) if avg_weekly_km > 0 else MIN_WEEKLY_KM
+            target_weekly_km = round(avg_weekly_km * 1.05, 1) if avg_weekly_km > 0 else ADVISORY_WEEKLY_KM
 
         # Current week so far.
         current_week_km = sum((r["distance_m"] or 0) for r in current_week_rows) / 1000
@@ -1188,27 +1200,37 @@ def double_day_advisor(
 
         # ── Objective precondition checks ─────────────────────────────────
         reasons_fail: list[str] = []
+        advisories: list[str] = []
         preconditions: list[dict] = []
 
-        # 1. Sustained weekly volume (~70+ km/week).
-        volume_ok = avg_weekly_km >= MIN_WEEKLY_KM
+        # 1. Weekly volume — ADVISORY ONLY. The book has no volume gate and
+        #    explicitly opens doubles to amateurs (every other week "is more
+        #    than enough" in the 5-hour week). Low volume is context, never
+        #    a blocker, so it goes to `advisories`, not `reasons_fail`.
+        volume_ok = avg_weekly_km >= ADVISORY_WEEKLY_KM
         preconditions.append({
-            "name": "sustained_weekly_volume",
-            "requirement": f">= {MIN_WEEKLY_KM:.0f} km/week (ideally 100+)",
+            "name": "weekly_volume_advisory",
+            "requirement": (
+                f">= {ADVISORY_WEEKLY_KM:.0f} km/week is house ADVISORY context — "
+                "not a book gate, never a blocker"
+            ),
             "your_status": f"{avg_weekly_km:.1f} km/week over the last {n_weeks} full weeks",
             "met": volume_ok,
+            "advisory": True,
         })
         if not volume_ok:
-            reasons_fail.append(
-                f"Weekly volume too low ({avg_weekly_km:.1f} km/week) — "
-                f"double-threshold needs sustained {MIN_WEEKLY_KM:.0f}+ km/week"
+            advisories.append(
+                f"Volume is modest ({avg_weekly_km:.1f} km/week). Doubles are "
+                "book-sanctioned at this level too — but start at every OTHER "
+                "week, and check the same stimulus isn't simpler to get via "
+                "the singles load-increase options."
             )
 
         # 2. Consistency (>= 8-12 weeks of real volume).
         consistency_ok = consistent_weeks >= MIN_CONSISTENT_WEEKS
         preconditions.append({
             "name": "consistency",
-            "requirement": f">= {MIN_CONSISTENT_WEEKS} consecutive weeks of consistent volume",
+            "requirement": f">= {MIN_CONSISTENT_WEEKS} consecutive weeks of consistent volume (house rule)",
             "your_status": (
                 f"{consistent_weeks} of the last {n_weeks} weeks had "
                 f">= {CONSISTENT_WEEK_FLOOR_KM:.0f} km"
@@ -1317,8 +1339,23 @@ def double_day_advisor(
             "week with full easy days between, and the default remains "
             "Norwegian Singles. Both sessions stay sub-threshold (Golden Zone); "
             "ramp in gradually (start with easy+threshold on the same day, run "
-            "the first true doubles 10-15 sec/km slower than normal)."
+            "the first true doubles 10-15 sec/km slower than normal, cadence "
+            "starting at every OTHER week — the book calls that 'more than "
+            "enough' for significant benefit)."
         )
+        book_gates = {
+            "note": (
+                "Bakken's actual gate (the book's 'Advarsel') is qualitative — "
+                "confirm each with the USER in conversation before recommending "
+                "doubles; none of these are measurable from the cache:"
+            ),
+            "criteria": [
+                "Full control of intensity around threshold (sessions land in the band consistently)",
+                "Extended injury-free period",
+                "Experience tolerating double training sessions generally",
+                "Discipline to abstain when it doesn't feel right",
+            ],
+        }
 
         # Eligible if EITHER the objective base is in place OR the user has
         # explicitly opted in (informed consent). Not meeting the base is not
@@ -1341,13 +1378,16 @@ def double_day_advisor(
                     "user_confirms_ready=True (informed-consent override)."
                 ),
                 "preconditions": preconditions,
+                "book_gates": book_gates,
+                "advisories": advisories,
                 "objective_checks_pass": objective_ok,
                 "failed_preconditions": reasons_fail,
                 "confirmation_prompt": (
-                    "You don't yet meet the usual base (70+ km/week, 8-12 consistent "
-                    "weeks). Double-threshold days raise injury/overreach risk without "
-                    "it. Do you still want to proceed? It's your choice — confirm only "
-                    "if you understand the trade-off."
+                    "You don't yet meet the house base (8-12 consistent weeks of "
+                    "singles, recovery/calendar clear today). Double-threshold days "
+                    "raise injury/overreach risk without it. Do you still want to "
+                    "proceed? It's your choice — confirm only if you understand the "
+                    "trade-off, and walk through the book's four criteria first."
                 ),
                 "suggested_structure": None,
                 "weekly_context": weekly_context,
@@ -1370,12 +1410,13 @@ def double_day_advisor(
                     "for 20-30 min. Same HR target as AM; pace is faster only "
                     "because rests are shorter. Still sub-threshold."
                 ),
-                "rest_between_sessions_h": "6-8",
+                "rest_between_sessions_h": "6-8 preferred (down to 2-3 workable)",
             },
             "timing_note": (
-                "Space the two sessions 6-8 h apart so muscle tone recovers and "
-                "the PM reps land on relatively fresh legs. AM in the morning, "
-                "PM by early evening to protect sleep."
+                "Space the two sessions preferably 6-8 h apart so muscle tone "
+                "recovers and the PM reps land on relatively fresh legs — the "
+                "book notes 2-3 h can work for many when the day doesn't allow "
+                "more. AM in the morning, PM by early evening to protect sleep."
             ),
             "rationale": (
                 "Both sessions are sub-threshold (Golden Zone) — the goal is to "
@@ -1424,6 +1465,8 @@ def double_day_advisor(
             "override": override,
             "reason": reason,
             "preconditions": preconditions,
+            "book_gates": book_gates,
+            "advisories": advisories,
             "objective_checks_pass": objective_ok,
             "failed_preconditions": reasons_fail,
             "suggested_structure": suggested_structure,

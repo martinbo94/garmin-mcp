@@ -3,9 +3,28 @@ from typing import Optional
 
 import garmin_sync
 import plan as plan_mod
-from core import IntervalSet, Step, mcp
+from core import IntervalSet, Step, _client, mcp
 from tools.scheduling import schedule_workout
 from tools.workouts import create_continuous_run, create_interval_workout
+
+
+def _structure_sig(w: dict) -> str:
+    """Stable signature of a plan entry's template content (name +
+    continuous/interval structure + description). Two plan entries with
+    the same signature can share one Garmin template scheduled on
+    multiple dates."""
+    import hashlib
+    import json as _json
+
+    payload = {
+        "name": w.get("name"),
+        "description": w.get("description"),
+        "continuous": w.get("continuous"),
+        "interval": w.get("interval"),
+    }
+    return hashlib.sha1(
+        _json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
 
 
 # ─── Training plan: load, save, materialize, compare ──────────────────
@@ -129,7 +148,10 @@ def save_plan(
 
 
 @mcp.tool()
-def materialize_plan(from_date: Optional[str] = None) -> dict:
+def materialize_plan(
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+) -> dict:
     """Push planned workouts from plan.json to Garmin Connect.
 
     For each workout in the plan that has not yet been materialized (no
@@ -138,27 +160,95 @@ def materialize_plan(from_date: Optional[str] = None) -> dict:
     planned date, and writes the Garmin IDs back to plan.json so subsequent
     calls skip it.
 
+    **Template reuse:** plan entries with identical name + structure +
+    description share ONE Garmin template scheduled on multiple dates
+    (reused templates are counted in `reused`, not `created`). This
+    matters because the watch only holds ~25 structured workouts.
+
+    **Recommended cadence (watch 25-workout limit): materialize ONE WEEK
+    at a time** — e.g. every Monday, `materialize_plan(from_date=<today>,
+    to_date=<sunday>)` — and run `cleanup_workout_templates` in the same
+    session to drop completed templates. Materializing a whole multi-month
+    block floods the watch's workout list and today's session can silently
+    fail to appear on the device.
+
     Skips rest/strength workouts (no Garmin template needed).
 
     Args:
         from_date: Optional 'YYYY-MM-DD' — only materialize workouts on or
-            after this date. Useful for "push just the next week" rather
-            than the whole block.
+            after this date.
+        to_date: Optional 'YYYY-MM-DD' — only materialize workouts on or
+            before this date. Combine with from_date for the weekly window.
     """
+    import sqlite3
+
     p = plan_mod.load_plan()
     if not p:
         return {"error": "No plan at coach_data/plan.json. Use save_plan first."}
 
-    created, scheduled, skipped = 0, 0, 0
+    # Template-reuse index: structure_hash → workout_id, kept in the
+    # created_workouts registry and validated against templates that still
+    # exist in Connect (a cleaned-up template must not be reused).
+    with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS created_workouts ("
+            "workout_id INTEGER PRIMARY KEY, name TEXT, "
+            "created_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        try:
+            conn.execute("ALTER TABLE created_workouts ADD COLUMN structure_hash TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        hash_rows = conn.execute(
+            "SELECT structure_hash, workout_id FROM created_workouts "
+            "WHERE structure_hash IS NOT NULL"
+        ).fetchall()
+
+    existing_ids: set = set()
+    try:
+        g = _client()
+        start = 0
+        while True:
+            batch = g.get_workouts(start, 100) or []
+            existing_ids.update(t["workoutId"] for t in batch)
+            if len(batch) < 100:
+                break
+            start += 100
+    except Exception:
+        pass  # offline → no reuse this run, everything gets created fresh
+
+    sig_to_wid = {h: wid for h, wid in hash_rows if wid in existing_ids}
+
+    created, reused, scheduled, skipped = 0, 0, 0, 0
     errors: list[str] = []
 
     for w in p["workouts"]:
         if from_date and w["date"] < from_date:
             continue
+        if to_date and w["date"] > to_date:
+            continue
         if w.get("type") in ("rest", "strength"):
             continue
         if w.get("garmin_workout_id"):
             skipped += 1
+            continue
+
+        sig = _structure_sig(w)
+        if sig in sig_to_wid:
+            # Identical template already exists — schedule it, don't recreate.
+            w["garmin_workout_id"] = sig_to_wid[sig]
+            reused += 1
+            plan_mod.save_plan(p)
+            garmin_sync.record_workout_types([w], p.get("block_name"))
+            try:
+                sched = schedule_workout(sig_to_wid[sig], w["date"])
+                sid = sched.get("schedule_id") if isinstance(sched, dict) else None
+                if sid:
+                    w["garmin_schedule_id"] = sid
+                    scheduled += 1
+                    plan_mod.save_plan(p)
+            except Exception as e:
+                errors.append(f"{w['date']}: {type(e).__name__}: {e}")
             continue
 
         try:
@@ -192,6 +282,14 @@ def materialize_plan(from_date: Optional[str] = None) -> dict:
             plan_mod.save_plan(p)
             # Durable workout_id → type mapping; survives plan.json turnover
             garmin_sync.record_workout_types([w], p.get("block_name"))
+            # Register the structure hash so identical later entries reuse
+            # this template instead of creating a duplicate.
+            sig_to_wid[sig] = wid
+            with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE created_workouts SET structure_hash = ? WHERE workout_id = ?",
+                    (sig, wid),
+                )
 
             sched = schedule_workout(wid, w["date"])
             sid = sched.get("schedule_id") if isinstance(sched, dict) else None
@@ -204,6 +302,7 @@ def materialize_plan(from_date: Optional[str] = None) -> dict:
 
     return {
         "created": created,
+        "reused": reused,
         "scheduled": scheduled,
         "skipped": skipped,
         "errors": errors,

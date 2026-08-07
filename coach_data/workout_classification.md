@@ -64,7 +64,8 @@ Example: a week with 1 threshold + 1 progressive long run + 1 regular long run
 The Marius Bakken method explicitly does short-rep work (e.g. 45/15 — 45s on,
 15s off) at **threshold** intensity. What a generic coach would call a VO2max
 session by rep length is threshold here because the *intensity* is controlled
-(roughly sub-2.5 mmol lactate, "controlled hard" not all-out).
+(the golden zone: ~2.3-3.0 mmol lactate, individually up to ~3.5 —
+"controlled hard" not all-out).
 
 When the name alone is ambiguous:
 - **Threshold:** avg HR in upper Z3 / lower Z4 across work portions. Feels

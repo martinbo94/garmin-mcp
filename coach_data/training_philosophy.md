@@ -139,20 +139,25 @@ one is a net loss.
 ## Rep-length pace adjustment (within the same HR target)
 
 Same Golden Zone HR target, different paces depending on rep design.
-Bakken's specific rule, scaled relative to a runner's standard T-pace:
+Bakken's calibration has two parts:
 
-| Rep length | Pace adjustment |
+1. **Anchor:** calculated golden-zone pace ≈ standard T-pace (from race
+   calculators) **+ 8-12 sec/km** — the conservative shift that moves
+   textbook T-tempo down into the 2.3-3.0 mmol zone.
+2. **Tempo guide by rep length**, relative to that calculated
+   golden-zone pace (the book's own table):
+
+| Rep length | Pace vs calculated golden-zone pace |
 |---|---|
-| Short reps (1-3 min) | T-pace + ~10-25 sec/km — faster end |
-| Medium reps (4-8 min) | T-pace + ~25-32 sec/km — the baseline |
-| Long reps (8-12 min) | T-pace + ~32-39 sec/km — slower end |
+| 45 s – 1 min | ~5-7 sec/km **faster** |
+| 4 – 5 min | equal — the baseline |
+| 6 – 8 min | ~5-7 sec/km slower |
+| 10 – 15 min | ~7-10 sec/km slower |
 
-True short reps (45/15, 30/30, etc.) sit at or slightly faster than the
-"short reps" line above because the brief work bursts don't accumulate
-fatigue the way 1-3 min reps do.
-
-The athlete's actual numbers are in `coach://user_profile` under "Session
-pace estimates."
+The book's warning: follow a race calculator slavishly on 10-min reps
+and you run 7-10 sec/km too fast — well over threshold, and over time
+that is overload. The athlete's actual numbers are in
+`coach://user_profile` under "Session pace estimates."
 
 ## Session formats
 
@@ -171,9 +176,14 @@ lactate controllable. Bakken's stronger claim (chapter 3, *Løping!*):
 the same intensity because (a) intervals let you accumulate more total
 time at the target HR before hitting the wall, and (b) the brief rests
 prevent the slow drift into supra-threshold that ruins a continuous
-tempo. The exception is marathon-specific prep — 20-40 min continuous
-tempo blocks become useful in the final weeks before a marathon, but
-they're an exception, not the default.
+tempo. The exception is HM **and** marathon prep — Bakken explicitly
+allows 20-40 min continuous threshold runs for half marathon and
+marathon ("metabolsk utholdenhet"), and lists 40-60 min continuous
+threshold **in varying tempo** as a half-marathon X-økt option. Even
+then the continuous work varies pace around threshold (under → at →
+just over, with running "pauses" below); it is never a steady
+goal-pace grind. For 5-10 km goals, intervals remain the clear
+recommendation.
 
 ### Variation within sub-threshold work
 
@@ -183,8 +193,7 @@ Bakken's third "frame" is to vary *inside* the Golden Zone over a block:
   long (8-12 min) reps across weeks so the body sees different stimuli at
   the same HR target.
 - **Intensity micro-variation:** progress sessions across a block from
-  the lower end of the sub-threshold band (~180 bpm) toward the upper
-  end (~188 bpm).
+  the lower end of the sub-threshold band toward the upper end.
 - **Recovery variation:** longer rests (90-120s) for the harder end of
   the band, shorter rests (30-45s) for the easier end or for short reps.
 - **Terrain variation:** track, road, light trail, hill — same HR target,
@@ -194,13 +203,16 @@ The point: monotony at sub-threshold intensity is what causes both
 plateaus and burnout. Variation keeps adaptation moving without escalating
 intensity.
 
-### Smart Strides (optional session-end protocol)
+### Smart Strides (session-end recovery protocol)
 
-Bakken's protocol for keeping neuromuscular speed sharp without adding
-load: after the main set, 2-3 min easy jog, then **5-6 × ~100 m strides
-slightly above threshold pace**. Controlled, not sprints. Walk/jog between.
-Total cost ~5 min, kept rare on the hardest days. Useful for runners who
-otherwise lose top-end feel on a heavy-sub-threshold block.
+Bakken's named protocol, and its purpose is **recovery, not speed work**:
+lowering muscle tone faster after hard work — he calls it one of the few
+shortcuts to quicker recovery between sessions. Prescribed after **all
+hard sessions** as routine, not kept rare: 2-3 min easy jog after the
+main set, then **5-8 × ~100 m** even, controlled strides slightly above
+threshold pace. Not sprints; walk or jog between; the focus is
+normalizing the musculature, not speed. Treat it as the default way to
+*end* a hard session.
 
 ### Example sessions the user has used or might use
 
@@ -219,10 +231,19 @@ have to think about pacing 6-min reps), and unusually easy to recover from
 because each work bout is short.
 
 Specific protocol variants from the book:
-- **Standard:** 15-20 reps at sub-threshold pace, controlled.
-- **Pyramid:** 20 / 25 / 30 / 25 / 20 reps as continuous sets with
-  short rest between, or one long block with internal feel-based pacing.
-- **Block:** 3 × (10 × 45/15) with 3-5 min easy between blocks.
+- **Standard:** 15-30 reps, controlled — volume progresses toward 30
+  (or split as 2 × 15) over a block.
+- **Pyramid:** vary the WORK duration, not rep count — 3 × 30 s /
+  3 × 45 s / 3 × 60 s / 3 × 45 s / 3 × 30 s, all with 15 s rest.
+- **Block:** 3 × (10 × 45/15) with ~3 min rest between blocks, pace
+  escalating per block (10k → 5k → 3k effort — this variant runs above
+  threshold and belongs in the X-økt slot).
+
+**Dual-use:** 45/15 spans two roles. As a *threshold session* it runs at
+sub-threshold HR (lactate oscillates around threshold; the 15 s pauses
+clear it). As the *X-økt* it runs progressive and over threshold —
+start at 10 km effort, build toward 5 km effort, up to ~95% of max HR.
+Same format, different intent; be explicit about which one is planned.
 
 **Where 45/15 specifically shines:** weeks with limited time, return from
 illness or injury (you can do half the reps and still get useful stimulus),
@@ -240,8 +261,15 @@ on its own; don't chase it.
 
 **Within-session progression** (Bakken, "konservativ tilnærming"):
 **make every session progressive** — start the first rep at the slow end
-of your sub-threshold band, build to the middle by mid-session, and only
-push the upper end on the final rep if you're feeling strong.
+of your sub-threshold band and build through it. Feeling strong at the
+end? **Add an extra rep / extra volume — do not push intensity higher**
+(book: *"legg heller inn et ekstra volum mot slutten hvis du føler deg
+sterk"*). Volume is the reward for a good day; pace/HR is not.
+
+**Myk start, myk landing:** the first and last interval of a session are
+never intensive. Composite sessions end with the *shortest* reps, run
+below threshold — that lowers muscle tone into the recovery day
+("nullstilling av kroppen").
 > *"Det er bedre å avslutte med følelsen av at du kunne gjort mer, enn å
 > ha presset deg for hardt i starten, for så å måtte redusere
 > intensiteten senere."*
@@ -278,10 +306,14 @@ VO2 work modest unless there's a clear reason it's the bottleneck.
 
 **X-element guidelines:**
 - 0 – 1 session per week, on a rested day.
-- HR target: roughly 92 – 96% of max HR (top of Z5). See
-  `coach://user_profile` for your specific band.
-- Formats: 4 × 4 min steady, 5 × 3 min, 4 × 6 min 30/15 in hills, or
-  shorter (1 – 2 min) high-effort reps.
+- HR target: roughly 92 – 96% of max HR (top of Z5) — our
+  operationalization; the book says "well over threshold" / >90%, with
+  progressive 45/15 reaching ~95%. See `coach://user_profile`.
+- Formats (the book's menu is SHORT efforts, never stacked sustained
+  intervals): hill repeats 8-15 × ~200 m well over threshold;
+  progressive 45/15 (start at 10k effort, build to 5k); short 20-30 s
+  bursts; fast 400s with long (2-4 min) rests; near race day, 800-1000 m
+  reps around 5k pace.
 - Skip it in weeks where two threshold sessions already feel taxing —
   threshold takes priority.
 
@@ -294,14 +326,19 @@ The discipline is non-negotiable: **easy is truly easy**.
 > "I would entirely stay away from the zone in between very easy running
 > and the threshold."  — Bakken
 
-Bakken's elites run easy below 70% of max HR, but amateur economy makes
-that effectively walking pace. Practical interpretation:
+Bakken's rule is explicit and **universal**: easy runs are run *in their
+entirety* below **70% of max HR** — *"Min erfaring er at dette
+prinsippet gjelder uansett nivå. For mange mosjonister betyr det
+5:30-6:30 min/km, kanskje saktere — og det er helt riktig."* The gray
+zone (70-80%) is a bad trade: the effect barely rises, the load does.
 
-- **Aim for average HR in Z1 or low-mid Z2.** Upward drift on long runs
-  is normal.
-- **Hard cap: LT1** (≈ 84% of max HR untested). Routine drift above LT1
-  is the gray zone — too hard to recover from, too easy to drive
-  adaptation.
+- **Aim: the whole run below ~70% of max HR** (Z1 / bottom of Z2 — see
+  `coach://user_profile` for the bpm). Upward drift on long runs
+  happens; rein it in rather than budgeting for it.
+- **Absolute ceiling: LT1.** Anything above LT1 is unambiguously gray
+  zone. (Using lab-measured LT1 as the hard ceiling is this framework's
+  lab-anchored adaptation; the book's own stated rule is the stricter
+  70%.)
 - **Purpose:** aerobic base, economy, recovery — not a moderate workout.
 
 See `coach://user_profile` for your easy-cap bpm. The real signal isn't
@@ -329,8 +366,9 @@ recovery budget that threshold work needs.
 ## Weekly structure: Norwegian Singles adaptation
 
 The full Bakken method runs **double-threshold days** (two threshold
-sessions in one day, ~6-8 h apart) on Tuesdays and Thursdays/Saturdays.
-That's elite practice — 4 threshold sessions per week, 150-220 km total.
+sessions in one day, preferably 6-8 h apart — down to 2-3 h works for
+many) on Tuesdays and Thursdays/Saturdays. That's elite practice —
+4 threshold sessions per week at ~180 km/week in the book's example.
 
 For amateurs (the Norwegian Singles adaptation that emerged on forums),
 the structure preserves the framework but reduces frequency:
@@ -353,12 +391,17 @@ is too easy-heavy for this dose. The adjusted distribution:
 | Z3-Z4 (sub-threshold, the Golden Zone) | **20-30%** | ~1:00-1:30 hours |
 | Z5 (true high intensity) | **5-10%** | ~20-30 min |
 
+(Z3-Z4 in this table is a weekly-time *accounting* bucket; the session HR
+target itself is the profile's sub-threshold band — the part of Z4 above
+the hard cap is not part of the target.)
+
 These are the bands Claude should check against when reviewing weekly
 summaries. They override the looser "Z1-2: 60-80% / Z3-4: 20-35% / Z5:
 0-5%" target in `coach://classification` for athletes at this volume —
-the sub-threshold floor is *higher* (20% minimum vs 20%) and the Z5
-allowance is *higher* (5-10% vs 0-5%) because amateurs need a slightly
-larger quality fraction to drive adaptation than elites do.
+the sub-threshold share is treated as a firm *floor* (≥20%, not a range
+to drift below) and the Z5 allowance is *higher* (5-10% vs 0-5%) because
+amateurs need a slightly larger quality fraction to drive adaptation
+than elites do.
 
 ### Sample week template (Bakken, 5-hour reference week)
 
@@ -368,32 +411,40 @@ This is the book's concrete chapter 7 layout, lightly adapted:
 |---|---|---|
 | Mon | **Rest** | Full recovery from weekend training. |
 | Tue | **Threshold "støtte" session** | E.g. 6×6 min sub-threshold, or 10×3 min with 1 min jog. Variations in rep length OK; same HR target. |
-| Wed | Easy 40-60 min | Truly easy — *"så slakk at den nesten føles feil"*. Hard cap at LT1. |
-| Thu | **Threshold "hoved" session** | E.g. 3-4×10 min, or another long-rep variation. Different format than Tuesday. The most balanced session of the week. |
+| Wed | Easy 40-60 min | Truly easy — *"så sakte at det nesten føles feil"*. You should be able to talk effortlessly. |
+| Thu | **Threshold "hoved" session** | E.g. 3-4×10 min, or a long varying-tempo session. Different format than Tuesday. **One of the most taxing sessions of the week** ("en av de mest belastende øktene") — long reps, more muscular wear; max once per week. |
 | Fri | **Rest** or short easy | Strategic rest before weekend. Skip if 4 rest days in a row feels off. |
 | Sat | **X-økt (flex slot)** | See below — varies week to week. |
 | Sun | **Long easy** | 60-120 min depending on block. Distance-specific (longer for HM/marathon goals). |
 
 Two threshold sessions (Tue / Thu) + one flex slot (Sat) + one long
-(Sun) is the working structure. Strength training fits as a separate
-add-on, typically Mon, Wed or Fri.
+(Sun) is the working structure. **Strength training goes on or after
+quality days (or on the Monday rest day at low load) — never bundled
+onto the easy days.** Bakken explicitly shields easy days: *"rolig
+løping, under 70 % av makspuls, ingenting annet"* — extra load belongs
+on the threshold days, where the recovery cost is already being paid.
 
 ### The X-økt — Saturday's flex slot
 
 Bakken calls Saturday the "X-økt" — a flexible third quality slot whose
 character changes week to week and across the block:
 
-- **45/15 session** when you want short-rep variation or have less time
-- **Hills / strides / Smart Strides** when neuromuscular freshness matters
+- **Progressive 45/15** (X-økt form: 10k → 5k effort) when you want
+  short-rep variation or have less time
+- **Hills** when neuromuscular strength matters
 - **Race-specific work** (closer to race day): mile reps, 6×1k at goal
-  pace, or a tune-up effort
+  pace, or a tune-up effort / test race
+- **A third threshold session** — explicitly book-sanctioned:
+  *"Alternativt kan denne dagen inneholde en tredje terskeløkt for uken"*
 - **Extra easy / skipped entirely** in deload weeks or when recovery is
   marginal
 
-The X-økt is *not* a fixed third threshold. Two threshold sessions plus
-a third hard session is too much sustained quality for most amateurs.
-Treat the X-økt as the variation lever — what you cycle through that
-keeps the framework from going stale across a 12-week block.
+The X-økt is not a *fixed* third threshold — its value is variation —
+but a third threshold session is a valid choice for the slot. What must
+NOT be stacked on top of the two threshold days is additional
+*intensive* (over-threshold) work: intensity is never the extra-load
+lever in this framework. Treat the X-økt as what you cycle through to
+keep the framework from going stale across a 12-week block.
 
 ### Advanced variant: double-threshold days (NOT current default)
 
@@ -401,58 +452,79 @@ keeps the framework from going stale across a 12-week block.
 double-threshold without explicit user confirmation.**
 
 The elite protocol clusters two sub-threshold sessions into the same day
-(6-8 h apart): morning long reps (5×6 min, 4×8 min), evening short reps
-(10×1k or 45/15). Both in the Golden Zone — neither at-threshold. Muscle
-tone recovers enough between sessions that the second lands on fresh
-legs despite partial glycogen depletion, compounding weekly threshold
-volume well beyond singles.
+(preferably 6-8 h apart; the book notes 2-3 h can work): morning long
+reps (5×6 min, 4×8 min), evening short reps (10×1k or 45/15). Both in
+the Golden Zone — neither at-threshold. Muscle tone recovers enough
+between sessions that the second lands on fresh legs despite partial
+glycogen depletion, compounding weekly threshold volume well beyond
+singles.
 
-Why gatekept: Bakken's reference athletes ran 150-220 km/week with 5+
-years of consistent volume. Below ~80 km/week the base isn't there;
-recovery infrastructure (sleep, nutrition, lifestyle fit) starts
-mattering much more than for singles.
+**Bakken's own gate (the book's "Advarsel") — he advises AGAINST doubles
+unless you have ALL of:**
+- full control of intensity around threshold,
+- an extended injury-free period,
+- experience that you tolerate double sessions generally,
+- the discipline to abstain when it doesn't feel right.
+
+Note the book has NO volume gate: it explicitly opens doubles to
+amateurs — a double **every other week** is "more than enough" inside
+the 5-hour week, and the entry ladder starts with easy+threshold on the
+same day (morning 2-6 min reps / evening 30 s-1 min reps, the two days
+around it fully easy). High weekly volume (70+ km) and 8-12 weeks of
+consistent sub-threshold singles are additional advisory context used
+here, not book requirements.
 
 Preconditions before recommending:
-- Sustained 70+ km/week (ideally 100+).
-- ≥ 8-12 weeks of consistent sub-threshold singles.
-- Goal race ≥ 10k (less benefit for pure 5k focus).
+- The four book criteria above, all true.
+- ≥ 8-12 weeks of consistent sub-threshold singles (house rule).
 - User explicitly wants to try it.
 
-If any fail, stay on Singles. Adopt gradually via Bakken's ramp (see
-*Løping!* ch. 7): start with easy+threshold on the same day before any
-true double, modulate the first true doubles 10-15 sec/km slower than
-normal sub-threshold pace.
+If any fail, stay on Singles. Adopt gradually via Bakken's ramp:
+easy+threshold same-day first, first true doubles 10-15 sec/km slower
+than normal sub-threshold pace, cadence starting at every other week.
 
 **Frequency cap once adopted:** at most 2 double-days per week, with
-full easy days between. Bakken calls the format "forførende" — feeling
-good every day tempts a third double, which breaks the recovery loop.
+full easy days between. Feeling good every day tempts a third double —
+that breaks the recovery loop the format depends on.
 
 ---
 
 ## Recovery and the "traffic light" check
 
 Bakken used a traffic-light system to decide whether a planned hard
-session should go ahead. Adapted for this setup, before each threshold
-or VO2 day:
+session should go ahead. Crucially, the book's model is built on
+**active tests, not passive metrics** — *"informasjon ingen passiv test
+kan gi"*:
 
-- **🟢 Green:** Low morning resting HR, low warm-up HR, lactate climbs
-  easily at fast paces, legs feel responsive → run the session as
-  planned, maybe push the upper end of the band.
-- **🟡 Yellow:** Normal warm-up HR, normal feel → standard session.
-- **🔴 Red:** Elevated resting/warm-up HR, can't drive lactate up despite
-  effort, legs heavy → **scale back or skip**. Cut volume by 30-50%,
-  lower target HR by 2-3 bpm, OR convert to easy. The next session
-  matters more than this one.
+**Primary signals (the book's):**
+- **Standardized test interval in the warm-up:** after ~5 min jog, run a
+  fixed-pace 3-6 min interval you know well and compare HR to normal:
+  **+8-10 bpm** over normal → reduce or abort (red); **within ±3-5
+  bpm** → run as planned (yellow/green); **-3-5 bpm with light legs** →
+  green.
+- **Stair test:** how the thighs feel up the stairs that morning.
+- **Resting HR** and **warm-up HR** vs your own normal.
 
-Concrete signals to watch (via `morning_check_in` tool):
-- **Training readiness** (Garmin) score → low score = consider yellow/red
-- **HRV** trending below baseline → yellow/red
-- **Resting HR** elevated by 5+ bpm above your typical → yellow/red
-- **Sleep** under 6 hrs or poor quality → yellow at minimum
-- **Body battery** low at wake → adjust
+**Responses:**
+- **🟢 Green:** run as planned; with repeated green signals **add extra
+  reps/volume — never raise intensity** (*"legg til ekstra drag. Ikke øk
+  intensitet"*).
+- **🟡 Yellow:** standard session, conservative start.
+- **🔴 Red:** **reduce or abort** (the book's rule is that simple). Our
+  house heuristics for "reduce": cut volume 30-50%, sit at the bottom of
+  the band, or convert to easy. The next session matters more than this
+  one.
 
-If two consecutive yellow/red days, skip the planned quality session;
-the framework only works if you can repeat sessions.
+**Wearable metrics are corroboration only** (via `morning_check_in`):
+Garmin readiness, HRV, resting-HR trend, sleep, body battery can prompt
+a yellow flag — but the active warm-up test and body feel decide.
+(Wearable HRV/RHR are easily confounded by fragmented sleep, illness,
+and life stress; any athlete-specific weighting belongs in
+`coach://user_profile`.)
+
+House rule (not book): two consecutive yellow/red days → skip the
+planned quality session; the framework only works if you can repeat
+sessions.
 
 ---
 
@@ -468,6 +540,27 @@ the framework only works if you can repeat sessions.
   resist the urge to push pace faster. Progress in this method comes from
   *more time at the same controlled effort*, not from squeezing each
   session.
+
+---
+
+## Does the model fit? (individualization, from the book's genetics chapter)
+
+Bakken's warning signs that threshold-heavy training may not suit an
+athlete (type II / fast-fiber dominant):
+- Sessions are executed correctly but progress stalls for months.
+- Musculature feels constantly heavy, even after easy days and rest.
+- Repeated muscle/tendon injuries despite correct intensity control.
+- Short intense sessions feel natural; sustained threshold work feels
+  like a fight.
+- Background in explosive sports / always been fast rather than durable.
+
+If several apply, the book's adaptations: cut the longest threshold
+sessions (shorter reps, less total volume); shorter easy runs at higher
+frequency; more explosive elements (sprint/strength tolerated well);
+progressive threshold sessions that are allowed to finish through the
+threshold; and every 2-3 weeks a week without threshold focus at all.
+(This section exists so the check is made deliberately per athlete, not
+assumed.)
 
 ---
 

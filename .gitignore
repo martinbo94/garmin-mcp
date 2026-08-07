@@ -14,3 +14,12 @@ coach_data/plan.json
 coach_data/deleted_templates_backup.json
 .flake8
 *.gpx
+
+# Local personal data / book scans
+bakken_bok/
+bakken_bok_jpg/
+bakken_bok_transcript/
+coach_data/manual_workouts_backup.json
+coach_data/*.bak-*
+consolidate_garmin_templates.py
+coach_data/grade_model.json
