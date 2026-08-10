@@ -26,7 +26,25 @@ def list_scheduled_workouts(start_date: str, end_date: str) -> list[dict]:
     seen: dict[int, dict] = {}
     y, m = start.year, start.month
     while (y, m) <= (end.year, end.month):
-        resp = client.get_scheduled_workouts(y, m) or {}
+        # A failed month must fail LOUDLY: destructive consumers
+        # (cleanup_workout_templates) treat "not in this list" as "safe to
+        # delete", so silently swallowing a flaky response could delete
+        # live templates. Retry once, then raise. ({} = legitimately empty.)
+        resp = None
+        for _attempt in range(2):
+            try:
+                resp = client.get_scheduled_workouts(y, m)
+            except Exception:
+                resp = None
+            if resp is not None:
+                break
+            import time as _time
+            _time.sleep(1)
+        if resp is None:
+            raise RuntimeError(
+                f"Garmin calendar fetch failed for {y}-{m:02d} — aborting "
+                "instead of under-reporting the schedule."
+            )
         for item in resp.get("calendarItems", []):
             if item.get("itemType") != "workout":
                 continue

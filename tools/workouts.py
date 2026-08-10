@@ -288,6 +288,20 @@ def cleanup_workout_templates(dry_run: bool = True) -> dict:
     future = _lsw(today.isoformat(), horizon.isoformat())
     fut_ids = {w["workout_id"] for w in future}
 
+    # Belt and braces: also protect every template id plan.json holds for
+    # today-or-future dates. If the calendar API under-reports (partial
+    # month response), this keeps live plan templates out of the delete set.
+    try:
+        import plan as _plan_mod
+
+        _p = _plan_mod.load_plan() or {}
+        fut_ids |= {
+            w["garmin_workout_id"] for w in _p.get("workouts", [])
+            if w.get("garmin_workout_id") and w.get("date", "") >= today.isoformat()
+        }
+    except Exception:
+        pass
+
     import sqlite3 as _sqlite3
 
     with _sqlite3.connect(garmin_sync.DB_PATH) as conn:
