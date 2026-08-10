@@ -149,6 +149,9 @@ def save_plan(
 
 @mcp.tool()
 def materialize_plan(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    confirm: bool = False,
     from_date: Optional[str] = None,
     to_date: Optional[str] = None,
 ) -> dict:
@@ -166,25 +169,71 @@ def materialize_plan(
     matters because the watch only holds ~25 structured workouts.
 
     **Recommended cadence (watch 25-workout limit): materialize ONE WEEK
-    at a time** — e.g. every Monday, `materialize_plan(from_date=<today>,
-    to_date=<sunday>)` — and run `cleanup_workout_templates` in the same
-    session to drop completed templates. Materializing a whole multi-month
-    block floods the watch's workout list and today's session can silently
-    fail to appear on the device.
+    at a time** — e.g. every Monday, `materialize_plan(
+    start_date=<monday>, end_date=<sunday>)` — and run
+    `cleanup_workout_templates` in the same session to drop completed
+    templates. Materializing a whole multi-month block floods the watch's
+    workout list and today's session can silently fail to appear on the
+    device. Calling with NO date bounds while the plan holds more than
+    ~3 weeks of unmaterialized workouts therefore returns a
+    `needs_confirmation` preview instead of proceeding — re-run with
+    `confirm=True` only if flooding the device is genuinely intended.
 
     Skips rest/strength workouts (no Garmin template needed).
 
     Args:
-        from_date: Optional 'YYYY-MM-DD' — only materialize workouts on or
-            after this date.
-        to_date: Optional 'YYYY-MM-DD' — only materialize workouts on or
-            before this date. Combine with from_date for the weekly window.
+        start_date: Optional 'YYYY-MM-DD' — only materialize workouts on
+            or after this date. (Same naming as the other date-ranged
+            tools; `from_date` is accepted as a deprecated alias.)
+        end_date: Optional 'YYYY-MM-DD' — only materialize workouts on or
+            before this date. Combine with start_date for the weekly
+            window. (`to_date` is a deprecated alias.)
+        confirm: Set True to materialize an unbounded span larger than
+            ~3 weeks anyway (see needs_confirmation above).
+        from_date: Deprecated alias for start_date.
+        to_date: Deprecated alias for end_date.
     """
     import sqlite3
+
+    start_date = start_date or from_date
+    end_date = end_date or to_date
 
     p = plan_mod.load_plan()
     if not p:
         return {"error": "No plan at coach_data/plan.json. Use save_plan first."}
+
+    # Guard: an unbounded call over a long plan floods the watch's
+    # ~25-workout list — the most common cause is a mis-typed/ignored
+    # date parameter, not actual intent. Preview + explicit confirm.
+    if not confirm:
+        from datetime import date as _date
+
+        pending_dates = sorted(
+            w["date"] for w in p["workouts"]
+            if w.get("type") not in ("rest", "strength")
+            and not w.get("garmin_workout_id")
+            and (not start_date or w["date"] >= start_date)
+            and (not end_date or w["date"] <= end_date)
+        )
+        if pending_dates:
+            span_days = (
+                _date.fromisoformat(pending_dates[-1])
+                - _date.fromisoformat(pending_dates[0])
+            ).days
+            if span_days > 21:
+                return {
+                    "needs_confirmation": True,
+                    "pending_workouts": len(pending_dates),
+                    "span": f"{pending_dates[0]} → {pending_dates[-1]} ({span_days} days)",
+                    "reason": (
+                        "This call would materialize far more than the "
+                        "recommended one-week window and flood the watch's "
+                        "~25-workout list. If you meant one week, pass "
+                        f"start_date/end_date (e.g. start_date='{pending_dates[0]}', "
+                        "end_date=<sunday>)."
+                    ),
+                    "proceed": "Re-run with confirm=True to materialize the full span anyway.",
+                }
 
     # Template-reuse index: structure_hash → workout_id, kept in the
     # created_workouts registry and validated against templates that still
@@ -223,9 +272,9 @@ def materialize_plan(
     errors: list[str] = []
 
     for w in p["workouts"]:
-        if from_date and w["date"] < from_date:
+        if start_date and w["date"] < start_date:
             continue
-        if to_date and w["date"] > to_date:
+        if end_date and w["date"] > end_date:
             continue
         if w.get("type") in ("rest", "strength"):
             continue

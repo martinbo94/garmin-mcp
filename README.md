@@ -291,7 +291,7 @@ git.
 | `get_plan` | Read current `plan.json` |
 | `summarize_plan` | Preview per-week structure before saving |
 | `save_plan` | Write `plan.json` |
-| `materialize_plan` | Push planned workouts to Garmin calendar — identical sessions share one template, and `from_date`/`to_date` enable the recommended one-week-at-a-time cadence |
+| `materialize_plan` | Push planned workouts to Garmin calendar — identical sessions share one template, and `start_date`/`end_date` enable the recommended one-week-at-a-time cadence (unbounded calls over >3 weeks require `confirm=True`) |
 | `compare_plan_vs_actual` | Compliance per workout (type + ±15% distance) |
 
 ## MCP resources
@@ -326,7 +326,7 @@ Claude reads `coach://classification` + `coach://user_profile`, calls
 Materialize ONE week at a time rather than a whole block: most watches
 only hold ~25 structured workouts, and a fully-materialized multi-month
 plan crowds today's session off the device. The Monday routine is
-`materialize_plan(from_date=<monday>, to_date=<sunday>)` +
+`materialize_plan(start_date=<monday>, end_date=<sunday>)` +
 `cleanup_workout_templates` (shows an itemized dry-run list first) to
 drop completed templates. The rest of the plan stays in `plan.json`
 until its week arrives.
