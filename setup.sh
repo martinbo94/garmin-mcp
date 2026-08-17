@@ -77,8 +77,21 @@ if Path(token_store).exists():
 from garminconnect import Garmin
 
 def prompt_mfa():
+    # stdin is the heredoc that delivered this script, so input() would hit
+    # EOF — read the code from the controlling terminal instead.
     print("  MFA required. Open your authenticator app.")
-    return input("  MFA code: ").strip()
+    print("  MFA code: ", end="", flush=True)
+    try:
+        with open("/dev/tty") as tty:
+            code = tty.readline()
+    except OSError:
+        try:
+            code = input()
+        except EOFError:
+            code = ""
+    if not code:
+        sys.exit("  No MFA code entered (no interactive terminal available).")
+    return code.strip()
 
 g = Garmin(email, password, prompt_mfa=prompt_mfa)
 g.login(tokenstore=token_store)
