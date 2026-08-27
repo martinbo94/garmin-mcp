@@ -14,6 +14,8 @@ def sync_activities(
     backfill_links: bool = False,
     backfill_streams: bool = False,
     backfill_gear: bool = False,
+    backfill_laps: bool = False,
+    backfill_activity_metrics: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
 ) -> dict:
@@ -48,29 +50,38 @@ def sync_activities(
             those fields existed. One extra API call per activity —
             new activities get this automatically; this is only for
             history.
-        backfill_links: If True, also fetch workout-linkage detail for
-            cached activities synced before those fields existed (one API
-            call each). New activities get this automatically.
-        backfill_streams: If True, populate the elevation/pace/distance/
-            cadence stream columns for activities whose cached stream
-            predates them (one API call each). New activities get these
-            automatically; this is only for history. Use after this change
-            to enrich existing streams.
+        backfill_streams: If True, populate the extra stream columns
+            (elevation / pace / distance / cadence / performance condition /
+            grade-adjusted speed) for activities whose cached stream predates
+            them (one API call each). New activities get these automatically;
+            this is only for history. Also fills the perf_cond_* summary
+            columns, so run it before trusting a performance-condition trend
+            over older sessions.
+        backfill_laps: If True, re-fetch laps for cached activities whose
+            laps_json predates the per-lap running-dynamics fields (cadence,
+            ground contact, vertical oscillation/ratio, stride, power,
+            respiration) — one API call each. HR/pace lap data is unaffected.
+        backfill_activity_metrics: If True, populate the activity-level
+            running-dynamics / power / training-load / VO2max columns for
+            history synced before they existed. Cheap — these ride on the
+            activity list payload, so it re-lists the trailing year in
+            batches rather than calling per activity.
         backfill_gear: If True, fetch the gear (shoe) used for cached
             activities that never got it (one API call each). New activities
             get this automatically; this is only for history.
         backfill_max: Max activities to backfill per call (default 100),
-            shared by both backfills. The `remaining_*` field in each
+            shared by the backfills. The `remaining_*` field in each
             backfill result tells you whether another round is needed.
         wellness_days: Trailing days of wellness to refresh (default 10;
             0 to skip). Historical wellness backfill is via
             get_wellness_history.
 
     Returns dict with new_activities, streams_fetched, laps_fetched,
-    details_fetched, wellness_fetched/wellness_cached, last_sync, per-item
-    errors, and — for freshness checks — `cache_newest_activity` and
-    `cache_newest_wellness` (the newest cached dates). With backfill_links /
-    backfill_streams, also a `backfill` / `stream_backfill` block.
+    details_fetched, wellness_fetched/wellness_cached, vo2max_days,
+    last_sync, per-item errors, and — for freshness checks —
+    `cache_newest_activity` and `cache_newest_wellness` (the newest cached
+    dates). Each requested backfill adds its own block: `backfill`,
+    `stream_backfill`, `gear_backfill`, `lap_backfill`, `metrics_backfill`.
     """
     result = garmin_sync.run_sync(
         _client(), force_full=force_full, weeks_back=weeks_back,
@@ -87,6 +98,14 @@ def sync_activities(
     if backfill_gear and "error" not in result:
         result["gear_backfill"] = garmin_sync.backfill_gear(
             _client(), max_activities=backfill_max
+        )
+    if backfill_laps and "error" not in result:
+        result["lap_backfill"] = garmin_sync.backfill_laps(
+            _client(), max_activities=backfill_max
+        )
+    if backfill_activity_metrics and "error" not in result:
+        result["metrics_backfill"] = garmin_sync.backfill_activity_metrics(
+            _client()
         )
     return result
 
@@ -178,7 +197,16 @@ def query_activity_cache(
                  associated_workout_id, planned_type,
                  training_effect_label, workout_rpe, workout_feel,
                  workout_compliance, detail_fetched_at,
-                 gear_uuid, gear_name)
+                 gear_uuid, gear_name,
+                 avg_cadence_spm, max_cadence_spm, avg_ground_contact_ms,
+                 avg_gct_balance_pct, avg_vertical_osc_cm,
+                 avg_vertical_ratio_pct, avg_stride_length_cm,
+                 avg_power_w, max_power_w, norm_power_w,
+                 avg_respiration_rate, avg_grade_adj_speed, steps,
+                 activity_training_load, aerobic_training_effect,
+                 anaerobic_training_effect, vo2max_at_activity,
+                 perf_cond_first, perf_cond_min, perf_cond_max,
+                 perf_cond_avg, perf_cond_last, metrics_fetched_at)
           associated_workout_id: Garmin workout template the activity
           executed (null for free runs). planned_type: the plan's label
           for that workout (threshold/easy/long/...) — ground truth for
@@ -189,6 +217,21 @@ def query_activity_cache(
           gear_uuid/gear_name: the shoe used (joins gear.uuid); null when
           no gear was assigned or the activity isn't gear-synced yet
           (sync_activities(backfill_gear=True) populates history).
+          Running dynamics (avg_cadence_spm .. avg_grade_adj_speed) come
+          off the Garmin activity list payload: cadence in steps/min (NOT
+          the half-step stream units), stride length in CENTIMETRES,
+          avg_gct_balance_pct = left-foot share (50 = even), power in watts
+          from the wrist-based estimate. They are strongly pace-dependent —
+          always group by session type before comparing.
+          activity_training_load / aerobic_training_effect /
+          anaerobic_training_effect are Garmin's own per-session load and
+          TE scores. vo2max_at_activity is Garmin's VO2max as of that
+          activity at integer resolution — use vo2max_daily.vo2max for
+          trend maths, it carries the decimal.
+          perf_cond_* summarize the performance-condition stream (see
+          streams.perf_condition_json); NULL where the metric was never
+          emitted. metrics_fetched_at NULL = row predates these columns,
+          fix with sync_activities(backfill_activity_metrics=True).
       gear(uuid, name, make_model, type, status, in_use_since,
                  retired_at, total_distance_km, total_activities, synced_at)
           Gear library (shoes etc.), status='active'/'retired'. Join
@@ -198,18 +241,34 @@ def query_activity_cache(
                  plan_name, planned_date, updated_at)
           Durable workout_id → planned type mapping, written at
           materialize time; survives plan.json being replaced.
-      laps(activity_id, laps_json, fetched_at)
-          laps_json: JSON array of laps, each with lap_index, lap_type
-          ('wu'/'drag'/'pause'/'cd'/'lap'), distance_m, moving_time_s,
-          avg_hr, max_hr, avg_speed_m_s.
+      laps(activity_id, laps_json, fetched_at, dynamics_fetched_at)
+          laps_json: JSON array of laps, each with lap_index,
+          average_heartrate, max_heartrate, distance (m), elapsed_time (s),
+          moving_time (s), average_speed (m/s), start_date_local,
+          intensityType, plus per-lap running dynamics: avg_cadence_spm,
+          ground_contact_ms, gct_balance_pct, vertical_osc_cm,
+          vertical_ratio_pct, stride_length_cm, avg_power_w, norm_power_w,
+          avg_grade_adj_speed, avg_respiration_rate. Note the lap_type tag
+          ('wu'/'drag'/'pause'/'cd'/'easy') is computed at read time by
+          activity_breakdown and is NOT stored in laps_json.
+          dynamics_fetched_at NULL = row predates the dynamics fields; fix
+          with sync_activities(backfill_laps=True).
       streams(activity_id, time_json, hr_json, elevation_json, speed_json,
-                 distance_json, cadence_json, extras_fetched_at)
+                 distance_json, cadence_json, perf_condition_json,
+                 grade_adj_speed_json, extras_fetched_at, perf_fetched_at)
           Parallel JSON arrays, all the same length and index-aligned to
           time_json (elapsed seconds): hr (bpm), elevation (m), speed (m/s),
           distance (cumulative m), cadence (Garmin directRunCadence =
           strides/min, i.e. ~half steps-per-minute — double for spm).
           elevation/speed/distance/
-          cadence are NULL for streams cached before they were added —
+          perf_condition (Garmin "ytelseskondisjon", -20..+20; leading
+          samples are legitimately NULL because Garmin needs 6-20 min of
+          running before its first estimate), grade_adj_speed (m/s, pace
+          normalized for gradient — use this, not speed, when comparing
+          effort across hilly and flat sessions).
+          The extra arrays are NULL for streams cached before they were added
+          (extras_fetched_at covers elevation/speed/distance/cadence,
+          perf_fetched_at covers perf_condition/grade_adj_speed) —
           sync_activities(backfill_streams=True) populates them; they're also
           NULL per-sample for activities lacking a metric (e.g. indoor =
           no elevation/GPS). These are LARGE (thousands of points) — never
@@ -219,6 +278,13 @@ def query_activity_cache(
           FROM streams,
                json_each(hr_json) he, json_each(elevation_json) ee
           WHERE activity_id = 123 AND he.key = ee.key.
+      vo2max_daily(date, vo2max, vo2max_rounded, fitness_age, synced_at)
+          Garmin's own VO2max estimate. SPARSE BY DESIGN — a row exists only
+          for days Garmin recomputed it (i.e. days with a qualifying
+          outdoor run), so missing dates mean "no new estimate", not "no
+          data". vo2max carries one decimal; vo2max_rounded is the integer
+          the watch shows. Prefer the vo2max_trend tool, which also joins
+          each move to the sessions around it and carries the caveats.
       wellness_daily(date, resting_hr, hrv_overnight_avg, hrv_weekly_avg,
                  hrv_status, hrv_baseline_low, hrv_baseline_upper,
                  sleep_seconds, sleep_score, sleep_deep_s, sleep_rem_s,
@@ -265,7 +331,15 @@ def activity_breakdown(activity_id: int) -> dict:
     - Metadata: id, date, name, description, distance_m, moving_time_s,
       avg_hr, max_hr, sport_type
     - `laps`: list of {lap_index, type, distance_m, moving_time_s,
-      pace_s_per_km, avg_hr, max_hr}. `type` is auto-classified as
+      pace_s_per_km, avg_hr, max_hr, form}. `form` (present when Garmin
+      reported dynamics) carries cadence_spm, stride_cm, gct_ms,
+      vert_osc_cm, vert_ratio_pct, power_w, resp_rate for that lap — read
+      ACROSS the drag laps to see fatigue accumulate: a shortening stride
+      at held cadence, with power falling and HR climbing, is the standard
+      signature of reps biting. Pause-lap dynamics are meaningless (walking
+      or standing skews every one of them) — ignore them. Laps cached
+      before these fields existed have no `form`; fix with
+      sync_activities(backfill_laps=True). `type` is auto-classified as
       "drag" (work rep, Z3+ avg HR ≥30s), "pause" (recovery between
       drags), "wu" (warmup before first drag), "cd" (cooldown after
       last drag), or "easy" (continuous easy run, no drags found).
@@ -429,279 +503,92 @@ def update_activity(
 
 
 @mcp.tool()
-def running_form_trends(activities_to_analyze: int = 20) -> dict:
-    """Track running dynamics (form) over recent runs using Garmin data.
+def running_form_trends(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    sport_type: str = "Run",
+    classification: Optional[str] = None,
+    limit: int = 200,
+) -> dict:
+    """Running-dynamics (form) trends over the local cache — no Garmin calls.
 
-    Fetches the last 30 activities from Garmin, filters to runs, and
-    extracts running dynamics: cadence, ground contact time, vertical
-    oscillation, stride length, and vertical ratio.
+    Covers cadence, ground contact time, ground-contact balance, vertical
+    oscillation, vertical ratio, stride length, running power and respiration
+    rate. Reads the cache, so the window is the whole synced history rather
+    than Garmin's last 30 activities.
+
+    **Form metrics are pace-dependent, and that dominates everything else
+    here.** Cadence and stride length rise with speed; ground contact time
+    falls. Pooling easy runs with intervals produces an average that
+    describes the session mix, not the runner. So:
+      - every `per_activity` row carries `pace_s_per_km` and its
+        `classification`;
+      - `by_classification` gives the averages split by session type — **this
+        is the block to compare across time**, not the pooled `averages`;
+      - a `trends` direction can flip purely because the session mix changed
+        between the two halves of the window. Check that before reporting
+        form decay.
 
     Args:
-        activities_to_analyze: How many recent runs to include in the
-            analysis. Default 20. Must be between 1 and 30.
+        start_date / end_date: 'YYYY-MM-DD' inclusive bounds. Default: the
+            whole cache.
+        sport_type: exact match, default 'Run'. Dynamics only exist for
+            running.
+        classification: restrict to one session type (easy / threshold /
+            intervals / long / prog-long / race / tempo) — the cleanest way
+            to get a like-for-like trend.
+        limit: max `per_activity` rows returned (most recent kept, cap 1000).
+            Averages and trends are computed over the full match set.
 
-    Returns:
-        - per_activity: list of {date, distance_km, cadence, ground_contact_ms,
-          vertical_osc_cm, stride_length_m, vertical_ratio_pct}
-        - averages: mean of each metric across all analyzed runs
-        - trends: comparison of first half vs second half of analyzed window
-          (improving/stable/declining per metric, and raw values)
-        - ratings: dict of metric → 'elite'/'good'/'needs_work' based on
-          Garmin benchmarks
-        - insights: list of human-readable coaching observations
+    Returns window, per_activity, averages, by_classification, trends,
+    ratings (Garmin benchmark bands), insights, notes, and
+    `activities_without_metrics` — a non-zero count there means part of the
+    cache predates these columns; run
+    sync_activities(backfill_activity_metrics=True) to fill it in.
 
-    Garmin benchmarks used for ratings:
-        - Cadence (spm): ≥180 elite, 170-179 good, <165 needs work
-        - Ground contact (ms): <200 elite, 200-240 good, >260 needs work
-        - Vertical oscillation (cm): <6 elite, 6-8 good, >10 needs work
-        - Vertical ratio (%): <6 elite, 6-8 good, >10 needs work
+    Ratings use Garmin's published population bands (cadence >=180 elite,
+    ground contact <200 ms elite, vertical oscillation <6 cm elite, vertical
+    ratio <6% elite). They are not targets — height and leg length move
+    oscillation independently of running economy, so treat a "needs_work"
+    on a tall runner as context, not a fault.
     """
-    try:
-        activities_to_analyze = max(1, min(30, activities_to_analyze))
-        raw = _client().get_activities(0, 30)
-        if not raw:
-            return {"error": "No activities returned from Garmin API."}
-
-        runs = [
-            a for a in raw
-            if (a.get("activityType") or {}).get("typeKey", "").endswith("running")
-            or (a.get("activityType") or {}).get("typeKey", "") in (
-                "running", "indoor_running", "treadmill_running",
-                "trail_running", "track_running", "virtual_run",
-            )
-        ]
-
-        if not runs:
-            return {"error": "No running activities found in the last 30 activities."}
-
-        runs = runs[:activities_to_analyze]
-
-        per_activity = []
-        for act in runs:
-            date_str = (act.get("startTimeLocal") or "")[:10]
-            dist_m = act.get("distance") or 0
-            dist_km = round(dist_m / 1000, 2) if dist_m else None
-
-            cadence = act.get("averageRunningCadenceInStepsPerMinute")
-            gct = act.get("avgGroundContactTime")       # milliseconds
-            vo = act.get("avgVerticalOscillation")       # centimeters
-            stride = act.get("avgStrideLength")          # centimeters from the API
-            vr = act.get("avgVerticalRatio")             # percent
-            if stride is not None:
-                stride = stride / 100.0                  # → meters
-
-            # Skip activities with no running dynamics at all
-            if all(v is None for v in (cadence, gct, vo, stride, vr)):
-                continue
-
-            per_activity.append({
-                "date": date_str,
-                "distance_km": dist_km,
-                "cadence": round(cadence, 1) if cadence is not None else None,
-                "ground_contact_ms": round(gct, 1) if gct is not None else None,
-                "vertical_osc_cm": round(vo, 1) if vo is not None else None,
-                "stride_length_m": round(stride, 2) if stride is not None else None,
-                "vertical_ratio_pct": round(vr, 1) if vr is not None else None,
-            })
-
-        if not per_activity:
-            return {
-                "error": (
-                    "No running dynamics data found. Your Garmin device may not "
-                    "record running form metrics, or no runs have been synced yet."
-                ),
-                "activities_checked": len(runs),
-            }
-
-        def _avg(field: str) -> Optional[float]:
-            vals = [a[field] for a in per_activity if a.get(field) is not None]
-            return round(sum(vals) / len(vals), 1) if vals else None
-
-        averages = {
-            "cadence": _avg("cadence"),
-            "ground_contact_ms": _avg("ground_contact_ms"),
-            "vertical_osc_cm": _avg("vertical_osc_cm"),
-            "stride_length_m": _avg("stride_length_m"),
-            "vertical_ratio_pct": _avg("vertical_ratio_pct"),
-            "runs_with_data": len(per_activity),
-        }
-
-        # Trends: first half vs second half (chronological order — oldest first)
-        # per_activity is newest-first (Garmin API order), so reverse for trend calc
-        ordered = list(reversed(per_activity))
-        mid = len(ordered) // 2
-        first_half = ordered[:mid] if mid > 0 else []
-        second_half = ordered[mid:] if mid > 0 else ordered
-
-        def _half_avg(half: list[dict], field: str) -> Optional[float]:
-            vals = [a[field] for a in half if a.get(field) is not None]
-            return round(sum(vals) / len(vals), 1) if vals else None
-
-        def _trend_direction(field: str, higher_is_better: bool) -> str:
-            """Return 'improving', 'stable', or 'declining'."""
-            a = _half_avg(first_half, field)
-            b = _half_avg(second_half, field)
-            if a is None or b is None:
-                return "insufficient_data"
-            delta = b - a
-            threshold = abs(a) * 0.02  # 2% change threshold for "stable"
-            if abs(delta) <= threshold:
-                return "stable"
-            if (delta > 0) == higher_is_better:
-                return "improving"
-            return "declining"
-
-        trends = {
-            "cadence": {
-                "direction": _trend_direction("cadence", higher_is_better=True),
-                "first_half_avg": _half_avg(first_half, "cadence"),
-                "second_half_avg": _half_avg(second_half, "cadence"),
-            },
-            "ground_contact_ms": {
-                "direction": _trend_direction("ground_contact_ms", higher_is_better=False),
-                "first_half_avg": _half_avg(first_half, "ground_contact_ms"),
-                "second_half_avg": _half_avg(second_half, "ground_contact_ms"),
-            },
-            "vertical_osc_cm": {
-                "direction": _trend_direction("vertical_osc_cm", higher_is_better=False),
-                "first_half_avg": _half_avg(first_half, "vertical_osc_cm"),
-                "second_half_avg": _half_avg(second_half, "vertical_osc_cm"),
-            },
-            "stride_length_m": {
-                "direction": _trend_direction("stride_length_m", higher_is_better=True),
-                "first_half_avg": _half_avg(first_half, "stride_length_m"),
-                "second_half_avg": _half_avg(second_half, "stride_length_m"),
-            },
-            "vertical_ratio_pct": {
-                "direction": _trend_direction("vertical_ratio_pct", higher_is_better=False),
-                "first_half_avg": _half_avg(first_half, "vertical_ratio_pct"),
-                "second_half_avg": _half_avg(second_half, "vertical_ratio_pct"),
-            },
-        }
-
-        # Ratings based on Garmin benchmarks
-        def _rate_cadence(v: Optional[float]) -> Optional[str]:
-            if v is None:
-                return None
-            if v >= 180:
-                return "elite"
-            if v >= 170:
-                return "good"
-            return "needs_work"
-
-        def _rate_gct(v: Optional[float]) -> Optional[str]:
-            if v is None:
-                return None
-            if v < 200:
-                return "elite"
-            if v <= 240:
-                return "good"
-            return "needs_work"
-
-        def _rate_vo(v: Optional[float]) -> Optional[str]:
-            if v is None:
-                return None
-            if v < 6:
-                return "elite"
-            if v <= 8:
-                return "good"
-            return "needs_work"
-
-        def _rate_vr(v: Optional[float]) -> Optional[str]:
-            if v is None:
-                return None
-            if v < 6:
-                return "elite"
-            if v <= 8:
-                return "good"
-            return "needs_work"
-
-        ratings = {
-            "cadence": _rate_cadence(averages["cadence"]),
-            "ground_contact_ms": _rate_gct(averages["ground_contact_ms"]),
-            "vertical_osc_cm": _rate_vo(averages["vertical_osc_cm"]),
-            "vertical_ratio_pct": _rate_vr(averages["vertical_ratio_pct"]),
-        }
-
-        # Insights
-        insights: list[str] = []
-
-        cad = averages.get("cadence")
-        if cad is not None:
-            if cad < 165:
-                insights.append(
-                    f"Cadence is low at {cad} spm — focus on quick, light steps. "
-                    "A metronome or cadence cue during easy runs can help."
-                )
-            elif cad < 170:
-                insights.append(
-                    f"Cadence ({cad} spm) is below the 170 spm threshold — "
-                    "some improvement possible."
-                )
-            elif cad >= 180:
-                insights.append(f"Cadence is elite at {cad} spm.")
-
-        gct = averages.get("ground_contact_ms")
-        if gct is not None:
-            if gct > 260:
-                insights.append(
-                    f"Ground contact time is high at {gct} ms — indicates heavy "
-                    "footstrike or overstriding. Focus on landing under your hips."
-                )
-            elif gct < 200:
-                insights.append(f"Ground contact time is excellent at {gct} ms.")
-
-        vo = averages.get("vertical_osc_cm")
-        if vo is not None:
-            if vo > 10:
-                insights.append(
-                    f"Vertical oscillation is high at {vo} cm — you may be "
-                    "bouncing more than needed. Aim for forward propulsion."
-                )
-            elif vo < 6:
-                insights.append(f"Vertical oscillation is excellent at {vo} cm.")
-
-        vr = averages.get("vertical_ratio_pct")
-        if vr is not None:
-            if vr > 10:
-                insights.append(
-                    f"Vertical ratio is high at {vr}% — "
-                    "energy is being spent going up rather than forward."
-                )
-            elif vr < 6:
-                insights.append(f"Vertical ratio is excellent at {vr}%.")
-
-        # Trend-based insights
-        for metric, label in [
-            ("cadence", "Cadence"),
-            ("ground_contact_ms", "Ground contact time"),
-            ("vertical_osc_cm", "Vertical oscillation"),
-            ("vertical_ratio_pct", "Vertical ratio"),
-        ]:
-            t = trends.get(metric, {})
-            if t.get("direction") == "improving":
-                insights.append(f"{label} is trending in the right direction.")
-            elif t.get("direction") == "declining":
-                insights.append(
-                    f"{label} has been trending in the wrong direction recently — "
-                    "worth monitoring."
-                )
-
-        if not insights:
-            insights.append("Running form looks consistent — no major issues detected.")
-
-        return {
-            "per_activity": per_activity,
-            "averages": averages,
-            "trends": trends,
-            "ratings": ratings,
-            "insights": insights,
-        }
-
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+    return garmin_sync.running_form_trends(
+        start_date=start_date, end_date=end_date, sport_type=sport_type,
+        classification=classification, limit=limit,
+    )
 
 
+@mcp.tool()
+def performance_condition(activity_id: int) -> dict:
+    """Garmin's performance condition ("ytelseskondisjon") for one activity.
+
+    The number that appears on the watch 6-20 minutes into a run, and its
+    whole time course afterwards — the same data the Connect app draws as
+    "ytelseskondisjon over tid".
+
+    What it measures: a -20..+20 comparison of the current effort's pace/HR
+    relationship against Garmin's model of the athlete's recent performance.
+    **0 means "exactly as your recent baseline predicts"**, so a strong
+    session can legitimately read 0 the whole way. It is not a fitness score
+    and not a readiness score.
+
+    Returns first_value + first_at_min (the pop-up number), min / max / avg /
+    last, `drift` (last - first), `by_quarter` (the curve's shape),
+    `per_lap` (mean per lap with its drag/pause/wu/cd tag — where interval
+    rep-to-rep decay shows), and an `interpretation` block.
+
+    HOW TO READ IT: the within-session shape is the signal. Holding flat or
+    rising through a long run is durability; a steady sag is fatigue, heat or
+    a too-fast start. The absolute level is far weaker evidence, because the
+    baseline it compares against moves as fitness moves — after a good block
+    the same run scores lower. Never recalibrate zones, paces or LT2 from it,
+    and never let it override the athlete's own read of the session.
+
+    Requires a cached stream. Activities synced before performance condition
+    was stored return a `reason` pointing at
+    sync_activities(backfill_streams=True).
+    """
+    return garmin_sync.performance_condition(activity_id)
 
 
 @mcp.tool()

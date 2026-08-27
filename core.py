@@ -70,6 +70,24 @@ If the profile exists and is filled in, proceed normally.
 
 4. WEEKLY VOLUME / ZONE TIME: `weekly_summary`.
 
+5. GARMIN'S DERIVED METRICS — `vo2max_trend`, `performance_condition`,
+   `running_form_trends`. All three are DESCRIPTIVE ONLY. Report them,
+   trend them, use them to raise a question — but they never gate a
+   session and they never override the athlete's own read of the day or
+   a race result. Specifically:
+   - VO2max is smoothed and derived from the pace/HR relationship, so
+     heat, hills, fatigue and wrist-HR error push it down, and it often
+     sags through a block in which fitness is rising. Never present a
+     single day's delta as a given workout's effect.
+   - Performance condition is measured against Garmin's model of RECENT
+     performance, so 0 means "as expected", not "average". Read the
+     within-session shape (holds vs. sags), not the absolute level.
+   - Running-dynamics numbers are pace-dependent. Compare like session
+     type with like session type (`by_classification`), never a pooled
+     average across easy runs and intervals.
+   These are the same class of signal as HRV/readiness: context to
+   explain, not a verdict to obey.
+
 ━━━ WHEN THE USER USES THE BAKKEN FRAMEWORK ━━━━━━━━━━━━━━━━━━━━━━━━
 
 Pre-analysis protocol (race goal, weekly review, plan tweak):
@@ -100,7 +118,9 @@ Core tools:
 - Schedule: `schedule_workout`, `reschedule_workout`, `swap_scheduled_workouts`
 - Review a session: `activity_breakdown`
 - Daily readiness: `morning_check_in`
-- Trends: `get_wellness_history`, `weekly_summary`
+- Trends: `get_wellness_history`, `weekly_summary`, `vo2max_trend`,
+  `running_form_trends`
+- Single-session Garmin metrics: `performance_condition`
 
 Skip the Bakken-specific analysis (session_category, profile A/B/C,
 sub-threshold band) — just use HR zones and lap data directly.

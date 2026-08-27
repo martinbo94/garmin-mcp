@@ -478,3 +478,63 @@ def sleep_performance_correlation(
         return {"error": f"{type(exc).__name__}: {exc}"}
 
 
+
+
+@mcp.tool()
+def vo2max_trend(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict:
+    """Garmin's VO2max day by day, joined to the sessions around each move.
+
+    Reads the local cache. Answers both "what is it doing over time" and
+    "which sessions moved it".
+
+    Returns:
+      - daily: [{date, vo2max, vo2max_rounded, delta}] — the series as Garmin
+        wrote it. **Sparse by design:** Garmin only recomputes on days with a
+        qualifying outdoor run, so a missing date means "no new estimate",
+        never "no data". Do not interpolate across gaps or describe them as
+        missing days.
+      - summary: first / last / min / max / peak_date / net_change.
+      - by_session: every day the estimate moved, with that day's activities
+        (classification, distance, avg HR, Garmin training load and TE),
+        sorted by the size of the move.
+      - by_classification: mean move per session type, counting only
+        single-activity days so a double day can't be double-attributed.
+
+    HOW TO PRESENT IT — the estimate is smoothed over recent history, so a
+    single day's delta is not that session's isolated effect. `by_session` is
+    association, not causation; say so rather than telling the athlete a
+    given workout "raised VO2max by 0.3". The estimate reads the pace/HR
+    relationship, so heat, hills, fatigue and wrist-HR error all push it
+    down, and it routinely sags through a heavy block in which fitness is
+    genuinely rising. Race and time-trial results outrank it as evidence of
+    fitness; treat a multi-week decline as a prompt to look at load, heat and
+    sleep, not as a verdict.
+
+    Args:
+        start_date / end_date: 'YYYY-MM-DD' inclusive. Default: everything
+            cached. `coverage` reports how deep the cache goes — extend it
+            with sync_vo2max(start_date, end_date).
+    """
+    return garmin_sync.vo2max_trend(start_date=start_date, end_date=end_date)
+
+
+@mcp.tool()
+def sync_vo2max(start_date: str, end_date: str) -> dict:
+    """Backfill Garmin's daily VO2max estimates for a date range.
+
+    One API call for the whole range, so a full year costs a single request.
+    Routine syncs already keep the trailing 30 days current — use this only
+    to reach deeper history than that (e.g. to see a whole season's
+    trajectory), then read it with vo2max_trend.
+
+    Args:
+        start_date / end_date: 'YYYY-MM-DD' inclusive.
+
+    Returns {vo2max_days, errors} — vo2max_days counts the days Garmin
+    actually had a value for, which is normally far fewer than the days in
+    the range.
+    """
+    return garmin_sync.sync_vo2max_range(_client(), start_date, end_date)

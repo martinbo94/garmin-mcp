@@ -236,7 +236,8 @@ git.
 
 | Tool | What it does |
 |---|---|
-| `running_form_trends` | Cadence, ground contact, vertical oscillation, stride trends |
+| `running_form_trends` | Cadence, ground contact, ground-contact balance, vertical oscillation, vertical ratio, stride length, power and respiration trends over the whole cache — split `by_classification`, because form metrics are pace-dependent and a pooled average describes the session mix, not the runner |
+| `performance_condition` | Garmin's "ytelseskondisjon" for one session: the number that pops up 6-20 min in, its full time course, per-quarter shape, and per-lap means (where an interval session's rep-to-rep decay shows) |
 | `elevation_impact` | Grade-adjusted (flat-equivalent) pace for a hilly run |
 
 ### Wellness / readiness
@@ -246,6 +247,8 @@ git.
 | `morning_check_in` | The single readiness tool: today's metrics + 7-day trend + 90-day baseline drift + acute illness-signal flags + Garmin readiness |
 | `get_wellness_history` | Multi-day wellness trends + long-baseline drift check |
 | `sleep_performance_correlation` | Pre-run-night sleep vs performance, within one session class |
+| `vo2max_trend` | Garmin's VO2max day by day, each move joined to the sessions around it and to per-session-type means |
+| `sync_vo2max` | Backfill the daily VO2max series for a date range (one API call for the whole range) |
 
 ### Training load & periodization
 
@@ -353,6 +356,27 @@ averages), and returns a grade-adjusted per-km plan that sums to the goal —
 even-effort by default, with an optional conservative-start negative-split.
 For hot races it can pull conditions via `forecast_conditions` and
 heat-adjust the target (it'll ask your planned start time).
+
+## Garmin's derived metrics
+
+`vo2max_trend`, `performance_condition` and `running_form_trends` surface
+Garmin's own computed numbers. They are wired in as **descriptive only** — the
+server's instructions tell the agent to report and trend them, never to gate a
+session on them:
+
+- **VO2max** is smoothed over recent history and derived from the pace/HR
+  relationship, so heat, hills, fatigue and wrist-HR error all push it down. It
+  routinely sags through a heavy block in which fitness is rising. A single
+  day's delta is not one session's effect, and race results outrank it.
+- **Performance condition** is measured against Garmin's model of *recent*
+  performance, so 0 means "as expected", not "average", and the baseline moves
+  as fitness moves. The within-session shape (holds vs. sags) is the signal;
+  the absolute level is weak evidence.
+- **Running dynamics** are strongly pace-dependent — cadence and stride length
+  rise with speed, ground contact falls. Only cadence, ground contact, vertical
+  oscillation and vertical ratio get an improving/declining verdict; stride
+  length, power and respiration rate have no inherently good direction and are
+  reported as raw deltas.
 
 ## Notes
 
