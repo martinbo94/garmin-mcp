@@ -15,7 +15,7 @@ from typing import Literal, Optional
 from dotenv import load_dotenv
 from garminconnect import Garmin
 from mcp.server.fastmcp import FastMCP
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -177,10 +177,27 @@ def _client() -> Garmin:
 class EndCondition(BaseModel):
     """How a workout step ends."""
 
-    type: Literal["time", "distance"]
-    value: float = Field(
-        description="Seconds if type='time', meters if type='distance'"
+    type: Literal["time", "distance", "lap.button"]
+    value: Optional[float] = Field(
+        default=None,
+        description=(
+            "Seconds if type='time', meters if type='distance'. "
+            "Omit for type='lap.button' — the step then runs open-ended until "
+            "you press the lap key on the watch."
+        ),
     )
+
+    @model_validator(mode="after")
+    def _check_value(self):
+        if self.type == "lap.button":
+            if self.value is not None:
+                raise ValueError(
+                    "end_condition type 'lap.button' takes no value — the step "
+                    "ends when you press lap."
+                )
+        elif self.value is None:
+            raise ValueError(f"end_condition type '{self.type}' requires a value.")
+        return self
 
 
 class Step(BaseModel):
