@@ -59,6 +59,14 @@ _ST_REPEAT = {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6}
 
 def _end_condition_block(ec: EndCondition):
     """Convert an EndCondition to (Garmin endCondition dict, endConditionValue)."""
+    if ec.type == "lap.button":
+        # Open-ended step: runs until the athlete presses the lap key.
+        # Garmin expects a null endConditionValue here.
+        return (
+            {"conditionTypeId": 1, "conditionTypeKey": "lap.button",
+             "displayOrder": 1, "displayable": True},
+            None,
+        )
     if ec.type == "distance":
         return (
             {"conditionTypeId": 3, "conditionTypeKey": "distance",
@@ -196,6 +204,15 @@ def create_interval_workout(
 
     Multiple entries in `sets` produce back-to-back repeat groups — useful for
     e.g. pyramid workouts (3×400 + 3×800 + 3×400) or broken miles (4×(1600+200)).
+
+    Any step can instead end on a lap press: `{"type": "lap.button"}` with no
+    value. The step then runs open-ended until you press the lap key. This is
+    the natural encoding for a warmup you want to finish when *you* decide —
+    e.g. Bakken's standard warmup, where an open jog is followed by a fixed
+    3-6 min threshold rep used as the day's readiness probe:
+
+        warmup={"end_condition": {"type": "lap.button"},
+                "description": "easy jog — press lap when ready"}
 
     Returns the new workout_id.
     """

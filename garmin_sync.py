@@ -91,7 +91,34 @@ CREATE TABLE IF NOT EXISTS activities (
     start_lon REAL,
     gear_uuid TEXT,
     gear_name TEXT,
-    gear_fetched_at TEXT
+    gear_fetched_at TEXT,
+    -- Running dynamics + power + physiology, all straight off the activity
+    -- LIST payload (no extra API call). NULL for activities synced before
+    -- these columns existed and for sports/devices that don't report them.
+    avg_cadence_spm REAL,
+    max_cadence_spm REAL,
+    avg_ground_contact_ms REAL,
+    avg_gct_balance_pct REAL,
+    avg_vertical_osc_cm REAL,
+    avg_vertical_ratio_pct REAL,
+    avg_stride_length_cm REAL,
+    avg_power_w REAL,
+    max_power_w REAL,
+    norm_power_w REAL,
+    avg_respiration_rate REAL,
+    avg_grade_adj_speed REAL,
+    steps INTEGER,
+    activity_training_load REAL,
+    aerobic_training_effect REAL,
+    anaerobic_training_effect REAL,
+    vo2max_at_activity REAL,
+    -- Performance condition, derived from the stream at store time.
+    perf_cond_first REAL,
+    perf_cond_min REAL,
+    perf_cond_max REAL,
+    perf_cond_avg REAL,
+    perf_cond_last REAL,
+    metrics_fetched_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_activities_date ON activities(start_date_local);
 
@@ -130,7 +157,14 @@ CREATE TABLE IF NOT EXISTS streams (
     speed_json TEXT,
     distance_json TEXT,
     cadence_json TEXT,
+    perf_condition_json TEXT,
+    grade_adj_speed_json TEXT,
     extras_fetched_at TEXT,
+    -- Separate marker for perf_condition_json / grade_adj_speed_json.
+    -- extras_fetched_at can't do double duty: rows backfilled for
+    -- elevation/speed/distance/cadence already have it set, so reusing it
+    -- would silently skip them here.
+    perf_fetched_at TEXT,
     FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
@@ -138,12 +172,27 @@ CREATE TABLE IF NOT EXISTS laps (
     activity_id INTEGER PRIMARY KEY,
     laps_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL,
+    -- Set once the per-lap running-dynamics fields are present in laps_json.
+    -- Rows cached before they existed have it NULL — backfill_laps refetches.
+    dynamics_fetched_at TEXT,
     FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Garmin's own VO2max estimate, one row per day it was recomputed. Sparse
+-- by design: Garmin only writes a value on days with a qualifying activity,
+-- so gaps mean "no new estimate", not "missing data". vo2max is the precise
+-- one-decimal value; vo2max_rounded is the integer the watch displays.
+CREATE TABLE IF NOT EXISTS vo2max_daily (
+    date TEXT PRIMARY KEY,
+    vo2max REAL,
+    vo2max_rounded REAL,
+    fitness_age REAL,
+    synced_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS wellness_daily (
@@ -199,6 +248,32 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     # assigned, so the backfill terminates instead of re-fetching gearless
     # activities forever.
     "gear_fetched_at": "TEXT",
+    # Running dynamics / power / physiology off the activity list payload.
+    "avg_cadence_spm": "REAL",
+    "max_cadence_spm": "REAL",
+    "avg_ground_contact_ms": "REAL",
+    "avg_gct_balance_pct": "REAL",
+    "avg_vertical_osc_cm": "REAL",
+    "avg_vertical_ratio_pct": "REAL",
+    "avg_stride_length_cm": "REAL",
+    "avg_power_w": "REAL",
+    "max_power_w": "REAL",
+    "norm_power_w": "REAL",
+    "avg_respiration_rate": "REAL",
+    "avg_grade_adj_speed": "REAL",
+    "steps": "INTEGER",
+    "activity_training_load": "REAL",
+    "aerobic_training_effect": "REAL",
+    "anaerobic_training_effect": "REAL",
+    "vo2max_at_activity": "REAL",
+    "perf_cond_first": "REAL",
+    "perf_cond_min": "REAL",
+    "perf_cond_max": "REAL",
+    "perf_cond_avg": "REAL",
+    "perf_cond_last": "REAL",
+    # Marks an activity as processed for the metric columns above — set even
+    # when the sport reports none of them, so the backfill terminates.
+    "metrics_fetched_at": "TEXT",
 }
 
 _STREAMS_MIGRATION_COLUMNS = {
@@ -206,10 +281,19 @@ _STREAMS_MIGRATION_COLUMNS = {
     "speed_json": "TEXT",
     "distance_json": "TEXT",
     "cadence_json": "TEXT",
-    # Marks a stream as processed for the extra columns — set even when a
-    # metric is legitimately absent (treadmill = no elevation/GPS), so the
-    # backfill terminates instead of re-fetching no-elevation rows forever.
+    "perf_condition_json": "TEXT",
+    "grade_adj_speed_json": "TEXT",
+    # Markers: a stream is "processed" once fetched, even when a metric is
+    # legitimately absent (treadmill = no elevation/GPS, walk = no
+    # performance condition), so the backfills terminate instead of
+    # re-fetching those rows forever.
     "extras_fetched_at": "TEXT",
+    "perf_fetched_at": "TEXT",
+}
+
+
+_LAPS_MIGRATION_COLUMNS = {
+    "dynamics_fetched_at": "TEXT",
 }
 
 
@@ -221,6 +305,7 @@ def _init_db() -> None:
             ("wellness_daily", _WELLNESS_MIGRATION_COLUMNS),
             ("activities", _ACTIVITY_MIGRATION_COLUMNS),
             ("streams", _STREAMS_MIGRATION_COLUMNS),
+            ("laps", _LAPS_MIGRATION_COLUMNS),
         ):
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             for col, col_type in columns.items():
@@ -292,17 +377,73 @@ def _garmin_list_activities(
     return all_acts
 
 
+# Activity-summary metric columns ← keys on the Garmin activity LIST record.
+# Everything here rides along on a call sync already makes, so populating
+# these costs zero extra requests.
+_ACTIVITY_METRIC_KEYS = {
+    "avg_cadence_spm": "averageRunningCadenceInStepsPerMinute",
+    "max_cadence_spm": "maxRunningCadenceInStepsPerMinute",
+    "avg_ground_contact_ms": "avgGroundContactTime",
+    "avg_gct_balance_pct": "avgGroundContactBalance",
+    "avg_vertical_osc_cm": "avgVerticalOscillation",
+    "avg_vertical_ratio_pct": "avgVerticalRatio",
+    "avg_stride_length_cm": "avgStrideLength",
+    "avg_power_w": "avgPower",
+    "max_power_w": "maxPower",
+    "norm_power_w": "normPower",
+    "avg_respiration_rate": "avgRespirationRate",
+    "avg_grade_adj_speed": "avgGradeAdjustedSpeed",
+    "steps": "steps",
+    "activity_training_load": "activityTrainingLoad",
+    "aerobic_training_effect": "aerobicTrainingEffect",
+    "anaerobic_training_effect": "anaerobicTrainingEffect",
+    # Garmin's VO2max as of this activity. Integer-resolution here; the
+    # one-decimal value lives in vo2max_daily, which is what trend maths
+    # should use. Kept per-activity so a session can be attributed even on
+    # days Garmin wrote no daily row.
+    "vo2max_at_activity": "vO2MaxValue",
+}
+
+
+def _activity_metric_values(act: dict) -> list:
+    """Metric column values, in _ACTIVITY_METRIC_KEYS order, from a list record."""
+    return [act.get(src) for src in _ACTIVITY_METRIC_KEYS.values()]
+
+
+def _store_activity_metrics(act_id: int, act: dict) -> None:
+    """UPDATE the metric columns for an already-cached activity."""
+    sets = ", ".join(f"{col} = ?" for col in _ACTIVITY_METRIC_KEYS)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            f"UPDATE activities SET {sets}, metrics_fetched_at = ? WHERE id = ?",
+            (*_activity_metric_values(act),
+             datetime.now(timezone.utc).isoformat(), act_id),
+        )
+
+
 def _garmin_get_stream(garmin_client, activity_id: int) -> Optional[dict]:
     """Fetch ~2s-resolution HR + elapsed stream (plus elevation, pace, distance,
-    cadence) from Garmin activity details.
+    cadence, performance condition, grade-adjusted speed) from Garmin
+    activity details.
 
     Returns parallel arrays, all the same length, keyed:
       time (elapsed s), heartrate (bpm), elevation (m), speed (m/s),
-      distance (cumulative m), cadence (spm).
+      distance (cumulative m), cadence (spm), perf_condition
+      (dimensionless, Garmin "ytelseskondisjon"), grade_adj_speed (m/s).
     Samples are kept where HR and elapsed are both present; the extra
     metrics are aligned to those kept samples (None when a metric's
     descriptor is absent or its value is missing for a sample). maxchart=6000
     covers ~3.3 hours at 2s/sample. Returns None if there's no HR stream.
+
+    Garmin only starts emitting performance condition 6-20 minutes into a
+    run, so the leading samples of `perf_condition` are legitimately None —
+    that gap is the metric's warm-up, not missing data.
+
+    The other running-dynamics streams Garmin exposes here (vertical
+    oscillation / ratio, ground contact time and balance, stride length,
+    power) are deliberately NOT stored per-sample: the coaching signal lives
+    at lap and session level, which the laps rows and the activity summary
+    columns already carry at a fraction of the size.
     """
     try:
         details = garmin_client.get_activity_details(str(activity_id), maxchart=6000)
@@ -324,6 +465,8 @@ def _garmin_get_stream(garmin_client, activity_id: int) -> Optional[dict]:
         "speed": descriptors.get("directSpeed"),
         "distance": descriptors.get("sumDistance"),
         "cadence": descriptors.get("directRunCadence"),
+        "perf_condition": descriptors.get("directPerformanceCondition"),
+        "grade_adj_speed": descriptors.get("directGradeAdjustedSpeed"),
     }
 
     elapsed_list: list[float] = []
@@ -346,12 +489,18 @@ def _garmin_get_stream(garmin_client, activity_id: int) -> Optional[dict]:
     return {"time": elapsed_list, "heartrate": hr_list, **extra}
 
 
+_STREAM_EXTRA_KEYS = (
+    "elevation", "speed", "distance", "cadence",
+    "perf_condition", "grade_adj_speed",
+)
+
+
 def _stream_extra_json(stream: dict) -> tuple:
-    """Serialize the optional stream arrays (elevation, speed, distance,
-    cadence) to JSON in column order. Stores NULL when a whole array is
-    missing or entirely None (e.g. an indoor run with no elevation)."""
+    """Serialize the optional stream arrays to JSON in column order. Stores
+    NULL when a whole array is missing or entirely None (e.g. an indoor run
+    with no elevation, or a walk with no performance condition)."""
     out = []
-    for key in ("elevation", "speed", "distance", "cadence"):
+    for key in _STREAM_EXTRA_KEYS:
         arr = stream.get(key)
         if arr and any(v is not None for v in arr):
             out.append(json.dumps(arr))
@@ -360,12 +509,68 @@ def _stream_extra_json(stream: dict) -> tuple:
     return tuple(out)
 
 
+def _perf_condition_summary(stream: Optional[dict]) -> dict:
+    """Condense a performance-condition array into the five stored columns.
+
+    `first` is the first value Garmin emitted — the number that pops up on
+    the watch 6-20 min in — and `last` the final one, so `last - first` is
+    the within-session drift (a durability / decoupling proxy: holding or
+    rising through a long run is good, sagging is fatigue). Returns all-None
+    when the activity has no performance-condition samples.
+    """
+    vals = [v for v in ((stream or {}).get("perf_condition") or [])
+            if v is not None]
+    if not vals:
+        return {k: None for k in
+                ("first", "min", "max", "avg", "last")}
+    return {
+        "first": float(vals[0]),
+        "min": float(min(vals)),
+        "max": float(max(vals)),
+        "avg": round(sum(vals) / len(vals), 2),
+        "last": float(vals[-1]),
+    }
+
+
+def _store_stream(activity_id: int, stream: dict) -> None:
+    """Upsert a stream row and the derived performance-condition columns.
+
+    Both writes happen here so the stored array and the summary columns on
+    `activities` can never drift apart.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    pc = _perf_condition_summary(stream)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO streams (activity_id, time_json, hr_json, "
+            "elevation_json, speed_json, distance_json, cadence_json, "
+            "perf_condition_json, grade_adj_speed_json, extras_fetched_at, "
+            "perf_fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (activity_id, json.dumps(stream["time"]),
+             json.dumps(stream["heartrate"]),
+             *_stream_extra_json(stream), now, now),
+        )
+        conn.execute(
+            "UPDATE activities SET perf_cond_first=?, perf_cond_min=?, "
+            "perf_cond_max=?, perf_cond_avg=?, perf_cond_last=? WHERE id=?",
+            (pc["first"], pc["min"], pc["max"], pc["avg"], pc["last"],
+             activity_id),
+        )
+
+
 def _garmin_get_laps(garmin_client, activity_id: int) -> list[dict]:
     """Fetch lapDTOs from Garmin and normalise to our internal field names.
 
     Normalised lap dict:
       lap_index, average_heartrate, max_heartrate, distance, elapsed_time,
-      moving_time, average_speed, start_date_local, intensityType.
+      moving_time, average_speed, start_date_local, intensityType,
+      plus the per-lap running dynamics Garmin reports on the same payload:
+      avg_cadence_spm, ground_contact_ms, gct_balance_pct, vertical_osc_cm,
+      vertical_ratio_pct, stride_length_cm, avg_power_w, norm_power_w,
+      avg_grade_adj_speed, avg_respiration_rate (None where unreported).
+
+    The dynamics come free with the lap fetch — no extra API call — and are
+    what makes per-rep form decay across an interval session visible.
     """
     try:
         splits = garmin_client.get_activity_splits(str(activity_id))
@@ -385,6 +590,16 @@ def _garmin_get_laps(garmin_client, activity_id: int) -> list[dict]:
             "average_speed": speed,
             "start_date_local": (lap.get("startTimeGMT") or "").replace(".0", ""),
             "intensityType": lap.get("intensityType"),
+            "avg_cadence_spm": lap.get("averageRunCadence"),
+            "ground_contact_ms": lap.get("groundContactTime"),
+            "gct_balance_pct": lap.get("groundContactBalanceLeft"),
+            "vertical_osc_cm": lap.get("verticalOscillation"),
+            "vertical_ratio_pct": lap.get("verticalRatio"),
+            "stride_length_cm": lap.get("strideLength"),
+            "avg_power_w": lap.get("averagePower"),
+            "norm_power_w": lap.get("normalizedPower"),
+            "avg_grade_adj_speed": lap.get("avgGradeAdjustedSpeed"),
+            "avg_respiration_rate": lap.get("avgRespirationRate"),
         })
     return out
 
@@ -401,10 +616,12 @@ def _cached_laps(activity_id: int) -> Optional[list[dict]]:
 
 
 def _store_laps(activity_id: int, laps: list[dict]) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO laps (activity_id, laps_json, fetched_at) VALUES (?, ?, ?)",
-            (activity_id, json.dumps(laps), datetime.now(timezone.utc).isoformat()),
+            "INSERT OR REPLACE INTO laps (activity_id, laps_json, fetched_at, "
+            "dynamics_fetched_at) VALUES (?, ?, ?, ?)",
+            (activity_id, json.dumps(laps), now, now),
         )
 
 
@@ -730,11 +947,12 @@ def backfill_workout_links(garmin_client, max_activities: int = 100) -> dict:
 
 
 def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
-    """Populate the new stream columns (elevation/speed/distance/cadence) for
-    cached activities whose streams row predates them (elevation_json IS NULL).
+    """Populate the extra stream columns (elevation / speed / distance /
+    cadence / performance condition / grade-adjusted speed) for cached
+    activities whose streams row predates them (extras_fetched_at IS NULL).
 
     Re-fetches the activity stream (one API call each), newest first, and
-    UPDATEs the four new columns. Existing time/hr arrays are left untouched.
+    rewrites the row plus the derived perf_cond_* columns on `activities`.
     """
     _init_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -742,13 +960,14 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
             """
             SELECT s.activity_id
             FROM streams s JOIN activities a ON a.id = s.activity_id
-            WHERE s.extras_fetched_at IS NULL
+            WHERE s.extras_fetched_at IS NULL OR s.perf_fetched_at IS NULL
             ORDER BY a.start_date_local DESC LIMIT ?
             """,
             (max_activities,),
         )]
         remaining = conn.execute(
-            "SELECT COUNT(*) FROM streams WHERE extras_fetched_at IS NULL"
+            "SELECT COUNT(*) FROM streams "
+            "WHERE extras_fetched_at IS NULL OR perf_fetched_at IS NULL"
         ).fetchone()[0] - len(ids)
 
     updated = 0
@@ -763,19 +982,13 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
             # No stream available — mark processed so it isn't retried forever.
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE streams SET extras_fetched_at=? WHERE activity_id=?",
-                    (datetime.now(timezone.utc).isoformat(), act_id),
+                    "UPDATE streams SET extras_fetched_at=?, perf_fetched_at=? "
+                    "WHERE activity_id=?",
+                    (datetime.now(timezone.utc).isoformat(),
+                     datetime.now(timezone.utc).isoformat(), act_id),
                 )
             continue
-        elev, speed, dist, cad = _stream_extra_json(stream)
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE streams SET elevation_json=?, speed_json=?, "
-                "distance_json=?, cadence_json=?, extras_fetched_at=? "
-                "WHERE activity_id=?",
-                (elev, speed, dist, cad,
-                 datetime.now(timezone.utc).isoformat(), act_id),
-            )
+        _store_stream(act_id, stream)
         updated += 1
 
     return {
@@ -783,6 +996,151 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
         "remaining_without_streams": remaining,
         "errors": errors,
     }
+
+
+def backfill_activity_metrics(
+    garmin_client, weeks_back: int = 52, max_activities: int = 500
+) -> dict:
+    """Populate the running-dynamics / power / VO2max columns on cached
+    activities synced before those columns existed (metrics_fetched_at NULL).
+
+    Cheap: the values live on the activity LIST payload, so this re-lists the
+    trailing `weeks_back` window in batches of 100 rather than making a call
+    per activity. Rows outside that window keep metrics_fetched_at NULL —
+    widen `weeks_back` to reach them.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        pending = {r[0] for r in conn.execute(
+            "SELECT id FROM activities WHERE metrics_fetched_at IS NULL"
+        )}
+    if not pending:
+        return {"metrics_updated": 0, "remaining_without_metrics": 0,
+                "errors": []}
+
+    after = datetime.now(timezone.utc) - timedelta(weeks=weeks_back)
+    try:
+        listed = _garmin_list_activities(garmin_client, after)
+    except Exception as e:
+        return {"metrics_updated": 0,
+                "remaining_without_metrics": len(pending),
+                "errors": [f"list: {type(e).__name__}: {e}"]}
+
+    updated = 0
+    errors: list[str] = []
+    for act in listed:
+        act_id = act.get("activityId")
+        if act_id not in pending or updated >= max_activities:
+            continue
+        try:
+            _store_activity_metrics(act_id, act)
+            updated += 1
+        except Exception as e:
+            errors.append(f"metrics {act_id}: {type(e).__name__}: {e}")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE metrics_fetched_at IS NULL"
+        ).fetchone()[0]
+
+    return {
+        "metrics_updated": updated,
+        "remaining_without_metrics": remaining,
+        "errors": errors,
+    }
+
+
+def backfill_laps(garmin_client, max_activities: int = 100) -> dict:
+    """Re-fetch laps for cached activities whose laps_json predates the
+    per-lap running-dynamics fields (dynamics_fetched_at IS NULL).
+
+    One API call each, newest first. HR/pace lap fields are unchanged by
+    this — it only adds cadence / GCT / vertical / power / respiration.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [r[0] for r in conn.execute(
+            """
+            SELECT l.activity_id
+            FROM laps l JOIN activities a ON a.id = l.activity_id
+            WHERE l.dynamics_fetched_at IS NULL
+            ORDER BY a.start_date_local DESC LIMIT ?
+            """,
+            (max_activities,),
+        )]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM laps WHERE dynamics_fetched_at IS NULL"
+        ).fetchone()[0] - len(ids)
+
+    updated = 0
+    errors: list[str] = []
+    for act_id in ids:
+        try:
+            laps = _garmin_get_laps(garmin_client, act_id)
+        except Exception as e:
+            errors.append(f"laps {act_id}: {type(e).__name__}: {e}")
+            continue
+        if not laps:
+            # Nothing to re-store — mark processed so it isn't retried forever.
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE laps SET dynamics_fetched_at=? WHERE activity_id=?",
+                    (datetime.now(timezone.utc).isoformat(), act_id),
+                )
+            continue
+        _store_laps(act_id, laps)
+        updated += 1
+
+    return {
+        "laps_updated": updated,
+        "remaining_without_lap_dynamics": remaining,
+        "errors": errors,
+    }
+
+
+# ─── VO2max (Garmin max-metrics) ──────────────────────────────────────
+_MAXMET_DAILY_PATH = "/metrics-service/metrics/maxmet/daily/{start}/{end}"
+
+
+def sync_vo2max_range(garmin_client, start_date: str, end_date: str) -> dict:
+    """Pull Garmin's daily VO2max estimates for a date range into vo2max_daily.
+
+    One API call for the whole range (the endpoint takes start/end), so this
+    is cheap enough to run on every sync and to backfill a full year in one
+    go. The series is sparse: Garmin writes a value only on days with a
+    qualifying activity, so absent dates mean "no new estimate that day".
+    """
+    _init_db()
+    try:
+        raw = garmin_client.connectapi(
+            _MAXMET_DAILY_PATH.format(start=start_date, end=end_date)
+        ) or []
+    except Exception as e:
+        return {"vo2max_days": 0, "errors": [f"maxmet: {type(e).__name__}: {e}"]}
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for entry in raw:
+        gen = (entry or {}).get("generic") or {}
+        day = gen.get("calendarDate")
+        if not day:
+            continue
+        rows.append((
+            day,
+            gen.get("vo2MaxPreciseValue"),
+            gen.get("vo2MaxValue"),
+            gen.get("fitnessAge"),
+            now,
+        ))
+    if rows:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO vo2max_daily "
+                "(date, vo2max, vo2max_rounded, fitness_age, synced_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+    return {"vo2max_days": len(rows), "errors": []}
 
 
 # ─── Location + weather (Open-Meteo) ──────────────────────────────────
@@ -950,9 +1308,13 @@ def run_sync(
                 INSERT OR IGNORE INTO activities (
                     id, start_date_local, name, description, type, sport_type,
                     distance_m, moving_time_s, elapsed_time_s, avg_hr, max_hr,
-                    total_elevation_gain, synced_at, training_effect_label
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                    total_elevation_gain, synced_at, training_effect_label,
+                    metrics_fetched_at, {metric_cols}
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{metric_qs})
+                """.format(
+                    metric_cols=", ".join(_ACTIVITY_METRIC_KEYS),
+                    metric_qs=", ?" * len(_ACTIVITY_METRIC_KEYS),
+                ),
                 (
                     act_id, local_str,
                     act.get("activityName") or "",
@@ -966,6 +1328,8 @@ def run_sync(
                     act.get("elevationGain"),
                     sync_start.isoformat(),
                     act.get("trainingEffectLabel"),
+                    sync_start.isoformat(),
+                    *_activity_metric_values(act),
                 ),
             )
         new_count += 1
@@ -986,17 +1350,7 @@ def run_sync(
                 errors.append(f"stream {act_id}: {e}")
                 stream = None
             if stream:
-                with sqlite3.connect(DB_PATH) as conn:
-                    conn.execute(
-                        "INSERT OR IGNORE INTO streams (activity_id, time_json, "
-                        "hr_json, elevation_json, speed_json, distance_json, "
-                        "cadence_json, extras_fetched_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (act_id, json.dumps(stream["time"]),
-                         json.dumps(stream["heartrate"]),
-                         *_stream_extra_json(stream),
-                         datetime.now(timezone.utc).isoformat()),
-                    )
+                _store_stream(act_id, stream)
                 streams_count += 1
 
         if is_cardio and act.get("lapCount", 0) > 1:
@@ -1035,6 +1389,19 @@ def run_sync(
         except Exception as e:
             errors.append(f"wellness: {type(e).__name__}: {e}")
 
+    # Garmin's VO2max estimate for the same trailing window — one call for
+    # the whole range, so this is nearly free. Failures never break sync.
+    vo2max_days = 0
+    if wellness_days and wellness_days > 0:
+        try:
+            today = datetime.now(timezone.utc).date()
+            v_start = (today - timedelta(days=max(wellness_days, 30) - 1)).isoformat()
+            v = sync_vo2max_range(garmin_client, v_start, today.isoformat())
+            vo2max_days = v.get("vo2max_days", 0)
+            errors.extend(v.get("errors", []))
+        except Exception as e:
+            errors.append(f"vo2max: {type(e).__name__}: {e}")
+
     # Refresh the gear library (status + mileage) so the gear tools read
     # locally. Cheap (one list + one stats call per gear item) and failures
     # never break activity sync.
@@ -1066,6 +1433,7 @@ def run_sync(
         "gear_synced": gear_synced,
         "wellness_fetched": wellness_fetched,
         "wellness_cached": wellness_cached,
+        "vo2max_days": vo2max_days,
         "errors": errors,
         "last_sync": sync_start.isoformat(),
         "since": after.isoformat(),
@@ -2160,6 +2528,29 @@ def _lap_zone_secs(
     return secs
 
 
+# Per-lap running dynamics, kept compact because a session can have 20+ laps.
+# Rounded on the way out; absent keys mean Garmin reported nothing for them.
+_LAP_FORM_FIELDS = (
+    ("avg_cadence_spm", "cadence_spm", 0),
+    ("stride_length_cm", "stride_cm", 0),
+    ("ground_contact_ms", "gct_ms", 0),
+    ("vertical_osc_cm", "vert_osc_cm", 1),
+    ("vertical_ratio_pct", "vert_ratio_pct", 1),
+    ("avg_power_w", "power_w", 0),
+    ("avg_respiration_rate", "resp_rate", 1),
+)
+
+
+def _lap_form(lap: dict) -> dict:
+    """Compact running-dynamics block for one lap, empty when unreported."""
+    out = {}
+    for src, key, digits in _LAP_FORM_FIELDS:
+        v = lap.get(src)
+        if v is not None:
+            out[key] = round(v, digits) if digits else round(v)
+    return out
+
+
 def _summarize_laps(
     laps: list[dict],
     activity_start_s: Optional[float] = None,
@@ -2194,6 +2585,9 @@ def _summarize_laps(
             "avg_hr": lap.get("average_heartrate"),
             "max_hr": lap.get("max_heartrate"),
         }
+        form = _lap_form(lap)
+        if form:
+            entry["form"] = form
         if times is not None and hrs is not None and zones is not None:
             entry["zone_secs"] = _lap_zone_secs_by_offset(
                 offset_start, offset_end, times, hrs, zones
@@ -2922,3 +3316,563 @@ def activity_breakdown(activity_id: int) -> dict:
         )
         result["interval_analysis"] = interval_analysis
     return result
+
+
+# ─── Performance condition ("ytelseskondisjon") ───────────────────────
+def performance_condition(activity_id: int) -> dict:
+    """Performance-condition time course for one cached activity.
+
+    Garmin's performance condition is a real-time -20..+20 read of how the
+    current effort's pace/HR relationship compares to the athlete's recent
+    baseline. It is NOT a fitness score: 0 means "running as your recent
+    baseline predicts", so a good session can sit at 0 all the way through.
+    Garmin needs 6-20 minutes of running before it emits a first value.
+
+    Returns:
+      - first_value / first_at_min: the number that pops up on the watch,
+        and how far into the activity it arrived.
+      - min / max / avg / last, plus `drift` (last - first).
+      - by_quarter: mean value per quarter of the sampled window — the shape
+        of the curve, which is what the Connect chart draws.
+      - per_lap: mean value per lap (with the lap's drag/pause/wu/cd tag),
+        present when laps are cached. This is where an interval session's
+        rep-to-rep decay shows up.
+      - interpretation: how to read the numbers, including the baseline
+        caveat below.
+
+    Baseline caveat, worth stating whenever this is reported: the reference
+    is Garmin's own recent-performance model, so a negative value can mean
+    "slower than lately" OR "the baseline drifted up after a good block".
+    Treat it as a within-session shape signal (does it hold or sag?) rather
+    than an absolute verdict on the day.
+    """
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT a.id, a.start_date_local, a.name, a.sport_type,
+                   a.distance_m, a.moving_time_s, a.avg_hr, a.max_hr,
+                   a.planned_type, a.vo2max_at_activity,
+                   s.time_json, s.perf_condition_json, s.perf_fetched_at
+            FROM activities a
+            LEFT JOIN streams s ON s.activity_id = a.id
+            WHERE a.id = ?
+            """,
+            (activity_id,),
+        ).fetchone()
+
+    if not row:
+        return {
+            "error": f"Activity {activity_id} not in local cache.",
+            "next_steps": ["Run sync_activities() to pull recent activities."],
+        }
+
+    if not row["perf_condition_json"]:
+        stale = row["perf_fetched_at"] is None
+        return {
+            "activity_id": activity_id,
+            "date": row["start_date_local"][:10],
+            "name": row["name"],
+            "error": "No performance-condition samples cached for this activity.",
+            "reason": (
+                "This stream was cached before performance condition was "
+                "stored — run sync_activities(backfill_streams=True)."
+                if stale else
+                "Garmin recorded none. Expected for activities shorter than "
+                "~6-20 min, non-running sports, and sessions the watch could "
+                "not baseline."
+            ),
+        }
+
+    times = json.loads(row["time_json"] or "[]")
+    pcs = json.loads(row["perf_condition_json"])
+    samples = [(t, v) for t, v in zip(times, pcs) if v is not None]
+    if not samples:
+        return {
+            "activity_id": activity_id,
+            "error": "Performance-condition array is present but all-null.",
+        }
+
+    vals = [v for _, v in samples]
+    first_t, first_v = samples[0]
+    last_v = samples[-1][1]
+
+    # Quarters of the SAMPLED window (not the whole activity) — the metric
+    # only exists after its warm-up, so quartering the activity would put an
+    # empty first bucket in the report.
+    span_start, span_end = samples[0][0], samples[-1][0]
+    span = span_end - span_start
+    by_quarter = []
+    for q in range(4):
+        lo = span_start + span * q / 4
+        hi = span_start + span * (q + 1) / 4
+        bucket = [v for t, v in samples if (lo <= t < hi or (q == 3 and t == hi))]
+        by_quarter.append({
+            "quarter": q + 1,
+            "from_min": round(lo / 60, 1),
+            "to_min": round(hi / 60, 1),
+            "avg": round(sum(bucket) / len(bucket), 1) if bucket else None,
+            "samples": len(bucket),
+        })
+
+    per_lap = []
+    laps_raw = _cached_laps(activity_id) or []
+    if laps_raw:
+        classified = _classify_laps(laps_raw, _parse_zones())
+        cumulative = 0.0
+        for lap in classified:
+            start = cumulative
+            cumulative += lap.get("elapsed_time") or 0
+            bucket = [v for t, v in samples if start <= t < cumulative]
+            per_lap.append({
+                "lap_index": lap.get("lap_index"),
+                "type": lap.get("lap_type"),
+                "from_min": round(start / 60, 1),
+                "avg": round(sum(bucket) / len(bucket), 1) if bucket else None,
+                "min": min(bucket) if bucket else None,
+                "max": max(bucket) if bucket else None,
+            })
+
+    drift = round(last_v - first_v, 1)
+    if drift >= 1:
+        drift_read = "rose through the session — effort felt easier as it went"
+    elif drift <= -2:
+        drift_read = (
+            "sagged through the session — the pace/HR relationship "
+            "deteriorated, the usual signature of fatigue or heat"
+        )
+    else:
+        drift_read = "essentially flat — the effort held its pace/HR relationship"
+
+    return {
+        "activity_id": activity_id,
+        "date": row["start_date_local"][:10],
+        "name": row["name"],
+        "sport_type": row["sport_type"],
+        "planned_type": row["planned_type"],
+        "distance_km": round((row["distance_m"] or 0) / 1000, 2),
+        "avg_hr": row["avg_hr"],
+        "vo2max_at_activity": row["vo2max_at_activity"],
+        "first_value": first_v,
+        "first_at_min": round(first_t / 60, 1),
+        "min": min(vals),
+        "max": max(vals),
+        "avg": round(sum(vals) / len(vals), 1),
+        "last": last_v,
+        "drift": drift,
+        "sample_count": len(vals),
+        "by_quarter": by_quarter,
+        "per_lap": per_lap,
+        "interpretation": {
+            "drift": drift_read,
+            "scale": (
+                "-20..+20, where 0 = matching Garmin's recent baseline for "
+                "this athlete. Not a fitness score; sustained 0 is normal."
+            ),
+            "baseline_caveat": (
+                "The reference is Garmin's own recent-performance model, so a "
+                "negative run can mean 'slower than lately' OR 'the baseline "
+                "moved up'. Read the within-session shape, not the absolute "
+                "level, and never recalibrate zones or paces off it."
+            ),
+        },
+    }
+
+
+# ─── Running form (dynamics) from the local cache ─────────────────────
+_FORM_FIELDS = (
+    "avg_cadence_spm", "avg_ground_contact_ms", "avg_gct_balance_pct",
+    "avg_vertical_osc_cm", "avg_vertical_ratio_pct", "avg_stride_length_cm",
+    "avg_power_w", "norm_power_w", "avg_respiration_rate",
+)
+
+
+# Only these four have a direction in which "better" is meaningful, so only
+# these get rated and given an improving/declining verdict. Stride length,
+# power and respiration rate have no good side — a longer stride can be
+# efficiency or overstriding, and respiration tracks effort — and
+# ground-contact balance is best at 50 in either direction, so all four are
+# reported as raw deltas instead.
+_FORM_BANDS = {
+    # field: ((elite, good, needs_work) thresholds, higher_is_better)
+    "avg_cadence_spm": ((180, 170, 165), True),
+    "avg_ground_contact_ms": ((200, 240, 260), False),
+    "avg_vertical_osc_cm": ((6, 8, 10), False),
+    "avg_vertical_ratio_pct": ((6, 8, 10), False),
+}
+
+# Smallest half-to-half change worth calling a trend. Below this a metric is
+# "stable" — Garmin's wrist/accelerometer estimates carry more run-to-run
+# noise than a bare percentage test allows for, and a 0.1 cm move in vertical
+# oscillation is not a form change.
+_FORM_NOISE_FLOOR = {
+    "avg_cadence_spm": 1.5,
+    "avg_ground_contact_ms": 5.0,
+    "avg_vertical_osc_cm": 0.3,
+    "avg_vertical_ratio_pct": 0.3,
+}
+
+
+def _rate_form(field: str, v: Optional[float]) -> Optional[str]:
+    """Garmin's published benchmark bands for a running-dynamics average."""
+    if v is None or field not in _FORM_BANDS:
+        return None
+    (elite, good, poor), higher_better = _FORM_BANDS[field]
+    if higher_better:
+        if v >= elite:
+            return "elite"
+        return "good" if v >= good else ("fair" if v >= poor else "needs_work")
+    if v < elite:
+        return "elite"
+    return "good" if v <= good else ("fair" if v <= poor else "needs_work")
+
+
+def running_form_trends(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    sport_type: str = "Run",
+    classification: Optional[str] = None,
+    limit: int = 200,
+) -> dict:
+    """Running-dynamics trends over the local cache (no Garmin calls).
+
+    Form metrics are strongly pace-dependent — cadence and stride length rise
+    with speed, ground contact falls — so a single average across easy runs
+    and intervals is close to meaningless. Every row therefore carries its
+    pace and classification, and the response breaks the averages down
+    `by_classification`; compare like with like.
+    """
+    _init_db()
+    limit = max(1, min(limit, 1000))
+
+    where = ["1=1"]
+    params: list[Any] = []
+    if sport_type:
+        where.append("sport_type = ?")
+        params.append(sport_type)
+    if start_date:
+        where.append("date(start_date_local) >= ?")
+        params.append(start_date)
+    if end_date:
+        where.append("date(start_date_local) <= ?")
+        params.append(end_date)
+
+    cols = ", ".join(_FORM_FIELDS)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, start_date_local, name, sport_type, planned_type,
+                   distance_m, moving_time_s, avg_hr, {cols}
+            FROM activities
+            WHERE {' AND '.join(where)}
+            ORDER BY start_date_local
+            """,
+            params,
+        ).fetchall()
+        missing_metrics = conn.execute(
+            "SELECT COUNT(*) FROM activities WHERE metrics_fetched_at IS NULL"
+        ).fetchone()[0]
+
+    per_activity = []
+    for r in rows:
+        if all(r[f] is None for f in _FORM_FIELDS):
+            continue
+        hint, _ = classify_activity(r["name"], r["sport_type"], r["planned_type"])
+        if classification and hint != classification:
+            continue
+        pace = None
+        if r["distance_m"] and r["moving_time_s"]:
+            pace = round(r["moving_time_s"] / (r["distance_m"] / 1000), 1)
+        entry = {
+            "id": r["id"],
+            "date": r["start_date_local"][:10],
+            "classification": hint,
+            "distance_km": round((r["distance_m"] or 0) / 1000, 2),
+            "pace_s_per_km": pace,
+            "avg_hr": r["avg_hr"],
+        }
+        for f in _FORM_FIELDS:
+            entry[f] = round(r[f], 1) if r[f] is not None else None
+        per_activity.append(entry)
+
+    if not per_activity:
+        return {
+            "error": "No cached activities with running-dynamics data in range.",
+            "activities_without_metrics": missing_metrics,
+            "next_steps": [
+                "Run sync_activities(backfill_activity_metrics=True) to "
+                "populate dynamics for history synced before they were stored.",
+            ],
+        }
+
+    def mean(items, field):
+        vals = [i[field] for i in items if i.get(field) is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    averages = {f: mean(per_activity, f) for f in _FORM_FIELDS}
+
+    half = len(per_activity) // 2
+    first_half, second_half = per_activity[:half], per_activity[half:]
+    trends = {}
+    for f in _FORM_FIELDS:
+        a, b = mean(first_half, f), mean(second_half, f)
+        if a is None or b is None:
+            trends[f] = {"direction": "insufficient_data",
+                         "first_half_avg": a, "second_half_avg": b}
+            continue
+        delta = b - a
+        if f not in _FORM_BANDS:
+            # No "better" direction — report the move, don't judge it.
+            direction = "not_rated"
+        elif abs(delta) < max(abs(a) * 0.02, _FORM_NOISE_FLOOR[f]):
+            direction = "stable"
+        else:
+            higher_better = _FORM_BANDS[f][1]
+            better = delta > 0 if higher_better else delta < 0
+            direction = "improving" if better else "declining"
+        trends[f] = {
+            "direction": direction,
+            "first_half_avg": a,
+            "second_half_avg": b,
+            "delta": round(delta, 1),
+        }
+
+    by_class: dict[str, dict] = {}
+    for entry in per_activity:
+        by_class.setdefault(entry["classification"], []).append(entry)
+    by_classification = {
+        cls: {
+            "n": len(items),
+            "avg_pace_s_per_km": mean(items, "pace_s_per_km"),
+            **{f: mean(items, f) for f in _FORM_FIELDS},
+        }
+        for cls, items in sorted(by_class.items())
+    }
+
+    insights = []
+    cad = averages["avg_cadence_spm"]
+    if cad is not None and cad < 170:
+        insights.append(
+            f"Cadence averages {cad} spm across the window. Read it against "
+            "pace before acting — the same runner turns over faster at "
+            "threshold than on an easy run, so check the by_classification "
+            "split rather than this pooled number."
+        )
+    bal = averages["avg_gct_balance_pct"]
+    if bal is not None and abs(bal - 50) >= 2:
+        side = "left" if bal > 50 else "right"
+        insights.append(
+            f"Ground-contact balance averages {bal}% left, i.e. {side}-biased "
+            f"by {abs(round(bal - 50, 1))} points. Garmin's own guidance is "
+            "that anything inside 50±2 is noise; outside it, look for a "
+            "one-sided niggle."
+        )
+    vr = averages["avg_vertical_ratio_pct"]
+    if vr is not None and vr > 10:
+        insights.append(
+            f"Vertical ratio averages {vr}% (bounce relative to stride "
+            "length). The productive fix is usually a longer stride at the "
+            "same cadence, not consciously trying to bounce less."
+        )
+    declining = [f for f, t in trends.items() if t["direction"] == "declining"]
+    if declining:
+        insights.append(
+            "Declining across the window: " + ", ".join(declining) +
+            ". Confirm the two halves contain a comparable mix of session "
+            "types before reading this as real form decay — a block that "
+            "shifted from intervals to easy volume will show exactly this."
+        )
+
+    return {
+        "window": {
+            "start_date": per_activity[0]["date"],
+            "end_date": per_activity[-1]["date"],
+            "activities": len(per_activity),
+            "sport_type": sport_type,
+            "classification_filter": classification,
+        },
+        "per_activity": per_activity[-limit:],
+        "averages": averages,
+        "by_classification": by_classification,
+        "trends": trends,
+        "ratings": {f: _rate_form(f, averages[f]) for f in _FORM_BANDS
+                    if _rate_form(f, averages[f]) is not None},
+        "insights": insights,
+        "activities_without_metrics": missing_metrics,
+        "notes": [
+            "Benchmarks (Garmin): cadence >=180 elite / 170-179 good; ground "
+            "contact <200 ms elite / 200-240 good; vertical oscillation "
+            "<6 cm elite / 6-8 good; vertical ratio <6% elite / 6-8% good. "
+            "They are population bands, not targets — a tall runner is "
+            "structurally penalised on oscillation.",
+            "Power here is the watch's wrist-based estimate, not a footpod or "
+            "power meter. Useful for within-session comparison, not for "
+            "absolute training prescription.",
+            "Only cadence, ground contact, vertical oscillation and vertical "
+            "ratio get an improving/declining verdict. Stride length, power "
+            "and respiration rate have no inherently good direction, and "
+            "ground-contact balance is best near 50 either way, so those are "
+            "reported as raw deltas with direction 'not_rated'.",
+        ],
+    }
+
+
+# ─── VO2max trend + per-session attribution ───────────────────────────
+def vo2max_trend(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict:
+    """Garmin's VO2max day by day, plus which sessions preceded each move.
+
+    Returns:
+      - daily: [{date, vo2max, delta}] — the sparse series as Garmin wrote it
+        (a value only lands on days with a qualifying activity).
+      - summary: first / last / min / max / net change, and the peak's date.
+      - by_session: each day the estimate moved, joined to that day's
+        activities (name, classification, distance, avg_hr, training load),
+        sorted by the size of the move — the closest thing available to
+        "which sessions pushed it".
+      - by_classification: mean move per session type, with counts.
+      - caveats: read them before presenting any of this as causal.
+    """
+    _init_db()
+    where = ["1=1"]
+    params: list[Any] = []
+    if start_date:
+        where.append("date >= ?")
+        params.append(start_date)
+    if end_date:
+        where.append("date <= ?")
+        params.append(end_date)
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT date, vo2max, vo2max_rounded, fitness_age FROM vo2max_daily "
+            f"WHERE {' AND '.join(where)} ORDER BY date",
+            params,
+        ).fetchall()
+        extent = conn.execute(
+            "SELECT MIN(date) AS oldest, MAX(date) AS newest FROM vo2max_daily"
+        ).fetchone()
+
+    if not rows:
+        return {
+            "error": "No VO2max data cached for that range.",
+            "coverage": {"cache_oldest": extent["oldest"] if extent else None,
+                         "cache_newest": extent["newest"] if extent else None},
+            "next_steps": [
+                "Run sync_activities() to pull the trailing window, or "
+                "sync_vo2max(start_date, end_date) for deeper history.",
+            ],
+        }
+
+    daily = []
+    prev = None
+    for r in rows:
+        v = r["vo2max"]
+        delta = round(v - prev, 1) if (v is not None and prev is not None) else None
+        daily.append({
+            "date": r["date"],
+            "vo2max": v,
+            "vo2max_rounded": r["vo2max_rounded"],
+            "delta": delta,
+        })
+        if v is not None:
+            prev = v
+
+    vals = [d["vo2max"] for d in daily if d["vo2max"] is not None]
+    peak = max(daily, key=lambda d: d["vo2max"] if d["vo2max"] is not None else -1)
+
+    # Join the days that moved to the activities recorded on them.
+    moved = [d for d in daily if d["delta"]]
+    by_session = []
+    if moved:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            for d in moved:
+                acts = conn.execute(
+                    """
+                    SELECT id, name, sport_type, planned_type, distance_m,
+                           moving_time_s, avg_hr, activity_training_load,
+                           aerobic_training_effect, anaerobic_training_effect
+                    FROM activities WHERE date(start_date_local) = ?
+                    ORDER BY start_date_local
+                    """,
+                    (d["date"],),
+                ).fetchall()
+                sessions = []
+                for a in acts:
+                    hint, _ = classify_activity(
+                        a["name"], a["sport_type"], a["planned_type"]
+                    )
+                    sessions.append({
+                        "id": a["id"],
+                        "name": a["name"],
+                        "classification": hint,
+                        "sport_type": a["sport_type"],
+                        "distance_km": round((a["distance_m"] or 0) / 1000, 2),
+                        "avg_hr": a["avg_hr"],
+                        "training_load": a["activity_training_load"],
+                        "aerobic_te": a["aerobic_training_effect"],
+                        "anaerobic_te": a["anaerobic_training_effect"],
+                    })
+                by_session.append({
+                    "date": d["date"],
+                    "vo2max": d["vo2max"],
+                    "delta": d["delta"],
+                    "sessions": sessions,
+                })
+        by_session.sort(key=lambda x: abs(x["delta"]), reverse=True)
+
+    # Mean move per session type — only for days with exactly one activity,
+    # so the attribution isn't split across a double day.
+    agg: dict[str, list[float]] = {}
+    for item in by_session:
+        if len(item["sessions"]) != 1:
+            continue
+        agg.setdefault(item["sessions"][0]["classification"], []).append(item["delta"])
+    by_classification = {
+        cls: {
+            "n": len(ds),
+            "mean_delta": round(sum(ds) / len(ds), 2),
+            "total_delta": round(sum(ds), 1),
+        }
+        for cls, ds in sorted(agg.items(), key=lambda kv: -abs(sum(kv[1])))
+    }
+
+    return {
+        "window": {"start_date": daily[0]["date"], "end_date": daily[-1]["date"],
+                   "days_with_value": len(vals)},
+        "daily": daily,
+        "summary": {
+            "first": vals[0] if vals else None,
+            "last": vals[-1] if vals else None,
+            "min": min(vals) if vals else None,
+            "max": max(vals) if vals else None,
+            "peak_date": peak["date"] if vals else None,
+            "net_change": round(vals[-1] - vals[0], 1) if len(vals) > 1 else None,
+        },
+        "by_session": by_session,
+        "by_classification": by_classification,
+        "coverage": {
+            "cache_oldest": extent["oldest"] if extent else None,
+            "cache_newest": extent["newest"] if extent else None,
+        },
+        "caveats": [
+            "The series is sparse by design — Garmin writes a value only on "
+            "days with a qualifying (outdoor, HR-stable) run, so gaps mean "
+            "'no new estimate', never 'fitness unmeasured'.",
+            "Garmin's estimate is smoothed over recent history, so a day's "
+            "delta is NOT that session's effect in isolation. `by_session` "
+            "shows what preceded each move; it is association, not cause.",
+            "The estimate is derived from the pace/HR relationship, so it is "
+            "depressed by heat, hills, fatigue and wrist-HR error, and can "
+            "drift down through a heavy block in which fitness is rising. "
+            "Race results outrank it as evidence.",
+            "by_classification counts only single-activity days, so a double "
+            "day contributes to `by_session` but not to the per-type means.",
+        ],
+    }
