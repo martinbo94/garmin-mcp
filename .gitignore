@@ -8,18 +8,23 @@ __pycache__/
 .venv/
 venv/
 ENV/
+.flake8
+.DS_Store
+
+# Local personal data — never committed
 coach_data/cache.db
 coach_data/user_profile.md
+coach_data/lab_test_*.md
 coach_data/plan.json
-coach_data/deleted_templates_backup.json
-.flake8
+coach_data/*.bak-*
+coach_data/manual_workouts_backup.json
+coach_data/grade_model.json
 *.gpx
 
-# Local personal data / book scans
-bakken_bok/
-bakken_bok_jpg/
-bakken_bok_transcript/
-coach_data/manual_workouts_backup.json
-coach_data/*.bak-*
-consolidate_garmin_templates.py
-coach_data/grade_model.json
+# Lab test reports (PDF) — kept locally
+*.pdf
+
+# Book scans + transcription — local reference only
+bakken_bok_sider/
+bakken-terskeltrening-komplett.md
+IMG_*.HEIC
