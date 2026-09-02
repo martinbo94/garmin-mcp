@@ -91,7 +91,7 @@ If the profile exists and is filled in, proceed normally.
 ━━━ WHEN THE USER USES THE BAKKEN FRAMEWORK ━━━━━━━━━━━━━━━━━━━━━━━━
 
 Pre-analysis protocol (race goal, weekly review, plan tweak):
-  a. `get_athlete_profile` — lock in zones, paces, PRs, profile A/B/C.
+  a. `get_athlete_profile` — lock in zones, paces, PRs.
   b. `morning_check_in` — current readiness.
   c. `weekly_summary` for the relevant window.
   d. `activity_breakdown` for specific reference sessions.
@@ -122,7 +122,7 @@ Core tools:
   `running_form_trends`
 - Single-session Garmin metrics: `performance_condition`
 
-Skip the Bakken-specific analysis (session_category, profile A/B/C,
+Skip the Bakken-specific analysis (session_category,
 sub-threshold band) — just use HR zones and lap data directly.
 """.strip()
 

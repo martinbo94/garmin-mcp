@@ -208,18 +208,6 @@ def _parse_athlete_profile() -> dict:
         {"low": int(st.group(1)), "high": int(st.group(2))} if st else None
     )
 
-    # Athlete profile A/B/C — looks like "**Profile A: ...**"
-    profile_section = next((b for k, b in sections.items() if "Athlete profile" in k), "")
-    profile_match = _re.search(r"\*\*Profile\s+([A-C])\s*:\s*([^*]+?)\*\*", profile_section)
-    athlete_profile = (
-        {
-            "label": profile_match.group(1),
-            "description": profile_match.group(2).strip().rstrip(",").strip(),
-        }
-        if profile_match
-        else None
-    )
-
     # HR zones — reuse the existing parser (reads the whole doc; zones table
     # is the only place its pattern matches).
     zones = []
@@ -289,7 +277,6 @@ def _parse_athlete_profile() -> dict:
         "weight_kg": _f(weight),
         "utilization_at_lt2_pct": _f(util, cast=int),
         "zones": zones,
-        "athlete_profile": athlete_profile,
         "race_prs": race_prs,
         "pace_estimates": pace_estimates,
     }
@@ -308,9 +295,6 @@ def get_athlete_profile() -> dict:
     - `zones`: [{name, low, high}] for Z1-Z5 (verbatim from Garmin Connect)
     - `sub_threshold_band_bpm`: Bakken Golden Zone training target
     - `vo2max_ml_min_kg`, `weight_kg`, `utilization_at_lt2_pct`
-    - `athlete_profile`: {label: A/B/C, description} — drives race-goal
-      bias (Profile A: bias conservative; Profile B: Riegel underestimates;
-      Profile C: as-is)
     - `race_prs`: list of {distance, time, pace, date}
     - `pace_estimates`: {effort_name: pace_string} (easy, sub-threshold, etc.)
 
