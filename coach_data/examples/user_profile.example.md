@@ -75,16 +75,23 @@ Real-world fitness anchors. Add as you set them.
 
 ## Athlete profile
 
-State your current limiter as a revisable observation, not a fixed type
-(see `coach://plan_design` → "Reading the limiter"). The common reads:
+This section is for calibrations that are **yours, not the book's** —
+anything that makes you deviate from the standard template. State each
+one as a revisable decision and say whose call it was, so it is never
+mistaken for a Bakken recommendation.
 
-- **Limiter looks like utilization/endurance** — high VO2max relative to
-  race times, low measured utilization at LT2 (< ~80%). Bias the X-økt
-  toward sub-threshold variation, not VO2. (Race time alone can't tell
-  utilization from economy — lean on a lab utilization number.)
-- **Limiter looks like the VO2 ceiling** — already using most of your
-  VO2max at threshold (utilization > ~85%). VO2 work matters more.
-- **No clear limiter** — standard mix.
+The book itself individualizes on three axes only (see
+`coach://plan_design` → "Individualization"): choice of periodization
+model, muscle-fibre type (kap. 8), and how the X-økt is used. Anything
+else here — e.g. a bias derived from lab numbers such as VO2max or
+utilization at LT2 — is your own reasoning on top of the framework.
+Record it, label it, and re-check it when you re-test.
+
+Example:
+
+- **[Your decision, 2026-01-01]:** bias the X-økt toward sub-threshold
+  variation rather than the standard 5k overspeed menu. Reason: <...>.
+  Revisit when: <...>.
 
 ## Session pace estimates (conservative, training-day)
 

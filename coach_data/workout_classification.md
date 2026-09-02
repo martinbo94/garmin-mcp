@@ -104,18 +104,19 @@ To compute time in zone for an activity, use `activity_breakdown(activity_id)`.
 It returns pre-computed `zone_secs` and `zone_pcts` for the whole session, plus
 per-lap `zone_secs` for structured workouts — no manual stream processing needed.
 
-## Target weekly zone distribution (rough guidance)
+## Target weekly zone distribution
 
-The canonical 80/20 polarized rule (80% easy / 20% hard) is too
-conservative for an amateur on moderate weekly volume — there's not enough
-total time for that little quality to deliver an aerobic stimulus. Working
-targets, to refine once enough data has accumulated:
+The canonical 80/20 polarized rule was built for athletes training 15-25
+hours a week. At 4-6 hours it leaves ~1 hour of quality — two 30-minute
+sessions, which Bakken calls barely enough to warm up properly and do
+meaningful threshold work. His adjusted distribution for this volume
+(kap. 7) is the target:
 
 | Zone band | Target % of weekly run time |
 |---|---|
-| Z1 + Z2 | 60 – 80% |
-| Z3 + Z4 | 20 – 35% |
-| Z5 | 0 – 5% |
+| Z1 + Z2 (easy / aerobic base) | 60 – 65% |
+| Z3 + Z4 (the Golden Zone) | 20 – 30% |
+| Z5 (high intensity) | 5 – 10% |
 
 The displayed report keeps zones separate. To check the bands, sum Z1+Z2
 and Z3+Z4 internally and compare against the targets — don't show the
@@ -124,14 +125,12 @@ collapsed numbers in the table.
 When summarizing a week, compare actual zone totals against these bands and
 flag noticeable deviation (in either direction):
 
-- **Z1–Z2 over 80%:** plenty of base but light on quality — might be a
+- **Z1–Z2 over 65%:** plenty of base but light on quality — might be a
   deliberate recovery week, or might be missing a threshold session.
-- **Z3–Z4 over 35%:** heavy quality load. Sustainable for a week or two,
+- **Z3–Z4 over 30%:** heavy quality load. Sustainable for a week or two,
   but if it persists multiple weeks check for accumulated fatigue.
-- **Z5 over 5%:** drift toward over-hard intervals — reconsider whether
+- **Z5 over 10%:** drift toward over-hard intervals — reconsider whether
   the Bakken "controlled hard" intent is being honored.
-
-These bands are placeholders. Update them here when the user refines.
 
 ## Ambiguity handling
 
