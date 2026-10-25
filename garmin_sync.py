@@ -5,6 +5,7 @@ activities from Garmin Connect since the last sync, including HR streams and
 lap data for runs. Data lives in `coach_data/cache.db` so weekly summaries
 and activity breakdowns don't hit the API on every query.
 """
+import collections
 import json
 import os
 import re
@@ -168,6 +169,35 @@ CREATE TABLE IF NOT EXISTS streams (
     FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
+-- Conditions at the activity. PRIMARY SOURCE = Open-Meteo ERA5 reanalysis
+-- (hourly, ~9 km grid) at the activity's own start coordinates, start hour;
+-- precip_mm sums the hours the activity spanned, precip_prev_6h_mm the six
+-- hours before. Garmin's own per-activity record (nearest METAR station)
+-- is kept in the garmin_* / station_* columns for audit and used only as a
+-- fallback: the station Garmin picks can be far from the route, and
+-- compared against ERA5 some stations disagree by several degrees and
+-- report rain on dry evenings. A row exists for every activity checked,
+-- with NULL temp_c for indoor / no-GPS ones, so the backfill terminates.
+CREATE TABLE IF NOT EXISTS activity_weather (
+    activity_id INTEGER PRIMARY KEY,
+    temp_c REAL,
+    apparent_temp_c REAL,
+    dew_point_c REAL,
+    relative_humidity REAL,
+    wind_speed_kmh REAL,
+    wind_gust_kmh REAL,
+    wind_direction_deg REAL,
+    wind_compass TEXT,
+    conditions TEXT,
+    station_id TEXT,
+    station_name TEXT,
+    station_lat REAL,
+    station_lon REAL,
+    observed_at TEXT,
+    fetched_at TEXT NOT NULL,
+    FOREIGN KEY (activity_id) REFERENCES activities(id)
+);
+
 CREATE TABLE IF NOT EXISTS laps (
     activity_id INTEGER PRIMARY KEY,
     laps_json TEXT NOT NULL,
@@ -322,6 +352,9 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     # Marks an activity as processed for the metric columns above — set even
     # when the sport reports none of them, so the backfill terminates.
     "metrics_fetched_at": "TEXT",
+    # Set whenever the detail fetch ran with the start_lat/lon fields present,
+    # so backfill_coordinates skips indoor rows instead of re-asking forever.
+    "coords_checked_at": "TEXT",
 }
 
 _STREAMS_MIGRATION_COLUMNS = {
@@ -344,6 +377,19 @@ _LAPS_MIGRATION_COLUMNS = {
     "dynamics_fetched_at": "TEXT",
 }
 
+_WEATHER_MIGRATION_COLUMNS = {
+    "precip_mm": "REAL",
+    "precip_prev_6h_mm": "REAL",
+    "cloud_cover_pct": "REAL",
+    "weather_code": "INTEGER",
+    "source": "TEXT",             # 'open-meteo' | 'garmin-station'
+    "location_source": "TEXT",    # 'activity_gps' | 'garmin_station'
+    "lat": "REAL",
+    "lon": "REAL",
+    "garmin_temp_c": "REAL",
+    "garmin_conditions": "TEXT",
+}
+
 
 def _init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -354,6 +400,7 @@ def _init_db() -> None:
             ("activities", _ACTIVITY_MIGRATION_COLUMNS),
             ("streams", _STREAMS_MIGRATION_COLUMNS),
             ("laps", _LAPS_MIGRATION_COLUMNS),
+            ("activity_weather", _WEATHER_MIGRATION_COLUMNS),
         ):
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             for col, col_type in columns.items():
@@ -781,7 +828,8 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
                 training_effect_label = COALESCE(?, training_effect_label),
                 detail_fetched_at = ?,
                 start_lat = COALESCE(?, start_lat),
-                start_lon = COALESCE(?, start_lon)
+                start_lon = COALESCE(?, start_lon),
+                coords_checked_at = ?
             WHERE id = ?
             """,
             (
@@ -794,9 +842,339 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
                 datetime.now(timezone.utc).isoformat(),
                 fields.get("start_lat"),
                 fields.get("start_lon"),
+                datetime.now(timezone.utc).isoformat(),
                 act_id,
             ),
         )
+
+
+# ─── Weather at the activity ──────────────────────────────────────────
+# Primary source: Open-Meteo ERA5 archive at the activity's start coordinates
+# (forecast API with past_days for the last week, where the archive lags).
+# Garmin's per-activity station record is fetched too — it is the only
+# indoor/outdoor signal we have, gives a fallback location, and is kept for
+# audit — but its temperatures are NOT trusted (see the schema note).
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+_OM_HOURLY = ("temperature_2m,apparent_temperature,dew_point_2m,relative_humidity_2m,"
+              "precipitation,wind_speed_10m,wind_gusts_10m,cloud_cover,weather_code")
+_ARCHIVE_LAG_DAYS = 7
+_WET_WORDS = ("rain", "shower", "drizzle", "snow", "sleet", "thunder", "hail")
+_WMO = {0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle",
+        56: "Freezing drizzle", 57: "Freezing drizzle", 61: "Light rain", 63: "Rain",
+        65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain", 71: "Light snow",
+        73: "Snow", 75: "Heavy snow", 77: "Snow grains", 80: "Light showers",
+        81: "Showers", 82: "Violent showers", 85: "Snow showers", 86: "Heavy snow showers",
+        95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with hail"}
+
+
+def _f_to_c(f: Optional[float]) -> Optional[float]:
+    return round((f - 32) / 1.8, 1) if f is not None else None
+
+
+def _fetch_garmin_weather(garmin_client, act_id: int) -> dict:
+    """Garmin's weather record for one activity (nearest METAR station,
+    served in °F). Indoor / no-GPS activities return all-null fields."""
+    w = garmin_client.get_activity_weather(act_id) or {}
+    station = w.get("weatherStationDTO") or {}
+    wtype = w.get("weatherTypeDTO") or {}
+    has_data = w.get("temp") is not None
+    return {
+        "garmin_temp_c": _f_to_c(w.get("temp")),
+        "garmin_conditions": wtype.get("desc"),
+        "station_id": station.get("id"),
+        "station_name": station.get("name"),
+        "station_lat": w.get("latitude") if has_data else None,
+        "station_lon": w.get("longitude") if has_data else None,
+        "observed_at": w.get("issueDate"),
+        # Fallback values, used only when Open-Meteo has nothing.
+        "_fallback": {
+            "temp_c": _f_to_c(w.get("temp")),
+            "apparent_temp_c": _f_to_c(w.get("apparentTemp")),
+            "dew_point_c": _f_to_c(w.get("dewPoint")),
+            "relative_humidity": w.get("relativeHumidity"),
+            "wind_speed_kmh": w.get("windSpeed"),
+            "wind_gust_kmh": w.get("windGust"),
+            "wind_direction_deg": w.get("windDirection"),
+            "wind_compass": w.get("windDirectionCompassPoint"),
+            "conditions": wtype.get("desc"),
+        } if has_data else None,
+    }
+
+
+def _om_hourly(lat: float, lon: float, d0: date, d1: date) -> dict:
+    """Hourly Open-Meteo series for [d0, d1] (local time keys 'YYYY-MM-DDTHH:00').
+    Archive for dates older than the lag, forecast API (past_days) for recent
+    ones; chunks the archive into ≤365-day requests."""
+    import requests
+    out: dict[str, dict] = {}
+    cutoff = date.today() - timedelta(days=_ARCHIVE_LAG_DAYS)
+
+    def _pull(url, a, b):
+        r = requests.get(url, params=dict(
+            latitude=lat, longitude=lon, start_date=a.isoformat(), end_date=b.isoformat(),
+            hourly=_OM_HOURLY, wind_speed_unit="kmh", timezone="auto"), timeout=60)
+        r.raise_for_status()
+        h = r.json().get("hourly") or {}
+        keys = [k for k in h if k != "time"]
+        for i, t in enumerate(h.get("time") or []):
+            out[t] = {k: h[k][i] for k in keys}
+
+    a = d0
+    while a <= min(d1, cutoff - timedelta(days=1)):
+        b = min(a + timedelta(days=364), d1, cutoff - timedelta(days=1))
+        _pull(OPEN_METEO_ARCHIVE_URL, a, b)
+        a = b + timedelta(days=1)
+    if d1 >= cutoff:
+        _pull(OPEN_METEO_FORECAST_URL, max(d0, cutoff), d1)
+    return out
+
+
+def _om_at(series: dict, start_local: str, duration_s: Optional[float]) -> Optional[dict]:
+    """Conditions for one activity from an hourly series: start-hour values,
+    precipitation summed over the hours the activity spanned and over the
+    six hours before it."""
+    key = start_local[:13] + ":00"
+    h0 = series.get(key)
+    if not h0 or h0.get("temperature_2m") is None:
+        return None
+    start = datetime.fromisoformat(start_local[:19])
+    hours = max(1, int((start.minute * 60 + (duration_s or 0)) // 3600) + 1)
+    precip = 0.0
+    for i in range(hours):
+        v = series.get((start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:00"), {}).get("precipitation")
+        precip += v or 0.0
+    prev = 0.0
+    for i in range(1, 7):
+        v = series.get((start - timedelta(hours=i)).strftime("%Y-%m-%dT%H:00"), {}).get("precipitation")
+        prev += v or 0.0
+    code = h0.get("weather_code")
+    return {
+        "temp_c": h0.get("temperature_2m"),
+        "apparent_temp_c": h0.get("apparent_temperature"),
+        "dew_point_c": h0.get("dew_point_2m"),
+        "relative_humidity": h0.get("relative_humidity_2m"),
+        "wind_speed_kmh": h0.get("wind_speed_10m"),
+        "wind_gust_kmh": h0.get("wind_gusts_10m"),
+        "wind_direction_deg": None,
+        "wind_compass": None,
+        "cloud_cover_pct": h0.get("cloud_cover"),
+        "weather_code": code,
+        "conditions": _WMO.get(int(code)) if code is not None else None,
+        "precip_mm": round(precip, 1),
+        "precip_prev_6h_mm": round(prev, 1),
+    }
+
+
+def _store_activity_weather(act_id: int, fields: dict) -> None:
+    fields = {k: v for k, v in fields.items() if not k.startswith("_")}
+    cols = list(fields.keys()) + ["fetched_at"]
+    vals = list(fields.values()) + [datetime.now(timezone.utc).isoformat()]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO activity_weather (activity_id, {', '.join(cols)}) "
+            f"VALUES (?{', ?' * len(cols)})",
+            [act_id, *vals],
+        )
+
+
+def _weather_row(garmin: dict, om: Optional[dict], lat, lon, loc_source) -> dict:
+    row = {k: v for k, v in garmin.items() if k != "_fallback"}
+    if om:
+        row.update(om)
+        row["source"] = "open-meteo"
+    elif garmin.get("_fallback"):
+        row.update(garmin["_fallback"])
+        row["source"] = "garmin-station"
+    else:
+        row["source"] = None
+    row["lat"], row["lon"], row["location_source"] = lat, lon, loc_source
+    return row
+
+
+def _activity_location(row) -> tuple:
+    """(lat, lon, source) from the activity's own GPS start, else
+    (None, None, None). Callers fall back to Garmin's station coordinates."""
+    if row["start_lat"] is not None and row["start_lon"] is not None:
+        return row["start_lat"], row["start_lon"], "activity_gps"
+    return None, None, None
+
+
+def fetch_and_store_weather(garmin_client, act_id: int) -> dict:
+    """Weather for one activity: Garmin record for indoor detection + audit,
+    Open-Meteo at the activity's coordinates for the values. Used by run_sync
+    for each new cardio activity."""
+    garmin = _fetch_garmin_weather(garmin_client, act_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        a = conn.execute(
+            "SELECT start_date_local, moving_time_s, start_lat, start_lon "
+            "FROM activities WHERE id = ?", (act_id,)).fetchone()
+    lat, lon, src = _activity_location(a)
+    if lat is None and garmin.get("station_lat"):
+        lat, lon, src = garmin["station_lat"], garmin["station_lon"], "garmin_station"
+    om = None
+    indoor = garmin.get("_fallback") is None and a["start_lat"] is None
+    if lat is not None and not indoor:
+        try:
+            d = date.fromisoformat(a["start_date_local"][:10])
+            om = _om_at(_om_hourly(lat, lon, d, d), a["start_date_local"], a["moving_time_s"])
+        except Exception:
+            om = None
+    row = _weather_row(garmin, om, lat, lon, src)
+    _store_activity_weather(act_id, row)
+    return row
+
+
+def backfill_coordinates(garmin_client, max_activities: int = 400) -> dict:
+    """Re-fetch detail fields for cached cardio activities whose row predates
+    the start_lat/lon columns (one API call each, newest first). Indoor rows
+    get coords_checked_at set and are not asked again."""
+    _init_db()
+    cardio = ", ".join("?" * len(_CARDIO_TYPES))
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [r[0] for r in conn.execute(
+            f"SELECT id FROM activities WHERE start_lat IS NULL AND coords_checked_at IS NULL "
+            f"AND sport_type IN ({cardio}) ORDER BY start_date_local DESC LIMIT ?",
+            (*_CARDIO_TYPES, max_activities))]
+        remaining = conn.execute(
+            f"SELECT COUNT(*) FROM activities WHERE start_lat IS NULL AND coords_checked_at IS NULL "
+            f"AND sport_type IN ({cardio})", tuple(_CARDIO_TYPES)).fetchone()[0] - len(ids)
+    fetched = with_coords = 0
+    errors: list[str] = []
+    for act_id in ids:
+        try:
+            f = _fetch_detail_fields(garmin_client, act_id)
+            _store_detail_fields(act_id, f)
+            fetched += 1
+            if f.get("start_lat") is not None:
+                with_coords += 1
+        except Exception as e:
+            errors.append(f"detail {act_id}: {type(e).__name__}: {e}")
+    return {"details_fetched": fetched, "with_coords": with_coords,
+            "remaining": remaining, "errors": errors}
+
+
+def backfill_weather(garmin_client, max_activities: int = 500,
+                     refresh_open_meteo: bool = False) -> dict:
+    """Fill activity_weather for cached cardio activities. Garmin's record is
+    fetched per activity (one call each) for indoor detection and audit;
+    Open-Meteo values are fetched in bulk — activities are clustered by
+    location (~5 km) and each cluster's whole date span is pulled in ≤365-day
+    hourly requests, so a two-year history costs ~20 HTTP requests.
+
+    refresh_open_meteo=True also re-derives rows whose source is not yet
+    'open-meteo' (e.g. rows stored from the Garmin station only).
+    """
+    _init_db()
+    cardio = ", ".join("?" * len(_CARDIO_TYPES))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        todo = conn.execute(
+            f"""
+            SELECT a.id, a.start_date_local, a.moving_time_s, a.start_lat, a.start_lon,
+                   w.activity_id AS has_row, w.source, w.station_lat, w.station_lon,
+                   w.garmin_temp_c, w.garmin_conditions, w.station_id, w.station_name,
+                   w.observed_at, w.temp_c AS old_temp_c
+            FROM activities a LEFT JOIN activity_weather w ON w.activity_id = a.id
+            WHERE a.sport_type IN ({cardio})
+              AND (w.activity_id IS NULL
+                   OR (? AND COALESCE(w.source, '') != 'open-meteo'
+                       AND (w.temp_c IS NOT NULL OR a.start_lat IS NOT NULL)))
+            ORDER BY a.start_date_local DESC LIMIT ?
+            """, (*_CARDIO_TYPES, 1 if refresh_open_meteo else 0, max_activities)).fetchall()
+
+    errors: list[str] = []
+    garmin_calls = 0
+    per_act: dict[int, dict] = {}
+    for a in todo:
+        if a["has_row"] is None:
+            try:
+                g = _fetch_garmin_weather(garmin_client, a["id"])
+                garmin_calls += 1
+            except Exception as e:
+                errors.append(f"garmin weather {a['id']}: {type(e).__name__}: {e}")
+                continue
+        else:
+            g = {"garmin_temp_c": a["garmin_temp_c"], "garmin_conditions": a["garmin_conditions"],
+                 "station_id": a["station_id"], "station_name": a["station_name"],
+                 "station_lat": a["station_lat"], "station_lon": a["station_lon"],
+                 "observed_at": a["observed_at"], "_fallback": None}
+        lat, lon, src = _activity_location(a)
+        if lat is None and g.get("station_lat"):
+            lat, lon, src = g["station_lat"], g["station_lon"], "garmin_station"
+        indoor = g.get("_fallback") is None and a["start_lat"] is None and a["old_temp_c"] is None
+        per_act[a["id"]] = {"row": a, "garmin": g, "lat": lat, "lon": lon, "src": src,
+                            "indoor": indoor or lat is None}
+
+    # Cluster outdoor activities by location and pull each cluster's span once.
+    clusters: dict[tuple, list[int]] = {}
+    for act_id, info in per_act.items():
+        if info["indoor"]:
+            continue
+        clusters.setdefault((round(info["lat"] / 0.05) * 0.05, round(info["lon"] / 0.05) * 0.05), []).append(act_id)
+
+    om_requests = 0
+    om_by_act: dict[int, Optional[dict]] = {}
+    for (clat, clon), ids in clusters.items():
+        days = [date.fromisoformat(per_act[i]["row"]["start_date_local"][:10]) for i in ids]
+        try:
+            series = _om_hourly(round(clat, 3), round(clon, 3), min(days), max(days))
+            om_requests += 1 + (max(days) - min(days)).days // 365
+        except Exception as e:
+            errors.append(f"open-meteo cluster {clat:.2f},{clon:.2f}: {type(e).__name__}: {e}")
+            continue
+        for i in ids:
+            r = per_act[i]["row"]
+            om_by_act[i] = _om_at(series, r["start_date_local"], r["moving_time_s"])
+
+    stored = with_om = 0
+    for act_id, info in per_act.items():
+        om = om_by_act.get(act_id)
+        if not info["indoor"] and om is None and act_id not in om_by_act:
+            continue  # cluster fetch failed — leave for next round
+        row = _weather_row(info["garmin"], om, info["lat"], info["lon"], info["src"])
+        _store_activity_weather(act_id, row)
+        stored += 1
+        if row.get("source") == "open-meteo":
+            with_om += 1
+
+    with sqlite3.connect(DB_PATH) as conn:
+        remaining = conn.execute(
+            f"SELECT COUNT(*) FROM activities a LEFT JOIN activity_weather w ON w.activity_id = a.id "
+            f"WHERE w.activity_id IS NULL AND a.sport_type IN ({cardio})", tuple(_CARDIO_TYPES)).fetchone()[0]
+    return {"weather_stored": stored, "with_open_meteo": with_om,
+            "garmin_calls": garmin_calls, "open_meteo_requests": om_requests,
+            "remaining_without_weather": remaining, "errors": errors}
+
+
+def cached_weather(activity_id: int) -> Optional[dict]:
+    """The stored weather row for one activity as a dict, or None if the
+    activity has not been weather-checked. A checked indoor activity
+    returns a dict whose `temp_c` is None."""
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM activity_weather WHERE activity_id = ?", (activity_id,)
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d.pop("activity_id", None)
+    d["wet"] = _is_wet(d)
+    return d
+
+
+def _is_wet(w: dict) -> Optional[bool]:
+    """Wet = measurable precipitation during the activity or in the six hours
+    before it (Open-Meteo), else Garmin's condition text as a fallback."""
+    if w.get("temp_c") is None:
+        return None
+    if w.get("source") == "open-meteo":
+        return (w.get("precip_mm") or 0) >= 0.2 or (w.get("precip_prev_6h_mm") or 0) >= 1.0
+    c = (w.get("conditions") or "").lower()
+    return any(word in c for word in _WET_WORDS) if c else None
 
 
 # ─── Gear (shoes etc.) ────────────────────────────────────────────────
@@ -1633,6 +2011,7 @@ def run_sync(
     laps_count = 0
     details_count = 0
     gear_count = 0
+    weather_count = 0
     errors: list[str] = []
 
     for act in activities:
@@ -1714,6 +2093,13 @@ def run_sync(
                     gear_count += 1
             except Exception as e:
                 errors.append(f"gear {act_id}: {e}")
+
+        if is_cardio:
+            try:
+                fetch_and_store_weather(garmin_client, act_id)
+                weather_count += 1
+            except Exception as e:
+                errors.append(f"weather {act_id}: {e}")
 
     # Refresh recent wellness so HRV/RHR/sleep stay current alongside
     # activities — activity sync alone leaves these stale, which makes the
@@ -1800,6 +2186,7 @@ def run_sync(
         "laps_fetched": laps_count,
         "details_fetched": details_count,
         "activity_gear_fetched": gear_count,
+        "weather_fetched": weather_count,
         "gear_synced": gear_synced,
         "gear_refresh": gear_refresh,
         "wellness_fetched": wellness_fetched,
@@ -3750,6 +4137,7 @@ def activity_breakdown(activity_id: int) -> dict:
         "has_stream_data": row["time_json"] is not None,
         "lap_fetch_error": lap_fetch_error,
         "performance_condition": _perf_cond_block(row),
+        "weather": cached_weather(activity_id),
     }
     # Race detection: name patterns rarely help (Garmin default-names races
     # like any other run, e.g. "<City> Løping"), so also flag on effort —
@@ -3999,6 +4387,214 @@ _FORM_NOISE_FLOOR = {
     "avg_vertical_osc_cm": 0.3,
     "avg_vertical_ratio_pct": 0.3,
 }
+
+
+# ─── Weather vs performance (descriptive) ─────────────────────────────
+_TEMP_BINS = [(-99, 0, "<0"), (0, 5, "0-5"), (5, 10, "5-10"), (10, 15, "10-15"),
+              (15, 20, "15-20"), (20, 99, ">=20")]
+_WEATHER_OUTCOMES = ("perf_cond_first", "perf_cond_last", "perf_cond_change",
+                     "workout_feel", "workout_rpe")
+_WEATHER_INPUTS = ("temp_c", "dew_point_c", "relative_humidity", "wind_speed_kmh")
+
+
+def _ranks(xs: list[float]) -> list[float]:
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    ranks = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        r = (i + j) / 2 + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = r
+        i = j + 1
+    return ranks
+
+
+def _spearman(xs: list[float], ys: list[float]) -> Optional[float]:
+    if len(xs) < 5 or len(set(xs)) < 2 or len(set(ys)) < 2:
+        return None
+    rx, ry = _ranks(xs), _ranks(ys)
+    mx, my = sum(rx) / len(rx), sum(ry) / len(ry)
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx) ** 0.5
+    vy = sum((b - my) ** 2 for b in ry) ** 0.5
+    return round(cov / (vx * vy), 2) if vx and vy else None
+
+
+def _mean(vals: list) -> Optional[float]:
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def _outcome_means(rows: list[dict]) -> dict:
+    out = {"n": len(rows)}
+    for key in _WEATHER_OUTCOMES:
+        out[key] = _mean([r[key] for r in rows])
+    out["avg_hr"] = _mean([r["avg_hr"] for r in rows])
+    return out
+
+
+def weather_performance(
+    weeks_back: int = 52,
+    classification: Optional[str] = None,
+    sport_type: str = "Run",
+    include_sessions: bool = False,
+) -> dict:
+    """Descriptive read of how conditions at the start of a session line up
+    with performance condition (first / last / change), post-run feel and
+    RPE. Groups by fixed temperature bins and wet vs dry, and reports
+    Spearman rank correlations. It does not fit thresholds or rules.
+    """
+    _init_db()
+    since = (datetime.now(timezone.utc) - timedelta(weeks=weeks_back)).date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        raw = conn.execute(
+            """
+            SELECT a.id, a.start_date_local, a.name, a.sport_type, a.planned_type,
+                   a.avg_hr, a.distance_m, a.moving_time_s,
+                   a.workout_rpe, a.workout_feel,
+                   a.perf_cond_first, a.perf_cond_last,
+                   w.temp_c, w.dew_point_c, w.relative_humidity,
+                   w.wind_speed_kmh, w.conditions, w.precip_mm,
+                   w.precip_prev_6h_mm, w.source
+            FROM activities a JOIN activity_weather w ON w.activity_id = a.id
+            WHERE a.sport_type = ? AND w.temp_c IS NOT NULL
+              AND a.start_date_local >= ?
+            ORDER BY a.start_date_local
+            """,
+            (sport_type, since),
+        ).fetchall()
+        unchecked = conn.execute(
+            """
+            SELECT COUNT(*) FROM activities a
+            LEFT JOIN activity_weather w ON w.activity_id = a.id
+            WHERE a.sport_type = ? AND a.start_date_local >= ?
+              AND w.activity_id IS NULL
+            """,
+            (sport_type, since),
+        ).fetchone()[0]
+
+    rows: list[dict] = []
+    for r in raw:
+        cls, _src = classify_activity(r["name"], r["sport_type"], r["planned_type"])
+        if classification and cls != classification:
+            continue
+        d = dict(r)
+        d["classification"] = cls
+        d["perf_cond_change"] = (
+            round(r["perf_cond_last"] - r["perf_cond_first"], 1)
+            if r["perf_cond_first"] is not None and r["perf_cond_last"] is not None
+            else None
+        )
+        d["wet"] = _is_wet(d)
+        d["month"] = r["start_date_local"][:7]
+        rows.append(d)
+
+    if not rows:
+        return {
+            "error": "No sessions with weather in that window.",
+            "unchecked_activities": unchecked,
+            "next_steps": ["sync_activities(backfill_coordinates=True) then "
+                           "sync_activities(backfill_weather=True) to fetch "
+                           "weather for cached history."],
+        }
+
+    by_temp = []
+    for low, high, label in _TEMP_BINS:
+        sub = [r for r in rows if low <= r["temp_c"] < high]
+        if sub:
+            by_temp.append({"temp_bin_c": label, **_outcome_means(sub)})
+
+    wet = [r for r in rows if r["wet"]]
+    dry = [r for r in rows if r["wet"] is False]
+    by_wet = {"wet": _outcome_means(wet) if wet else None,
+              "dry": _outcome_means(dry) if dry else None,
+              "wet_definition": "≥0.2 mm precipitation during the activity's "
+                                "hours or ≥1.0 mm in the six hours before "
+                                "(Open-Meteo ERA5 at the start coordinates)."}
+
+    correlations = {}
+    for inp in _WEATHER_INPUTS:
+        correlations[inp] = {}
+        for out in _WEATHER_OUTCOMES:
+            pairs = [(r[inp], r[out]) for r in rows
+                     if r[inp] is not None and r[out] is not None]
+            rho = _spearman([p[0] for p in pairs], [p[1] for p in pairs])
+            correlations[inp][out] = {"spearman": rho, "n": len(pairs)}
+
+    by_class: dict[str, list] = {}
+    for r in rows:
+        by_class.setdefault(r["classification"], []).append(r)
+    by_classification = {
+        cls: {
+            "n": len(sub),
+            "temp_vs_perf_cond_first": _spearman(
+                [r["temp_c"] for r in sub if r["perf_cond_first"] is not None],
+                [r["perf_cond_first"] for r in sub if r["perf_cond_first"] is not None]),
+            "temp_vs_perf_cond_change": _spearman(
+                [r["temp_c"] for r in sub if r["perf_cond_change"] is not None],
+                [r["perf_cond_change"] for r in sub if r["perf_cond_change"] is not None]),
+            "temp_vs_feel": _spearman(
+                [r["temp_c"] for r in sub if r["workout_feel"] is not None],
+                [r["workout_feel"] for r in sub if r["workout_feel"] is not None]),
+        }
+        for cls, sub in sorted(by_class.items()) if len(sub) >= 5
+    }
+
+    months: dict[str, list] = {}
+    for r in rows:
+        months.setdefault(r["month"], []).append(r)
+    monthly = [{"month": m, "n": len(sub), "temp_c": _mean([r["temp_c"] for r in sub]),
+                "perf_cond_first": _mean([r["perf_cond_first"] for r in sub]),
+                "workout_feel": _mean([r["workout_feel"] for r in sub])}
+               for m, sub in sorted(months.items())]
+
+    return {
+        "window": {"since": since, "weeks_back": weeks_back, "sport_type": sport_type,
+                   "classification": classification},
+        "n_sessions": len(rows),
+        "n_with_perf_cond": sum(1 for r in rows if r["perf_cond_first"] is not None),
+        "weather_source_counts": dict(collections.Counter(r["source"] for r in rows)),
+        "unchecked_activities": unchecked,
+        "by_temperature": by_temp,
+        "by_wet_dry": by_wet,
+        "correlations": correlations,
+        "by_classification": by_classification,
+        "monthly": monthly,
+        # Per-session rows only on request — 137 sessions × 16 fields is
+        # ~50k characters, which blows the tool-output budget. The same rows
+        # are one SQL join away in query_activity_cache.
+        "sessions": (
+            [
+                {"id": r["id"], "date": r["start_date_local"][:10],
+                 "cls": r["classification"], "temp_c": r["temp_c"], "wet": r["wet"],
+                 "pc_first": r["perf_cond_first"], "pc_last": r["perf_cond_last"],
+                 "feel": r["workout_feel"], "rpe": r["workout_rpe"]}
+                for r in rows
+            ]
+            if include_sessions
+            else f"{len(rows)} sessions omitted — pass include_sessions=True, or "
+                 "join activities ⨝ activity_weather in query_activity_cache."
+        ),
+        "caveats": [
+            "Temperature tracks the calendar, and so does fitness: a warm-month "
+            "vs cold-month contrast is partly a training-block contrast. Use "
+            "`monthly` to see how much of the spread is seasonal.",
+            "Performance condition is measured against Garmin's RECENT baseline, "
+            "so a hot spell that lasts weeks gets absorbed into the baseline and "
+            "stops showing as negative.",
+            "Session type dominates perf_cond_change (intervals sag, easy runs "
+            "hold) — read `by_classification`, or pass `classification`.",
+            "Conditions are ERA5 reanalysis (~9 km grid) at the start hour and "
+            "coordinates — good for temperature, dew point and rain yes/no, "
+            "coarse for local showers and wind. Feel is Garmin's 5-step "
+            "post-run prompt (0/25/50/75/100), RPE 10-100.",
+            "Descriptive: bins and correlations, no fitted cut-points.",
+        ],
+    }
 
 
 def _rate_form(field: str, v: Optional[float]) -> Optional[str]:
