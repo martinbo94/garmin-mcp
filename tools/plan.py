@@ -3,6 +3,7 @@ from typing import Optional
 
 import garmin_sync
 import plan as plan_mod
+import strength
 from core import IntervalSet, Step, _client, mcp
 from tools.scheduling import schedule_workout
 from tools.workouts import create_continuous_run, create_interval_workout
@@ -37,6 +38,8 @@ def get_plan() -> dict:
     prog-long/race/strength/rest), a name + optional description, and
     either a `continuous` block (mapping to create_continuous_run inputs)
     or an `interval` block (mapping to create_interval_workout inputs).
+    A strength workout may instead name a reusable template:
+    `"strength_template": "<name>"` (see create_strength_workout).
     Materialized workouts also carry garmin_workout_id and
     garmin_schedule_id.
     """
@@ -179,7 +182,11 @@ def materialize_plan(
     `needs_confirmation` preview instead of proceeding — re-run with
     `confirm=True` only if flooding the device is genuinely intended.
 
-    Skips rest/strength workouts (no Garmin template needed).
+    Skips rest workouts and free-text strength entries. A strength entry
+    with `"strength_template": "<name>"` is scheduled from the reusable
+    template of that name (made once with create_strength_workout) — no
+    new workout is created, and a date that already has that template
+    scheduled is left alone.
 
     Args:
         start_date: Optional 'YYYY-MM-DD' — only materialize workouts on
@@ -271,10 +278,44 @@ def materialize_plan(
     created, reused, scheduled, skipped = 0, 0, 0, 0
     errors: list[str] = []
 
+    scheduled_by_date: dict[str, set] = {}
+
+    def _already_scheduled(day: str, wid: int) -> bool:
+        if day not in scheduled_by_date:
+            from tools.scheduling import list_scheduled_workouts
+
+            scheduled_by_date[day] = {
+                x.get("workout_id") for x in list_scheduled_workouts(day, day)}
+        return wid in scheduled_by_date[day]
+
     for w in p["workouts"]:
         if start_date and w["date"] < start_date:
             continue
         if end_date and w["date"] > end_date:
+            continue
+        if w.get("type") == "strength" and w.get("strength_template"):
+            if w.get("garmin_schedule_id"):
+                skipped += 1
+                continue
+            wid = strength.template_id(w["strength_template"])
+            if not wid:
+                errors.append(f"{w['date']}: no strength template named "
+                              f"{w['strength_template']!r} — create it with create_strength_workout")
+                continue
+            try:
+                w["garmin_workout_id"] = wid
+                if _already_scheduled(w["date"], wid):
+                    skipped += 1
+                else:
+                    sched = schedule_workout(wid, w["date"])
+                    sid = sched.get("schedule_id") if isinstance(sched, dict) else None
+                    if sid:
+                        w["garmin_schedule_id"] = sid
+                        scheduled += 1
+                        scheduled_by_date[w["date"]].add(wid)
+                plan_mod.save_plan(p)
+            except Exception as e:
+                errors.append(f"{w['date']}: {type(e).__name__}: {e}")
             continue
         if w.get("type") in ("rest", "strength"):
             continue

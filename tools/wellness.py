@@ -523,18 +523,53 @@ def vo2max_trend(
 
 @mcp.tool()
 def sync_vo2max(start_date: str, end_date: str) -> dict:
-    """Backfill Garmin's daily VO2max estimates for a date range.
+    """Backfill Garmin's daily estimate series for a date range: VO2max,
+    lactate threshold (HR + pace + running FTP) and race predictions.
 
-    One API call for the whole range, so a full year costs a single request.
-    Routine syncs already keep the trailing 30 days current — use this only
-    to reach deeper history than that (e.g. to see a whole season's
-    trajectory), then read it with vo2max_trend.
+    One API call per series for the whole range, so a full year costs three
+    requests. Routine syncs already keep the trailing 30 days of all three
+    current — use this only to reach deeper history, then read it with
+    vo2max_trend and lactate_threshold_trend.
 
     Args:
         start_date / end_date: 'YYYY-MM-DD' inclusive.
 
-    Returns {vo2max_days, errors} — vo2max_days counts the days Garmin
-    actually had a value for, which is normally far fewer than the days in
-    the range.
+    Returns {vo2max_days, lt_days, race_prediction_days, errors} — the day
+    counts are the days Garmin actually had a value for; VO2max and LT are
+    sparse (far fewer than the days in the range), race predictions dense.
     """
-    return garmin_sync.sync_vo2max_range(_client(), start_date, end_date)
+    out = garmin_sync.sync_vo2max_range(_client(), start_date, end_date)
+    lt = garmin_sync.sync_lactate_threshold_range(_client(), start_date, end_date)
+    rp = garmin_sync.sync_race_predictions_range(_client(), start_date, end_date)
+    out["lt_days"] = lt.get("lt_days", 0)
+    out["race_prediction_days"] = rp.get("race_prediction_days", 0)
+    out["errors"] = out.get("errors", []) + lt.get("errors", []) + rp.get("errors", [])
+    return out
+
+
+@mcp.tool()
+def lactate_threshold_trend(weeks_back: int = 52) -> dict:
+    """Garmin's lactate-threshold estimate (HR and pace), running FTP and
+    race predictions over time, set next to the LT2 from the athlete's
+    profile. Use it when the watch announces "lactate threshold updated" or
+    to check whether Garmin's model agrees with the athlete's own fitness
+    signals (test reps, performance condition, chip times).
+
+    Reads the local cache (kept current by sync_activities; deeper history
+    via sync_vo2max(start_date, end_date), which backfills all three series).
+
+    HOW TO PRESENT IT: the LT2 in the profile (a lab test when the athlete
+    has one, else estimated from their zones) stays the anchor — zones and the sub-threshold band are NOT re-derived
+    from this. Garmin's value is a pace/HR model that only updates after
+    qualifying hard efforts, and cool or rainy days flatter it like they
+    flatter performance condition. Report the movement ("Garmin LT up 4 bpm
+    since August"), the update dates, and the gap to the profile value as
+    context. Race predictions are a VO2max-driven trend; chip times outrank
+    them.
+
+    Returns lactate_threshold.summary (first/latest/min/max per series,
+    profile_lt2_hr, profile_lt2_source, garmin_minus_profile_bpm), lactate_threshold.updates (each day
+    the model rewrote a value, with deltas), race_predictions (latest,
+    change over 4/12/52 weeks, a series sampled every 4 weeks), and caveats.
+    """
+    return garmin_sync.lactate_threshold_trend(weeks_back=weeks_back)

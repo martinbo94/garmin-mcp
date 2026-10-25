@@ -5,6 +5,7 @@ activities from Garmin Connect since the last sync, including HR streams and
 lap data for runs. Data lives in `coach_data/cache.db` so weekly summaries
 and activity breakdowns don't hit the API on every query.
 """
+import collections
 import json
 import os
 import re
@@ -168,6 +169,35 @@ CREATE TABLE IF NOT EXISTS streams (
     FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
+-- Conditions at the activity. PRIMARY SOURCE = Open-Meteo ERA5 reanalysis
+-- (hourly, ~9 km grid) at the activity's own start coordinates, start hour;
+-- precip_mm sums the hours the activity spanned, precip_prev_6h_mm the six
+-- hours before. Garmin's own per-activity record (nearest METAR station)
+-- is kept in the garmin_* / station_* columns for audit and used only as a
+-- fallback: the station Garmin picks can be far from the route, and
+-- compared against ERA5 some stations disagree by several degrees and
+-- report rain on dry evenings. A row exists for every activity checked,
+-- with NULL temp_c for indoor / no-GPS ones, so the backfill terminates.
+CREATE TABLE IF NOT EXISTS activity_weather (
+    activity_id INTEGER PRIMARY KEY,
+    temp_c REAL,
+    apparent_temp_c REAL,
+    dew_point_c REAL,
+    relative_humidity REAL,
+    wind_speed_kmh REAL,
+    wind_gust_kmh REAL,
+    wind_direction_deg REAL,
+    wind_compass TEXT,
+    conditions TEXT,
+    station_id TEXT,
+    station_name TEXT,
+    station_lat REAL,
+    station_lon REAL,
+    observed_at TEXT,
+    fetched_at TEXT NOT NULL,
+    FOREIGN KEY (activity_id) REFERENCES activities(id)
+);
+
 CREATE TABLE IF NOT EXISTS laps (
     activity_id INTEGER PRIMARY KEY,
     laps_json TEXT NOT NULL,
@@ -193,6 +223,69 @@ CREATE TABLE IF NOT EXISTS vo2max_daily (
     vo2max_rounded REAL,
     fitness_age REAL,
     synced_at TEXT NOT NULL
+);
+
+-- Garmin's running lactate-threshold estimate (HR, speed) and running FTP,
+-- one row per day the model rewrote a value. Sparse like vo2max_daily.
+-- lt_speed_m_s is the API value ×10 (Garmin serves 0.3417 for 3.417 m/s —
+-- verified against the threshold pace the watch displays). Model output:
+-- the LT2 in the user profile stays the anchor; this is trend material.
+CREATE TABLE IF NOT EXISTS lactate_threshold_daily (
+    date TEXT PRIMARY KEY,
+    lt_hr INTEGER,
+    lt_speed_m_s REAL,
+    lt_pace_s_per_km REAL,
+    ftp_w INTEGER,
+    synced_at TEXT NOT NULL
+);
+
+-- Garmin's race-time predictions, dense (one row per day, seconds).
+CREATE TABLE IF NOT EXISTS race_predictions_daily (
+    date TEXT PRIMARY KEY,
+    time_5k_s INTEGER,
+    time_10k_s INTEGER,
+    time_half_s INTEGER,
+    time_marathon_s INTEGER,
+    synced_at TEXT NOT NULL
+);
+
+-- Garmin's strength exercise catalog (public web-data JSON + English
+-- display names), refreshed monthly by strength.load_catalog().
+CREATE TABLE IF NOT EXISTS exercise_catalog (
+    category TEXT NOT NULL,
+    exercise_name TEXT NOT NULL,
+    display_name TEXT,
+    primary_muscles TEXT,
+    PRIMARY KEY (category, exercise_name)
+);
+
+-- Reusable strength workouts by name, so materialize_plan schedules the
+-- same template every week instead of creating a new one. Kept apart from
+-- created_workouts on purpose: cleanup_workout_templates only deletes ids
+-- in that registry, and these must survive between weeks.
+CREATE TABLE IF NOT EXISTS strength_templates (
+    name TEXT PRIMARY KEY,
+    workout_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Sets Garmin recorded for a strength activity (active sets and rests).
+-- category/exercise_name are Garmin's best guess for the set (it detects
+-- the exercise, or takes it from the workout step being followed);
+-- 'UNKNOWN' when the session was not run from a structured workout.
+CREATE TABLE IF NOT EXISTS strength_sets (
+    activity_id INTEGER NOT NULL,
+    set_index INTEGER NOT NULL,
+    set_type TEXT,
+    category TEXT,
+    exercise_name TEXT,
+    reps INTEGER,
+    weight_kg REAL,
+    duration_s REAL,
+    start_time TEXT,
+    workout_step_index INTEGER,
+    PRIMARY KEY (activity_id, set_index),
+    FOREIGN KEY (activity_id) REFERENCES activities(id)
 );
 
 CREATE TABLE IF NOT EXISTS wellness_daily (
@@ -230,6 +323,30 @@ _WELLNESS_MIGRATION_COLUMNS = {
     "respiration_avg": "INTEGER",
     "spo2_avg": "INTEGER",
     "recovery_time_hours": "INTEGER",
+    # Garmin training status as of that day (get_training_status is
+    # date-addressable, so history backfills). Load figures are Garmin's:
+    # acute = 7-day, chronic = 28-day, acwr_percent = acute/chronic position
+    # inside Garmin's optimal tunnel (not the ratio itself — that is
+    # load_acwr). load_4w_* are the monthly focus buckets behind the
+    # "anaerobic shortage"-style balance phrase.
+    "training_status_code": "INTEGER",
+    "training_status": "TEXT",
+    "acwr_percent": "INTEGER",
+    "acwr_status": "TEXT",
+    "load_acwr": "REAL",
+    "load_acute": "INTEGER",
+    "load_chronic": "INTEGER",
+    "load_chronic_min": "REAL",
+    "load_chronic_max": "REAL",
+    "load_4w_aerobic_low": "REAL",
+    "load_4w_aerobic_high": "REAL",
+    "load_4w_anaerobic": "REAL",
+    "load_balance": "TEXT",
+    # Morning training-readiness score/level (first reading of the day).
+    "training_readiness_score": "INTEGER",
+    "training_readiness_level": "TEXT",
+    # Marker so backfill_training_status terminates on days Garmin has nothing.
+    "training_status_fetched_at": "TEXT",
 }
 
 _ACTIVITY_MIGRATION_COLUMNS = {
@@ -274,6 +391,12 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     # Marks an activity as processed for the metric columns above — set even
     # when the sport reports none of them, so the backfill terminates.
     "metrics_fetched_at": "TEXT",
+    # Set whenever the detail fetch ran with the start_lat/lon fields present,
+    # so backfill_coordinates skips indoor rows instead of re-asking forever.
+    "coords_checked_at": "TEXT",
+    # Set once a strength activity's exercise sets were fetched (also when
+    # Garmin had none), so backfill_strength_sets terminates.
+    "strength_sets_fetched_at": "TEXT",
 }
 
 _STREAMS_MIGRATION_COLUMNS = {
@@ -296,6 +419,19 @@ _LAPS_MIGRATION_COLUMNS = {
     "dynamics_fetched_at": "TEXT",
 }
 
+_WEATHER_MIGRATION_COLUMNS = {
+    "precip_mm": "REAL",
+    "precip_prev_6h_mm": "REAL",
+    "cloud_cover_pct": "REAL",
+    "weather_code": "INTEGER",
+    "source": "TEXT",             # 'open-meteo' | 'garmin-station'
+    "location_source": "TEXT",    # 'activity_gps' | 'garmin_station'
+    "lat": "REAL",
+    "lon": "REAL",
+    "garmin_temp_c": "REAL",
+    "garmin_conditions": "TEXT",
+}
+
 
 def _init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +442,7 @@ def _init_db() -> None:
             ("activities", _ACTIVITY_MIGRATION_COLUMNS),
             ("streams", _STREAMS_MIGRATION_COLUMNS),
             ("laps", _LAPS_MIGRATION_COLUMNS),
+            ("activity_weather", _WEATHER_MIGRATION_COLUMNS),
         ):
             existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
             for col, col_type in columns.items():
@@ -733,7 +870,8 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
                 training_effect_label = COALESCE(?, training_effect_label),
                 detail_fetched_at = ?,
                 start_lat = COALESCE(?, start_lat),
-                start_lon = COALESCE(?, start_lon)
+                start_lon = COALESCE(?, start_lon),
+                coords_checked_at = ?
             WHERE id = ?
             """,
             (
@@ -746,9 +884,339 @@ def _store_detail_fields(act_id: int, fields: dict) -> None:
                 datetime.now(timezone.utc).isoformat(),
                 fields.get("start_lat"),
                 fields.get("start_lon"),
+                datetime.now(timezone.utc).isoformat(),
                 act_id,
             ),
         )
+
+
+# ─── Weather at the activity ──────────────────────────────────────────
+# Primary source: Open-Meteo ERA5 archive at the activity's start coordinates
+# (forecast API with past_days for the last week, where the archive lags).
+# Garmin's per-activity station record is fetched too — it is the only
+# indoor/outdoor signal we have, gives a fallback location, and is kept for
+# audit — but its temperatures are NOT trusted (see the schema note).
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+_OM_HOURLY = ("temperature_2m,apparent_temperature,dew_point_2m,relative_humidity_2m,"
+              "precipitation,wind_speed_10m,wind_gusts_10m,cloud_cover,weather_code")
+_ARCHIVE_LAG_DAYS = 7
+_WET_WORDS = ("rain", "shower", "drizzle", "snow", "sleet", "thunder", "hail")
+_WMO = {0: "Clear", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle", 55: "Dense drizzle",
+        56: "Freezing drizzle", 57: "Freezing drizzle", 61: "Light rain", 63: "Rain",
+        65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain", 71: "Light snow",
+        73: "Snow", 75: "Heavy snow", 77: "Snow grains", 80: "Light showers",
+        81: "Showers", 82: "Violent showers", 85: "Snow showers", 86: "Heavy snow showers",
+        95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with hail"}
+
+
+def _f_to_c(f: Optional[float]) -> Optional[float]:
+    return round((f - 32) / 1.8, 1) if f is not None else None
+
+
+def _fetch_garmin_weather(garmin_client, act_id: int) -> dict:
+    """Garmin's weather record for one activity (nearest METAR station,
+    served in °F). Indoor / no-GPS activities return all-null fields."""
+    w = garmin_client.get_activity_weather(act_id) or {}
+    station = w.get("weatherStationDTO") or {}
+    wtype = w.get("weatherTypeDTO") or {}
+    has_data = w.get("temp") is not None
+    return {
+        "garmin_temp_c": _f_to_c(w.get("temp")),
+        "garmin_conditions": wtype.get("desc"),
+        "station_id": station.get("id"),
+        "station_name": station.get("name"),
+        "station_lat": w.get("latitude") if has_data else None,
+        "station_lon": w.get("longitude") if has_data else None,
+        "observed_at": w.get("issueDate"),
+        # Fallback values, used only when Open-Meteo has nothing.
+        "_fallback": {
+            "temp_c": _f_to_c(w.get("temp")),
+            "apparent_temp_c": _f_to_c(w.get("apparentTemp")),
+            "dew_point_c": _f_to_c(w.get("dewPoint")),
+            "relative_humidity": w.get("relativeHumidity"),
+            "wind_speed_kmh": w.get("windSpeed"),
+            "wind_gust_kmh": w.get("windGust"),
+            "wind_direction_deg": w.get("windDirection"),
+            "wind_compass": w.get("windDirectionCompassPoint"),
+            "conditions": wtype.get("desc"),
+        } if has_data else None,
+    }
+
+
+def _om_hourly(lat: float, lon: float, d0: date, d1: date) -> dict:
+    """Hourly Open-Meteo series for [d0, d1] (local time keys 'YYYY-MM-DDTHH:00').
+    Archive for dates older than the lag, forecast API (past_days) for recent
+    ones; chunks the archive into ≤365-day requests."""
+    import requests
+    out: dict[str, dict] = {}
+    cutoff = date.today() - timedelta(days=_ARCHIVE_LAG_DAYS)
+
+    def _pull(url, a, b):
+        r = requests.get(url, params=dict(
+            latitude=lat, longitude=lon, start_date=a.isoformat(), end_date=b.isoformat(),
+            hourly=_OM_HOURLY, wind_speed_unit="kmh", timezone="auto"), timeout=60)
+        r.raise_for_status()
+        h = r.json().get("hourly") or {}
+        keys = [k for k in h if k != "time"]
+        for i, t in enumerate(h.get("time") or []):
+            out[t] = {k: h[k][i] for k in keys}
+
+    a = d0
+    while a <= min(d1, cutoff - timedelta(days=1)):
+        b = min(a + timedelta(days=364), d1, cutoff - timedelta(days=1))
+        _pull(OPEN_METEO_ARCHIVE_URL, a, b)
+        a = b + timedelta(days=1)
+    if d1 >= cutoff:
+        _pull(OPEN_METEO_FORECAST_URL, max(d0, cutoff), d1)
+    return out
+
+
+def _om_at(series: dict, start_local: str, duration_s: Optional[float]) -> Optional[dict]:
+    """Conditions for one activity from an hourly series: start-hour values,
+    precipitation summed over the hours the activity spanned and over the
+    six hours before it."""
+    key = start_local[:13] + ":00"
+    h0 = series.get(key)
+    if not h0 or h0.get("temperature_2m") is None:
+        return None
+    start = datetime.fromisoformat(start_local[:19])
+    hours = max(1, int((start.minute * 60 + (duration_s or 0)) // 3600) + 1)
+    precip = 0.0
+    for i in range(hours):
+        v = series.get((start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:00"), {}).get("precipitation")
+        precip += v or 0.0
+    prev = 0.0
+    for i in range(1, 7):
+        v = series.get((start - timedelta(hours=i)).strftime("%Y-%m-%dT%H:00"), {}).get("precipitation")
+        prev += v or 0.0
+    code = h0.get("weather_code")
+    return {
+        "temp_c": h0.get("temperature_2m"),
+        "apparent_temp_c": h0.get("apparent_temperature"),
+        "dew_point_c": h0.get("dew_point_2m"),
+        "relative_humidity": h0.get("relative_humidity_2m"),
+        "wind_speed_kmh": h0.get("wind_speed_10m"),
+        "wind_gust_kmh": h0.get("wind_gusts_10m"),
+        "wind_direction_deg": None,
+        "wind_compass": None,
+        "cloud_cover_pct": h0.get("cloud_cover"),
+        "weather_code": code,
+        "conditions": _WMO.get(int(code)) if code is not None else None,
+        "precip_mm": round(precip, 1),
+        "precip_prev_6h_mm": round(prev, 1),
+    }
+
+
+def _store_activity_weather(act_id: int, fields: dict) -> None:
+    fields = {k: v for k, v in fields.items() if not k.startswith("_")}
+    cols = list(fields.keys()) + ["fetched_at"]
+    vals = list(fields.values()) + [datetime.now(timezone.utc).isoformat()]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            f"INSERT OR REPLACE INTO activity_weather (activity_id, {', '.join(cols)}) "
+            f"VALUES (?{', ?' * len(cols)})",
+            [act_id, *vals],
+        )
+
+
+def _weather_row(garmin: dict, om: Optional[dict], lat, lon, loc_source) -> dict:
+    row = {k: v for k, v in garmin.items() if k != "_fallback"}
+    if om:
+        row.update(om)
+        row["source"] = "open-meteo"
+    elif garmin.get("_fallback"):
+        row.update(garmin["_fallback"])
+        row["source"] = "garmin-station"
+    else:
+        row["source"] = None
+    row["lat"], row["lon"], row["location_source"] = lat, lon, loc_source
+    return row
+
+
+def _activity_location(row) -> tuple:
+    """(lat, lon, source) from the activity's own GPS start, else
+    (None, None, None). Callers fall back to Garmin's station coordinates."""
+    if row["start_lat"] is not None and row["start_lon"] is not None:
+        return row["start_lat"], row["start_lon"], "activity_gps"
+    return None, None, None
+
+
+def fetch_and_store_weather(garmin_client, act_id: int) -> dict:
+    """Weather for one activity: Garmin record for indoor detection + audit,
+    Open-Meteo at the activity's coordinates for the values. Used by run_sync
+    for each new cardio activity."""
+    garmin = _fetch_garmin_weather(garmin_client, act_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        a = conn.execute(
+            "SELECT start_date_local, moving_time_s, start_lat, start_lon "
+            "FROM activities WHERE id = ?", (act_id,)).fetchone()
+    lat, lon, src = _activity_location(a)
+    if lat is None and garmin.get("station_lat"):
+        lat, lon, src = garmin["station_lat"], garmin["station_lon"], "garmin_station"
+    om = None
+    indoor = garmin.get("_fallback") is None and a["start_lat"] is None
+    if lat is not None and not indoor:
+        try:
+            d = date.fromisoformat(a["start_date_local"][:10])
+            om = _om_at(_om_hourly(lat, lon, d, d), a["start_date_local"], a["moving_time_s"])
+        except Exception:
+            om = None
+    row = _weather_row(garmin, om, lat, lon, src)
+    _store_activity_weather(act_id, row)
+    return row
+
+
+def backfill_coordinates(garmin_client, max_activities: int = 400) -> dict:
+    """Re-fetch detail fields for cached cardio activities whose row predates
+    the start_lat/lon columns (one API call each, newest first). Indoor rows
+    get coords_checked_at set and are not asked again."""
+    _init_db()
+    cardio = ", ".join("?" * len(_CARDIO_TYPES))
+    with sqlite3.connect(DB_PATH) as conn:
+        ids = [r[0] for r in conn.execute(
+            f"SELECT id FROM activities WHERE start_lat IS NULL AND coords_checked_at IS NULL "
+            f"AND sport_type IN ({cardio}) ORDER BY start_date_local DESC LIMIT ?",
+            (*_CARDIO_TYPES, max_activities))]
+        remaining = conn.execute(
+            f"SELECT COUNT(*) FROM activities WHERE start_lat IS NULL AND coords_checked_at IS NULL "
+            f"AND sport_type IN ({cardio})", tuple(_CARDIO_TYPES)).fetchone()[0] - len(ids)
+    fetched = with_coords = 0
+    errors: list[str] = []
+    for act_id in ids:
+        try:
+            f = _fetch_detail_fields(garmin_client, act_id)
+            _store_detail_fields(act_id, f)
+            fetched += 1
+            if f.get("start_lat") is not None:
+                with_coords += 1
+        except Exception as e:
+            errors.append(f"detail {act_id}: {type(e).__name__}: {e}")
+    return {"details_fetched": fetched, "with_coords": with_coords,
+            "remaining": remaining, "errors": errors}
+
+
+def backfill_weather(garmin_client, max_activities: int = 500,
+                     refresh_open_meteo: bool = False) -> dict:
+    """Fill activity_weather for cached cardio activities. Garmin's record is
+    fetched per activity (one call each) for indoor detection and audit;
+    Open-Meteo values are fetched in bulk — activities are clustered by
+    location (~5 km) and each cluster's whole date span is pulled in ≤365-day
+    hourly requests, so a two-year history costs ~20 HTTP requests.
+
+    refresh_open_meteo=True also re-derives rows whose source is not yet
+    'open-meteo' (e.g. rows stored from the Garmin station only).
+    """
+    _init_db()
+    cardio = ", ".join("?" * len(_CARDIO_TYPES))
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        todo = conn.execute(
+            f"""
+            SELECT a.id, a.start_date_local, a.moving_time_s, a.start_lat, a.start_lon,
+                   w.activity_id AS has_row, w.source, w.station_lat, w.station_lon,
+                   w.garmin_temp_c, w.garmin_conditions, w.station_id, w.station_name,
+                   w.observed_at, w.temp_c AS old_temp_c
+            FROM activities a LEFT JOIN activity_weather w ON w.activity_id = a.id
+            WHERE a.sport_type IN ({cardio})
+              AND (w.activity_id IS NULL
+                   OR (? AND COALESCE(w.source, '') != 'open-meteo'
+                       AND (w.temp_c IS NOT NULL OR a.start_lat IS NOT NULL)))
+            ORDER BY a.start_date_local DESC LIMIT ?
+            """, (*_CARDIO_TYPES, 1 if refresh_open_meteo else 0, max_activities)).fetchall()
+
+    errors: list[str] = []
+    garmin_calls = 0
+    per_act: dict[int, dict] = {}
+    for a in todo:
+        if a["has_row"] is None:
+            try:
+                g = _fetch_garmin_weather(garmin_client, a["id"])
+                garmin_calls += 1
+            except Exception as e:
+                errors.append(f"garmin weather {a['id']}: {type(e).__name__}: {e}")
+                continue
+        else:
+            g = {"garmin_temp_c": a["garmin_temp_c"], "garmin_conditions": a["garmin_conditions"],
+                 "station_id": a["station_id"], "station_name": a["station_name"],
+                 "station_lat": a["station_lat"], "station_lon": a["station_lon"],
+                 "observed_at": a["observed_at"], "_fallback": None}
+        lat, lon, src = _activity_location(a)
+        if lat is None and g.get("station_lat"):
+            lat, lon, src = g["station_lat"], g["station_lon"], "garmin_station"
+        indoor = g.get("_fallback") is None and a["start_lat"] is None and a["old_temp_c"] is None
+        per_act[a["id"]] = {"row": a, "garmin": g, "lat": lat, "lon": lon, "src": src,
+                            "indoor": indoor or lat is None}
+
+    # Cluster outdoor activities by location and pull each cluster's span once.
+    clusters: dict[tuple, list[int]] = {}
+    for act_id, info in per_act.items():
+        if info["indoor"]:
+            continue
+        clusters.setdefault((round(info["lat"] / 0.05) * 0.05, round(info["lon"] / 0.05) * 0.05), []).append(act_id)
+
+    om_requests = 0
+    om_by_act: dict[int, Optional[dict]] = {}
+    for (clat, clon), ids in clusters.items():
+        days = [date.fromisoformat(per_act[i]["row"]["start_date_local"][:10]) for i in ids]
+        try:
+            series = _om_hourly(round(clat, 3), round(clon, 3), min(days), max(days))
+            om_requests += 1 + (max(days) - min(days)).days // 365
+        except Exception as e:
+            errors.append(f"open-meteo cluster {clat:.2f},{clon:.2f}: {type(e).__name__}: {e}")
+            continue
+        for i in ids:
+            r = per_act[i]["row"]
+            om_by_act[i] = _om_at(series, r["start_date_local"], r["moving_time_s"])
+
+    stored = with_om = 0
+    for act_id, info in per_act.items():
+        om = om_by_act.get(act_id)
+        if not info["indoor"] and om is None and act_id not in om_by_act:
+            continue  # cluster fetch failed — leave for next round
+        row = _weather_row(info["garmin"], om, info["lat"], info["lon"], info["src"])
+        _store_activity_weather(act_id, row)
+        stored += 1
+        if row.get("source") == "open-meteo":
+            with_om += 1
+
+    with sqlite3.connect(DB_PATH) as conn:
+        remaining = conn.execute(
+            f"SELECT COUNT(*) FROM activities a LEFT JOIN activity_weather w ON w.activity_id = a.id "
+            f"WHERE w.activity_id IS NULL AND a.sport_type IN ({cardio})", tuple(_CARDIO_TYPES)).fetchone()[0]
+    return {"weather_stored": stored, "with_open_meteo": with_om,
+            "garmin_calls": garmin_calls, "open_meteo_requests": om_requests,
+            "remaining_without_weather": remaining, "errors": errors}
+
+
+def cached_weather(activity_id: int) -> Optional[dict]:
+    """The stored weather row for one activity as a dict, or None if the
+    activity has not been weather-checked. A checked indoor activity
+    returns a dict whose `temp_c` is None."""
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM activity_weather WHERE activity_id = ?", (activity_id,)
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d.pop("activity_id", None)
+    d["wet"] = _is_wet(d)
+    return d
+
+
+def _is_wet(w: dict) -> Optional[bool]:
+    """Wet = measurable precipitation during the activity or in the six hours
+    before it (Open-Meteo), else Garmin's condition text as a fallback."""
+    if w.get("temp_c") is None:
+        return None
+    if w.get("source") == "open-meteo":
+        return (w.get("precip_mm") or 0) >= 0.2 or (w.get("precip_prev_6h_mm") or 0) >= 1.0
+    c = (w.get("conditions") or "").lower()
+    return any(word in c for word in _WET_WORDS) if c else None
 
 
 # ─── Gear (shoes etc.) ────────────────────────────────────────────────
@@ -1205,6 +1673,234 @@ def sync_vo2max_range(garmin_client, start_date: str, end_date: str) -> dict:
     return {"vo2max_days": len(rows), "errors": []}
 
 
+# ─── Lactate threshold + race predictions (Garmin estimates) ──────────
+def sync_lactate_threshold_range(garmin_client, start_date: str, end_date: str) -> dict:
+    """Pull Garmin's running lactate-threshold estimate (HR + speed) and
+    running FTP for a date range into lactate_threshold_daily. One API call;
+    the series is sparse (a row only on days the model rewrote a value). The
+    three series arrive separately and are merged per date with COALESCE so a
+    speed-only day does not null out an HR-only day.
+    """
+    _init_db()
+    try:
+        raw = garmin_client.get_lactate_threshold(
+            latest=False, start_date=start_date, end_date=end_date, aggregation="daily"
+        ) or {}
+    except Exception as e:
+        return {"lt_days": 0, "errors": [f"lactate_threshold: {type(e).__name__}: {e}"]}
+
+    per_day: dict[str, dict] = {}
+    for key, col in (("heart_rate", "lt_hr"), ("speed", "lt_speed_m_s"), ("power", "ftp_w")):
+        for e in raw.get(key) or []:
+            day = (e or {}).get("from") or (e or {}).get("updatedDate")
+            val = (e or {}).get("value")
+            if not day or val is None:
+                continue
+            if col == "lt_speed_m_s":
+                val = round(val * 10, 4)  # API unit is 10 m/s
+            per_day.setdefault(day, {})[col] = val
+
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        for day, f in per_day.items():
+            spd = f.get("lt_speed_m_s")
+            pace = round(1000 / spd, 1) if spd else None
+            conn.execute(
+                """
+                INSERT INTO lactate_threshold_daily
+                    (date, lt_hr, lt_speed_m_s, lt_pace_s_per_km, ftp_w, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    lt_hr = COALESCE(excluded.lt_hr, lt_hr),
+                    lt_speed_m_s = COALESCE(excluded.lt_speed_m_s, lt_speed_m_s),
+                    lt_pace_s_per_km = COALESCE(excluded.lt_pace_s_per_km, lt_pace_s_per_km),
+                    ftp_w = COALESCE(excluded.ftp_w, ftp_w),
+                    synced_at = excluded.synced_at
+                """,
+                (day, f.get("lt_hr"), spd, pace, f.get("ftp_w"), now),
+            )
+    return {"lt_days": len(per_day), "errors": []}
+
+
+def sync_race_predictions_range(garmin_client, start_date: str, end_date: str) -> dict:
+    """Pull Garmin's daily 5k/10k/half/marathon predictions (seconds) for a
+    date range into race_predictions_daily. One API call, dense series."""
+    _init_db()
+    try:
+        raw = garmin_client.get_race_predictions(
+            startdate=start_date, enddate=end_date, _type="daily"
+        ) or []
+    except Exception as e:
+        return {"race_prediction_days": 0,
+                "errors": [f"race_predictions: {type(e).__name__}: {e}"]}
+    if isinstance(raw, dict):
+        raw = [raw]
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (e["calendarDate"], e.get("time5K"), e.get("time10K"),
+         e.get("timeHalfMarathon"), e.get("timeMarathon"), now)
+        for e in raw if isinstance(e, dict) and e.get("calendarDate")
+    ]
+    if rows:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO race_predictions_daily "
+                "(date, time_5k_s, time_10k_s, time_half_s, time_marathon_s, synced_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)", rows)
+    return {"race_prediction_days": len(rows), "errors": []}
+
+
+def _fmt_time(secs: Optional[float]) -> Optional[str]:
+    if secs is None:
+        return None
+    secs = int(round(secs))
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_pace(sec_per_km: Optional[float]) -> Optional[str]:
+    if sec_per_km is None:
+        return None
+    return f"{int(sec_per_km // 60)}:{int(round(sec_per_km % 60)):02d}"
+
+
+def lactate_threshold_trend(weeks_back: int = 52) -> dict:
+    """Garmin's lactate-threshold estimate (HR, pace), running FTP and race
+    predictions over time, next to the LT2 from the user profile.
+    Descriptive: the series and their changes, no re-derivation of zones.
+    """
+    _init_db()
+    since = (datetime.now(timezone.utc) - timedelta(weeks=weeks_back)).date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        lt_rows = conn.execute(
+            "SELECT * FROM lactate_threshold_daily WHERE date >= ? ORDER BY date", (since,)
+        ).fetchall()
+        rp_rows = conn.execute(
+            "SELECT * FROM race_predictions_daily WHERE date >= ? ORDER BY date", (since,)
+        ).fetchall()
+        extent = conn.execute(
+            "SELECT MIN(date) o, MAX(date) n FROM lactate_threshold_daily").fetchone()
+
+    if not lt_rows and not rp_rows:
+        return {
+            "error": "No Garmin threshold / race-prediction data cached for that window.",
+            "next_steps": ["sync_activities() keeps the trailing 30 days current; "
+                           "sync_vo2max(start_date, end_date) backfills all three "
+                           "estimate series for a range."],
+        }
+
+    try:
+        anchors = _parse_intensity_anchors(_parse_zones())
+        profile_lt2 = anchors.get("lt2_hr")
+        profile_source = anchors.get("source")
+    except Exception:
+        profile_lt2, profile_source = None, None
+
+    series = []
+    prev_hr = prev_pace = None
+    for r in lt_rows:
+        series.append({
+            "date": r["date"],
+            "lt_hr": r["lt_hr"],
+            "lt_hr_delta": (r["lt_hr"] - prev_hr) if r["lt_hr"] is not None and prev_hr is not None else None,
+            "lt_pace": _fmt_pace(r["lt_pace_s_per_km"]),
+            "lt_pace_s_per_km": r["lt_pace_s_per_km"],
+            "lt_pace_delta_s": round(r["lt_pace_s_per_km"] - prev_pace, 1)
+                if r["lt_pace_s_per_km"] is not None and prev_pace is not None else None,
+            "ftp_w": r["ftp_w"],
+        })
+        if r["lt_hr"] is not None:
+            prev_hr = r["lt_hr"]
+        if r["lt_pace_s_per_km"] is not None:
+            prev_pace = r["lt_pace_s_per_km"]
+
+    hr_pts = [(r["date"], r["lt_hr"]) for r in lt_rows if r["lt_hr"] is not None]
+    pace_pts = [(r["date"], r["lt_pace_s_per_km"]) for r in lt_rows if r["lt_pace_s_per_km"] is not None]
+    ftp_pts = [(r["date"], r["ftp_w"]) for r in lt_rows if r["ftp_w"] is not None]
+
+    def _summ(pts, fmt=lambda v: v):
+        if not pts:
+            return None
+        vals = [v for _, v in pts]
+        return {"first": {"date": pts[0][0], "value": fmt(pts[0][1])},
+                "latest": {"date": pts[-1][0], "value": fmt(pts[-1][1])},
+                "min": fmt(min(vals)), "max": fmt(max(vals)),
+                "n_updates": len(pts)}
+
+    lt_summary = {
+        "lt_hr": _summ(hr_pts),
+        "lt_pace": _summ(pace_pts, _fmt_pace),
+        "ftp_w": _summ(ftp_pts),
+        "profile_lt2_hr": profile_lt2,
+        "profile_lt2_source": profile_source,
+        "garmin_minus_profile_bpm": (hr_pts[-1][1] - profile_lt2) if hr_pts and profile_lt2 else None,
+    }
+
+    def _at_or_before(rows, target):
+        best = None
+        for r in rows:
+            if r["date"] <= target:
+                best = r
+        return best
+
+    rp = None
+    if rp_rows:
+        latest = rp_rows[-1]
+        today = date.fromisoformat(latest["date"])
+        deltas = {}
+        for label, days in (("4w", 28), ("12w", 84), ("52w", 364)):
+            ref = _at_or_before(rp_rows, (today - timedelta(days=days)).isoformat())
+            if ref:
+                deltas[label] = {
+                    "from_date": ref["date"],
+                    "d5k_s": latest["time_5k_s"] - ref["time_5k_s"] if latest["time_5k_s"] and ref["time_5k_s"] else None,
+                    "d10k_s": latest["time_10k_s"] - ref["time_10k_s"] if latest["time_10k_s"] and ref["time_10k_s"] else None,
+                    "dhalf_s": latest["time_half_s"] - ref["time_half_s"] if latest["time_half_s"] and ref["time_half_s"] else None,
+                }
+        # Sampled every 28 days (plus the latest) to keep the payload small;
+        # the daily rows are in race_predictions_daily for SQL.
+        step = 28
+        sampled = [{"date": r["date"], "5k": _fmt_time(r["time_5k_s"]),
+                    "10k": _fmt_time(r["time_10k_s"]), "half": _fmt_time(r["time_half_s"]),
+                    "marathon": _fmt_time(r["time_marathon_s"])}
+                   for i, r in enumerate(rp_rows)
+                   if (i % step == (len(rp_rows) - 1) % step)
+                   and r["time_10k_s"] is not None]
+        rp = {
+            "latest": {"date": latest["date"], "5k": _fmt_time(latest["time_5k_s"]),
+                       "10k": _fmt_time(latest["time_10k_s"]),
+                       "half": _fmt_time(latest["time_half_s"]),
+                       "marathon": _fmt_time(latest["time_marathon_s"])},
+            "change": deltas,
+            "every_4_weeks": sampled,
+        }
+
+    return {
+        "window": {"since": since, "weeks_back": weeks_back,
+                   "lt_cache_oldest": extent["o"], "lt_cache_newest": extent["n"]},
+        "lactate_threshold": {"summary": lt_summary, "updates": series},
+        "race_predictions": rp,
+        "caveats": [
+            "Garmin's LT is a model estimate from the pace/HR relationship in "
+            "hard running; the LT2 in the profile (a lab test when the athlete "
+            "has one, else an estimate from their zones — see "
+            "profile_lt2_source) stays the anchor for zones and the "
+            "sub-threshold band. Read the "
+            "MOVEMENT here (up 4 bpm over 3 weeks), not the level.",
+            "Updates land only after qualifying hard efforts (races, long "
+            "threshold reps), so a flat series usually means 'no qualifying "
+            "session', not 'no change'.",
+            "Cool, rainy days flatter the model exactly like they flatter "
+            "performance condition (same pace/HR input) — check weather on the "
+            "update day before reading a jump as fitness.",
+            "Race predictions are Garmin's VO2max-driven extrapolation; chip "
+            "times outrank them. Use them as a trend, and remember they shift "
+            "day to day with the VO2max estimate.",
+        ],
+    }
+
+
 # ─── Location + weather (Open-Meteo) ──────────────────────────────────
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -1357,6 +2053,8 @@ def run_sync(
     laps_count = 0
     details_count = 0
     gear_count = 0
+    weather_count = 0
+    strength_sets_count = 0
     errors: list[str] = []
 
     for act in activities:
@@ -1439,6 +2137,22 @@ def run_sync(
             except Exception as e:
                 errors.append(f"gear {act_id}: {e}")
 
+        if is_cardio:
+            try:
+                fetch_and_store_weather(garmin_client, act_id)
+                weather_count += 1
+            except Exception as e:
+                errors.append(f"weather {act_id}: {e}")
+
+        if sport_type == "WeightTraining":
+            import strength  # noqa: PLC0415  (strength imports this module)
+
+            try:
+                strength.fetch_and_store_sets(garmin_client, act_id)
+                strength_sets_count += 1
+            except Exception as e:
+                errors.append(f"strength sets {act_id}: {e}")
+
     # Refresh recent wellness so HRV/RHR/sleep stay current alongside
     # activities — activity sync alone leaves these stale, which makes the
     # recovery/readiness tools report phantom "no data". Failures here never
@@ -1468,6 +2182,23 @@ def run_sync(
             errors.extend(v.get("errors", []))
         except Exception as e:
             errors.append(f"vo2max: {type(e).__name__}: {e}")
+
+    # Same trailing window for Garmin's lactate-threshold estimate and race
+    # predictions — one call each, so nearly free. Failures never break sync.
+    lt_days = 0
+    race_prediction_days = 0
+    if wellness_days and wellness_days > 0:
+        try:
+            today = datetime.now(timezone.utc).date()
+            e_start = (today - timedelta(days=max(wellness_days, 30) - 1)).isoformat()
+            lt = sync_lactate_threshold_range(garmin_client, e_start, today.isoformat())
+            lt_days = lt.get("lt_days", 0)
+            errors.extend(lt.get("errors", []))
+            rp = sync_race_predictions_range(garmin_client, e_start, today.isoformat())
+            race_prediction_days = rp.get("race_prediction_days", 0)
+            errors.extend(rp.get("errors", []))
+        except Exception as e:
+            errors.append(f"garmin estimates: {type(e).__name__}: {e}")
 
     # Refresh the gear library (status + mileage) so the gear tools read
     # locally. Cheap (one list + one stats call per gear item) and failures
@@ -1507,11 +2238,15 @@ def run_sync(
         "laps_fetched": laps_count,
         "details_fetched": details_count,
         "activity_gear_fetched": gear_count,
+        "weather_fetched": weather_count,
+        "strength_sets_fetched": strength_sets_count,
         "gear_synced": gear_synced,
         "gear_refresh": gear_refresh,
         "wellness_fetched": wellness_fetched,
         "wellness_cached": wellness_cached,
         "vo2max_days": vo2max_days,
+        "lactate_threshold_days": lt_days,
+        "race_prediction_days": race_prediction_days,
         "errors": errors,
         "last_sync": sync_start.isoformat(),
         "since": after.isoformat(),
@@ -2064,10 +2799,94 @@ def _fetch_wellness_day(garmin_client, date_str: str) -> dict:
                 raw_minutes = peak.get("recoveryTime")
                 if raw_minutes is not None:
                     out["recovery_time_hours"] = round(raw_minutes / 60)
+                first = min(same_day, key=lambda e: e.get("timestamp") or "")
+                out["training_readiness_score"] = first.get("score")
+                out["training_readiness_level"] = first.get("level")
     except Exception:
         pass
 
+    out.update(_fetch_training_status_day(garmin_client, date_str))
     return out
+
+
+_TRAINING_STATUS_KEYS = (
+    "training_status_code", "training_status", "acwr_percent", "acwr_status",
+    "load_acwr", "load_acute", "load_chronic", "load_chronic_min",
+    "load_chronic_max", "load_4w_aerobic_low", "load_4w_aerobic_high",
+    "load_4w_anaerobic", "load_balance",
+)
+
+
+def _fetch_training_status_day(garmin_client, date_str: str) -> dict:
+    """Garmin training status / acute-chronic load / 4-week load balance as
+    of one date. The endpoint is date-addressable (a past date returns that
+    day's figures), so this backfills history. Always sets
+    training_status_fetched_at so the backfill terminates."""
+    out: dict = {"training_status_fetched_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        ts = garmin_client.get_training_status(date_str) or {}
+    except Exception:
+        return out
+    latest = (ts.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}
+    dev = next(iter(latest.values()), {}) if isinstance(latest, dict) else {}
+    if dev and dev.get("calendarDate") == date_str:
+        out["training_status_code"] = dev.get("trainingStatus")
+        out["training_status"] = dev.get("trainingStatusFeedbackPhrase")
+        acute = dev.get("acuteTrainingLoadDTO") or {}
+        out["acwr_percent"] = acute.get("acwrPercent")
+        out["acwr_status"] = acute.get("acwrStatus")
+        out["load_acwr"] = acute.get("dailyAcuteChronicWorkloadRatio")
+        out["load_acute"] = acute.get("dailyTrainingLoadAcute")
+        out["load_chronic"] = acute.get("dailyTrainingLoadChronic")
+        out["load_chronic_min"] = acute.get("minTrainingLoadChronic")
+        out["load_chronic_max"] = acute.get("maxTrainingLoadChronic")
+    bal_map = (ts.get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap") or {}
+    bal = next(iter(bal_map.values()), {}) if isinstance(bal_map, dict) else {}
+    if bal and bal.get("calendarDate") == date_str:
+        out["load_4w_aerobic_low"] = bal.get("monthlyLoadAerobicLow")
+        out["load_4w_aerobic_high"] = bal.get("monthlyLoadAerobicHigh")
+        out["load_4w_anaerobic"] = bal.get("monthlyLoadAnaerobic")
+        out["load_balance"] = bal.get("trainingBalanceFeedbackPhrase")
+    return out
+
+
+def backfill_training_status(garmin_client, max_days: int = 200) -> dict:
+    """Fill the training-status / load / readiness columns on wellness_daily
+    rows cached before they existed (two API calls per day, newest first)."""
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        days = [r[0] for r in conn.execute(
+            "SELECT date FROM wellness_daily WHERE training_status_fetched_at IS NULL "
+            "ORDER BY date DESC LIMIT ?", (max_days,))]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wellness_daily WHERE training_status_fetched_at IS NULL"
+        ).fetchone()[0] - len(days)
+    updated = 0
+    with_status = 0
+    errors: list[str] = []
+    for ds in days:
+        try:
+            fields = _fetch_training_status_day(garmin_client, ds)
+            tr = garmin_client.get_training_readiness(ds)
+            same_day = [e for e in (tr or []) if isinstance(e, dict)
+                        and str(e.get("timestamp", "")).startswith(ds)]
+            if same_day:
+                first = min(same_day, key=lambda e: e.get("timestamp") or "")
+                fields["training_readiness_score"] = first.get("score")
+                fields["training_readiness_level"] = first.get("level")
+            time.sleep(0.1)
+        except Exception as e:
+            errors.append(f"{ds}: {type(e).__name__}: {e}")
+            continue
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(f"UPDATE wellness_daily SET {sets} WHERE date = ?",
+                         [*fields.values(), ds])
+        updated += 1
+        if fields.get("training_status") is not None:
+            with_status += 1
+    return {"days_updated": updated, "days_with_status": with_status,
+            "remaining": remaining, "errors": errors}
 
 
 def _wellness_day_cached(date_str: str) -> Optional[dict]:
@@ -2089,6 +2908,9 @@ def _save_wellness_day(row: dict) -> None:
         "body_battery_high", "body_battery_low", "body_battery_at_wake",
         "respiration_avg", "spo2_avg",
         "recovery_time_hours",
+        *_TRAINING_STATUS_KEYS,
+        "training_readiness_score", "training_readiness_level",
+        "training_status_fetched_at",
         "synced_at",
     ]
     vals = [row.get(c) for c in cols[:-1]] + [datetime.now(timezone.utc).isoformat()]
@@ -3367,6 +4189,8 @@ def activity_breakdown(activity_id: int) -> dict:
         "lap_count": len(lap_summary),
         "has_stream_data": row["time_json"] is not None,
         "lap_fetch_error": lap_fetch_error,
+        "performance_condition": _perf_cond_block(row),
+        "weather": cached_weather(activity_id),
     }
     # Race detection: name patterns rarely help (Garmin default-names races
     # like any other run, e.g. "<City> Løping"), so also flag on effort —
@@ -3397,6 +4221,32 @@ def activity_breakdown(activity_id: int) -> dict:
 
 
 # ─── Performance condition ("ytelseskondisjon") ───────────────────────
+def _perf_cond_block(row) -> Optional[dict]:
+    """Session-level performance-condition summary from the perf_cond_*
+    columns: the first value the watch showed (day-form read, 6-20 min
+    in) and the last (where the session left it). None when Garmin never
+    emitted the metric (indoor, walk, or stream not yet cached)."""
+    first = row["perf_cond_first"]
+    if first is None:
+        return None
+    last = row["perf_cond_last"]
+    return {
+        "first": first,
+        "last": last,
+        "change": round(last - first, 1) if last is not None else None,
+        "min": row["perf_cond_min"],
+        "max": row["perf_cond_max"],
+        "avg": row["perf_cond_avg"],
+        "how_to_read": (
+            "first = today's pace/HR vs Garmin's RECENT baseline once the "
+            "estimate settles (a day-form read, 0 = as expected); last = "
+            "where the session left it; change = what the session cost. "
+            "Intervals sag more than easy runs by design — compare like "
+            "with like. Descriptive only, never a gate."
+        ),
+    }
+
+
 def performance_condition(activity_id: int) -> dict:
     """Performance-condition time course for one cached activity.
 
@@ -3590,6 +4440,214 @@ _FORM_NOISE_FLOOR = {
     "avg_vertical_osc_cm": 0.3,
     "avg_vertical_ratio_pct": 0.3,
 }
+
+
+# ─── Weather vs performance (descriptive) ─────────────────────────────
+_TEMP_BINS = [(-99, 0, "<0"), (0, 5, "0-5"), (5, 10, "5-10"), (10, 15, "10-15"),
+              (15, 20, "15-20"), (20, 99, ">=20")]
+_WEATHER_OUTCOMES = ("perf_cond_first", "perf_cond_last", "perf_cond_change",
+                     "workout_feel", "workout_rpe")
+_WEATHER_INPUTS = ("temp_c", "dew_point_c", "relative_humidity", "wind_speed_kmh")
+
+
+def _ranks(xs: list[float]) -> list[float]:
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    ranks = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        r = (i + j) / 2 + 1
+        for k in range(i, j + 1):
+            ranks[order[k]] = r
+        i = j + 1
+    return ranks
+
+
+def _spearman(xs: list[float], ys: list[float]) -> Optional[float]:
+    if len(xs) < 5 or len(set(xs)) < 2 or len(set(ys)) < 2:
+        return None
+    rx, ry = _ranks(xs), _ranks(ys)
+    mx, my = sum(rx) / len(rx), sum(ry) / len(ry)
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx) ** 0.5
+    vy = sum((b - my) ** 2 for b in ry) ** 0.5
+    return round(cov / (vx * vy), 2) if vx and vy else None
+
+
+def _mean(vals: list) -> Optional[float]:
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 1) if vals else None
+
+
+def _outcome_means(rows: list[dict]) -> dict:
+    out = {"n": len(rows)}
+    for key in _WEATHER_OUTCOMES:
+        out[key] = _mean([r[key] for r in rows])
+    out["avg_hr"] = _mean([r["avg_hr"] for r in rows])
+    return out
+
+
+def weather_performance(
+    weeks_back: int = 52,
+    classification: Optional[str] = None,
+    sport_type: str = "Run",
+    include_sessions: bool = False,
+) -> dict:
+    """Descriptive read of how conditions at the start of a session line up
+    with performance condition (first / last / change), post-run feel and
+    RPE. Groups by fixed temperature bins and wet vs dry, and reports
+    Spearman rank correlations. It does not fit thresholds or rules.
+    """
+    _init_db()
+    since = (datetime.now(timezone.utc) - timedelta(weeks=weeks_back)).date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        raw = conn.execute(
+            """
+            SELECT a.id, a.start_date_local, a.name, a.sport_type, a.planned_type,
+                   a.avg_hr, a.distance_m, a.moving_time_s,
+                   a.workout_rpe, a.workout_feel,
+                   a.perf_cond_first, a.perf_cond_last,
+                   w.temp_c, w.dew_point_c, w.relative_humidity,
+                   w.wind_speed_kmh, w.conditions, w.precip_mm,
+                   w.precip_prev_6h_mm, w.source
+            FROM activities a JOIN activity_weather w ON w.activity_id = a.id
+            WHERE a.sport_type = ? AND w.temp_c IS NOT NULL
+              AND a.start_date_local >= ?
+            ORDER BY a.start_date_local
+            """,
+            (sport_type, since),
+        ).fetchall()
+        unchecked = conn.execute(
+            """
+            SELECT COUNT(*) FROM activities a
+            LEFT JOIN activity_weather w ON w.activity_id = a.id
+            WHERE a.sport_type = ? AND a.start_date_local >= ?
+              AND w.activity_id IS NULL
+            """,
+            (sport_type, since),
+        ).fetchone()[0]
+
+    rows: list[dict] = []
+    for r in raw:
+        cls, _src = classify_activity(r["name"], r["sport_type"], r["planned_type"])
+        if classification and cls != classification:
+            continue
+        d = dict(r)
+        d["classification"] = cls
+        d["perf_cond_change"] = (
+            round(r["perf_cond_last"] - r["perf_cond_first"], 1)
+            if r["perf_cond_first"] is not None and r["perf_cond_last"] is not None
+            else None
+        )
+        d["wet"] = _is_wet(d)
+        d["month"] = r["start_date_local"][:7]
+        rows.append(d)
+
+    if not rows:
+        return {
+            "error": "No sessions with weather in that window.",
+            "unchecked_activities": unchecked,
+            "next_steps": ["sync_activities(backfill_coordinates=True) then "
+                           "sync_activities(backfill_weather=True) to fetch "
+                           "weather for cached history."],
+        }
+
+    by_temp = []
+    for low, high, label in _TEMP_BINS:
+        sub = [r for r in rows if low <= r["temp_c"] < high]
+        if sub:
+            by_temp.append({"temp_bin_c": label, **_outcome_means(sub)})
+
+    wet = [r for r in rows if r["wet"]]
+    dry = [r for r in rows if r["wet"] is False]
+    by_wet = {"wet": _outcome_means(wet) if wet else None,
+              "dry": _outcome_means(dry) if dry else None,
+              "wet_definition": "≥0.2 mm precipitation during the activity's "
+                                "hours or ≥1.0 mm in the six hours before "
+                                "(Open-Meteo ERA5 at the start coordinates)."}
+
+    correlations = {}
+    for inp in _WEATHER_INPUTS:
+        correlations[inp] = {}
+        for out in _WEATHER_OUTCOMES:
+            pairs = [(r[inp], r[out]) for r in rows
+                     if r[inp] is not None and r[out] is not None]
+            rho = _spearman([p[0] for p in pairs], [p[1] for p in pairs])
+            correlations[inp][out] = {"spearman": rho, "n": len(pairs)}
+
+    by_class: dict[str, list] = {}
+    for r in rows:
+        by_class.setdefault(r["classification"], []).append(r)
+    by_classification = {
+        cls: {
+            "n": len(sub),
+            "temp_vs_perf_cond_first": _spearman(
+                [r["temp_c"] for r in sub if r["perf_cond_first"] is not None],
+                [r["perf_cond_first"] for r in sub if r["perf_cond_first"] is not None]),
+            "temp_vs_perf_cond_change": _spearman(
+                [r["temp_c"] for r in sub if r["perf_cond_change"] is not None],
+                [r["perf_cond_change"] for r in sub if r["perf_cond_change"] is not None]),
+            "temp_vs_feel": _spearman(
+                [r["temp_c"] for r in sub if r["workout_feel"] is not None],
+                [r["workout_feel"] for r in sub if r["workout_feel"] is not None]),
+        }
+        for cls, sub in sorted(by_class.items()) if len(sub) >= 5
+    }
+
+    months: dict[str, list] = {}
+    for r in rows:
+        months.setdefault(r["month"], []).append(r)
+    monthly = [{"month": m, "n": len(sub), "temp_c": _mean([r["temp_c"] for r in sub]),
+                "perf_cond_first": _mean([r["perf_cond_first"] for r in sub]),
+                "workout_feel": _mean([r["workout_feel"] for r in sub])}
+               for m, sub in sorted(months.items())]
+
+    return {
+        "window": {"since": since, "weeks_back": weeks_back, "sport_type": sport_type,
+                   "classification": classification},
+        "n_sessions": len(rows),
+        "n_with_perf_cond": sum(1 for r in rows if r["perf_cond_first"] is not None),
+        "weather_source_counts": dict(collections.Counter(r["source"] for r in rows)),
+        "unchecked_activities": unchecked,
+        "by_temperature": by_temp,
+        "by_wet_dry": by_wet,
+        "correlations": correlations,
+        "by_classification": by_classification,
+        "monthly": monthly,
+        # Per-session rows only on request — 137 sessions × 16 fields is
+        # ~50k characters, which blows the tool-output budget. The same rows
+        # are one SQL join away in query_activity_cache.
+        "sessions": (
+            [
+                {"id": r["id"], "date": r["start_date_local"][:10],
+                 "cls": r["classification"], "temp_c": r["temp_c"], "wet": r["wet"],
+                 "pc_first": r["perf_cond_first"], "pc_last": r["perf_cond_last"],
+                 "feel": r["workout_feel"], "rpe": r["workout_rpe"]}
+                for r in rows
+            ]
+            if include_sessions
+            else f"{len(rows)} sessions omitted — pass include_sessions=True, or "
+                 "join activities ⨝ activity_weather in query_activity_cache."
+        ),
+        "caveats": [
+            "Temperature tracks the calendar, and so does fitness: a warm-month "
+            "vs cold-month contrast is partly a training-block contrast. Use "
+            "`monthly` to see how much of the spread is seasonal.",
+            "Performance condition is measured against Garmin's RECENT baseline, "
+            "so a hot spell that lasts weeks gets absorbed into the baseline and "
+            "stops showing as negative.",
+            "Session type dominates perf_cond_change (intervals sag, easy runs "
+            "hold) — read `by_classification`, or pass `classification`.",
+            "Conditions are ERA5 reanalysis (~9 km grid) at the start hour and "
+            "coordinates — good for temperature, dew point and rain yes/no, "
+            "coarse for local showers and wind. Feel is Garmin's 5-step "
+            "post-run prompt (0/25/50/75/100), RPE 10-100.",
+            "Descriptive: bins and correlations, no fitted cut-points.",
+        ],
+    }
 
 
 def _rate_form(field: str, v: Optional[float]) -> Optional[str]:

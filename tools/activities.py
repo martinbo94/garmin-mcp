@@ -16,6 +16,10 @@ def sync_activities(
     backfill_gear: bool = False,
     backfill_laps: bool = False,
     backfill_activity_metrics: bool = False,
+    backfill_weather: bool = False,
+    backfill_coordinates: bool = False,
+    backfill_training_status: bool = False,
+    backfill_strength_sets: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
     gear_refresh_days: int = 14,
@@ -67,6 +71,26 @@ def sync_activities(
             history synced before they existed. Cheap — these ride on the
             activity list payload, so it re-lists the trailing year in
             batches rather than calling per activity.
+        backfill_weather: If True, fill weather for cached cardio activities
+            that have none: Open-Meteo ERA5 at the activity's start
+            coordinates and hour (bulk-fetched per location cluster, ~20
+            requests for two years) plus Garmin's station record for
+            indoor detection and audit (one Garmin call each). New
+            activities get it automatically. Run `backfill_coordinates`
+            first so history has GPS starts, or Open-Meteo is evaluated at
+            Garmin's station coordinates instead.
+        backfill_coordinates: If True, re-fetch detail for cached cardio
+            activities missing start_lat/lon (one API call each, newest
+            first) — history synced before those columns existed.
+        backfill_training_status: If True, fill Garmin training status /
+            acute-chronic load / 4-week load balance / morning readiness
+            score on cached wellness_daily rows that predate those columns
+            (two API calls per day, newest first, `backfill_max` days per
+            call). New days get them automatically via the wellness refresh.
+        backfill_strength_sets: If True, fetch the exercise sets Garmin
+            recorded for cached strength activities that never got them (one
+            API call each, newest first) into strength_sets. New strength
+            activities get them automatically.
         backfill_gear: If True, fetch the gear (shoe) used for cached
             activities that never got it (one API call each). New activities
             get this automatically; this is only for history. It does NOT
@@ -89,7 +113,8 @@ def sync_activities(
     last_sync, per-item errors, and — for freshness checks —
     `cache_newest_activity` and `cache_newest_wellness` (the newest cached
     dates). Each requested backfill adds its own block: `backfill`,
-    `stream_backfill`, `gear_backfill`, `lap_backfill`, `metrics_backfill`.
+    `stream_backfill`, `gear_backfill`, `lap_backfill`, `metrics_backfill`,
+    `weather_backfill`, `training_status_backfill`, `strength_sets_backfill`.
     """
     result = garmin_sync.run_sync(
         _client(), force_full=force_full, weeks_back=weeks_back,
@@ -114,6 +139,24 @@ def sync_activities(
     if backfill_activity_metrics and "error" not in result:
         result["metrics_backfill"] = garmin_sync.backfill_activity_metrics(
             _client()
+        )
+    if backfill_coordinates and "error" not in result:
+        result["coordinate_backfill"] = garmin_sync.backfill_coordinates(
+            _client(), max_activities=backfill_max
+        )
+    if backfill_weather and "error" not in result:
+        result["weather_backfill"] = garmin_sync.backfill_weather(
+            _client(), max_activities=backfill_max
+        )
+    if backfill_training_status and "error" not in result:
+        result["training_status_backfill"] = garmin_sync.backfill_training_status(
+            _client(), max_days=backfill_max
+        )
+    if backfill_strength_sets and "error" not in result:
+        import strength
+
+        result["strength_sets_backfill"] = strength.backfill_sets(
+            _client(), max_activities=backfill_max
         )
     return result
 
@@ -286,6 +329,22 @@ def query_activity_cache(
           FROM streams,
                json_each(hr_json) he, json_each(elevation_json) ee
           WHERE activity_id = 123 AND he.key = ee.key.
+      activity_weather(activity_id, temp_c, apparent_temp_c, dew_point_c,
+                 relative_humidity, wind_speed_kmh, wind_gust_kmh,
+                 precip_mm, precip_prev_6h_mm, cloud_cover_pct, weather_code,
+                 conditions, source, location_source, lat, lon,
+                 garmin_temp_c, garmin_conditions, station_id, station_name,
+                 station_lat, station_lon, observed_at, fetched_at)
+          Conditions at the activity's start hour. source='open-meteo' =
+          ERA5 reanalysis at (lat, lon) — the activity's GPS start
+          (location_source='activity_gps') or Garmin's station coords as a
+          fallback; precip_mm sums the activity's hours, precip_prev_6h_mm
+          the six before. conditions = WMO code text ('Clear', 'Overcast',
+          'Light rain', ...). garmin_* / station_* = Garmin's own METAR
+          record, audit only (the nearest station can be far off). A row
+          with NULL temp_c = checked, indoor.
+          No row = not fetched yet (sync_activities(backfill_weather=True)).
+          Prefer the weather_performance tool, which carries the caveats.
       vo2max_daily(date, vo2max, vo2max_rounded, fitness_age, synced_at)
           Garmin's own VO2max estimate. SPARSE BY DESIGN — a row exists only
           for days Garmin recomputed it (i.e. days with a qualifying
@@ -299,7 +358,44 @@ def query_activity_cache(
                  sleep_light_s, sleep_awake_s, avg_stress,
                  body_battery_high, body_battery_low,
                  body_battery_at_wake, respiration_avg, spo2_avg,
-                 recovery_time_hours, synced_at)
+                 recovery_time_hours, training_status_code, training_status,
+                 acwr_percent, acwr_status, load_acwr, load_acute,
+                 load_chronic, load_chronic_min, load_chronic_max,
+                 load_4w_aerobic_low, load_4w_aerobic_high,
+                 load_4w_anaerobic, load_balance, training_readiness_score,
+                 training_readiness_level, training_status_fetched_at,
+                 synced_at)
+          training_status is Garmin's phrase as of that day (PRODUCTIVE_2,
+          MAINTAINING, STRAINED_4, RECOVERY, ...); load_acute = Garmin's
+          7-day load, load_chronic = 28-day, load_acwr their ratio,
+          acwr_percent/acwr_status = where that sits in Garmin's optimal
+          tunnel. load_4w_* = the monthly aerobic-low / aerobic-high /
+          anaerobic buckets behind load_balance (e.g. ANAEROBIC_SHORTAGE).
+          training_readiness_score/level = the morning reading.
+          training_status_fetched_at NULL = row predates these columns —
+          sync_activities(backfill_training_status=True).
+      lactate_threshold_daily(date, lt_hr, lt_speed_m_s, lt_pace_s_per_km,
+                 ftp_w, synced_at)
+          Garmin's running lactate-threshold estimate, SPARSE (a row only
+          on days the model rewrote a value). Model output — the LT2 in
+          the profile is the anchor; prefer the lactate_threshold_trend
+          tool, which sets the two side by side.
+      race_predictions_daily(date, time_5k_s, time_10k_s, time_half_s,
+                 time_marathon_s, synced_at)
+          Garmin's daily race-time predictions in seconds (dense).
+      strength_sets(activity_id, set_index, set_type, category,
+                 exercise_name, reps, weight_kg, duration_s, start_time,
+                 workout_step_index)
+          Sets Garmin recorded for strength activities; set_type 'active'
+          or 'rest'. category/exercise_name come from the workout step
+          when the session was run from a structured workout, else
+          Garmin's detection ('UNKNOWN' is common). Prefer the
+          get_strength_activity_sets tool.
+      strength_templates(name, workout_id, updated_at)
+          Reusable strength workouts by name (plan.json strength_template).
+      exercise_catalog(category, exercise_name, display_name,
+                 primary_muscles)
+          Garmin's strength exercise catalog, cached monthly.
       sync_state(key, value)
 
     Useful idioms: substr(start_date_local, 12, 5) gives 'HH:MM' start
@@ -338,6 +434,20 @@ def activity_breakdown(activity_id: int) -> dict:
     Returns:
     - Metadata: id, date, name, description, distance_m, moving_time_s,
       avg_hr, max_hr, sport_type
+    - `performance_condition`: {first, last, change, min, max, avg} —
+      Garmin's ytelseskondisjon. `first` is the value the watch showed once
+      it settled (6-20 min in): a day-form read against Garmin's RECENT
+      baseline, 0 = as expected. `last` is where the session left it and
+      `change` what it cost. Report both when summarizing a session;
+      compare like session types (intervals sag by design). None when
+      Garmin never emitted it (indoor, walk, stream not cached).
+    - `weather`: conditions at the start hour and coordinates — temp_c,
+      apparent_temp_c, dew_point_c, relative_humidity, wind_speed_kmh,
+      precip_mm (during the activity), precip_prev_6h_mm, conditions text,
+      `wet` flag, `source` ('open-meteo' = ERA5 reanalysis at the route,
+      'garmin-station' = fallback). garmin_temp_c/station_name are Garmin's
+      own record, kept for audit only — the nearest station can be far off.
+      None if not fetched yet; temp_c None means indoor/no GPS.
     - `laps`: list of {lap_index, type, distance_m, moving_time_s,
       pace_s_per_km, avg_hr, max_hr, form}. `form` (present when Garmin
       reported dynamics) carries cadence_spm, stride_cm, gct_ms,

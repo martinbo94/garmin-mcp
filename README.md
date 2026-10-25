@@ -248,7 +248,8 @@ git.
 | Tool | What it does |
 |---|---|
 | `running_form_trends` | Cadence, ground contact, ground-contact balance, vertical oscillation, vertical ratio, stride length, power and respiration trends over the whole cache — split `by_classification`, because form metrics are pace-dependent and a pooled average describes the session mix, not the runner |
-| `performance_condition` | Garmin's "ytelseskondisjon" for one session: the number that pops up 6-20 min in, its full time course, per-quarter shape, and per-lap means (where an interval session's rep-to-rep decay shows) |
+| `performance_condition` | Garmin's "ytelseskondisjon" for one session: the number that pops up 6-20 min in, its full time course, per-quarter shape, and per-lap means (where an interval session's rep-to-rep decay shows). `activity_breakdown` also carries the first/last/change summary |
+| `weather_performance` | Conditions at each run (Open-Meteo ERA5 at the GPS start, cached on sync; `sync_activities(backfill_weather=True)` for history) vs performance condition, feel and RPE — by temperature bin, wet/dry, rank correlations. Descriptive, with the season caveat built in |
 | `elevation_impact` | Grade-adjusted (flat-equivalent) pace for a hilly run |
 
 ### Wellness / readiness
@@ -259,7 +260,8 @@ git.
 | `get_wellness_history` | Multi-day wellness trends + long-baseline drift check |
 | `sleep_performance_correlation` | Pre-run-night sleep vs performance, within one session class |
 | `vo2max_trend` | Garmin's VO2max day by day, each move joined to the sessions around it and to per-session-type means |
-| `sync_vo2max` | Backfill the daily VO2max series for a date range (one API call for the whole range) |
+| `sync_vo2max` | Backfill Garmin's estimate series for a date range: VO2max, lactate threshold (HR/pace/FTP) and race predictions (one API call each for the whole range) |
+| `lactate_threshold_trend` | Garmin's lactate-threshold estimate and race predictions over time, next to the LT2 from the profile. Movement, not level; zones are never re-derived from it |
 
 ### Training load & periodization
 
@@ -297,6 +299,20 @@ git.
 | `init_user_profile` | Generate `user_profile.md` from structured inputs |
 | `get_athlete_profile` | Parse current profile into structured fields for tools |
 | `read_coach_doc` | Read a `coach://` framework doc as a tool call |
+
+### Strength workouts
+
+| Tool | What it does |
+|---|---|
+| `list_strength_exercises` | Search Garmin's ~1,500-exercise strength catalog (English) for the category + exercise keys a step needs; cached locally, refreshed monthly |
+| `create_strength_workout` | Build a structured strength workout from blocks (single / superset / circuit × rounds; reps, rep ranges, time or until-lap; per-side steps; weight; rests) — runs step by step on the watch. Saved by name as a reusable template |
+| `update_strength_workout` | Replace a strength workout's steps, name or description in place — same workout_id, so scheduled dates follow |
+| `get_strength_activity_sets` | The sets Garmin recorded for a completed strength activity, grouped per exercise (sets, reps, weight, duration) |
+
+In `plan.json`, `{"type": "strength", "strength_template": "<name>"}` makes
+`materialize_plan` schedule that template on the date instead of creating a
+new workout each week. Strength templates are never removed by
+`cleanup_workout_templates`.
 
 ### Plan management
 

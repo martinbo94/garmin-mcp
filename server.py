@@ -23,7 +23,9 @@ from tools import (  # noqa: F401  (imported for decorator registration)
     profile,
     resources,
     scheduling,
+    strength,
     training_load,
+    weather,
     wellness,
     workouts,
 )
