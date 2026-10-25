@@ -215,6 +215,7 @@ git.
 | `get_workout_template` | Full structure of one template |
 | `create_continuous_run` | Easy / long / tempo (single-step) |
 | `create_interval_workout` | Threshold / VO2 / structured intervals |
+| `update_workout` | Edit a template in place (name, description or full step structure) — keeps workout_id, so scheduled instances follow |
 | `delete_workout_template` | Remove a template |
 | `cleanup_workout_templates` | Delete templates no future schedule references (dry-run default; only touches templates this MCP created — hand-made ones are never deleted) |
 

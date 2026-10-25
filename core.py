@@ -114,7 +114,7 @@ Athlete profile and race-goal estimation:
 ━━━ WHEN THE USER USES WORKOUTS + HEALTH ONLY ━━━━━━━━━━━━━━━━━━━━━━
 
 Core tools:
-- Build sessions: `create_continuous_run`, `create_interval_workout`
+- Build sessions: `create_continuous_run`, `create_interval_workout`; edit in place with `update_workout`
 - Schedule: `schedule_workout`, `reschedule_workout`, `swap_scheduled_workouts`
 - Review a session: `activity_breakdown`
 - Daily readiness: `morning_check_in`
