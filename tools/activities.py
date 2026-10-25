@@ -16,6 +16,7 @@ def sync_activities(
     backfill_gear: bool = False,
     backfill_laps: bool = False,
     backfill_activity_metrics: bool = False,
+    backfill_training_status: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
     gear_refresh_days: int = 14,
@@ -67,6 +68,11 @@ def sync_activities(
             history synced before they existed. Cheap — these ride on the
             activity list payload, so it re-lists the trailing year in
             batches rather than calling per activity.
+        backfill_training_status: If True, fill Garmin training status /
+            acute-chronic load / 4-week load balance / morning readiness
+            score on cached wellness_daily rows that predate those columns
+            (two API calls per day, newest first, `backfill_max` days per
+            call). New days get them automatically via the wellness refresh.
         backfill_gear: If True, fetch the gear (shoe) used for cached
             activities that never got it (one API call each). New activities
             get this automatically; this is only for history. It does NOT
@@ -89,7 +95,8 @@ def sync_activities(
     last_sync, per-item errors, and — for freshness checks —
     `cache_newest_activity` and `cache_newest_wellness` (the newest cached
     dates). Each requested backfill adds its own block: `backfill`,
-    `stream_backfill`, `gear_backfill`, `lap_backfill`, `metrics_backfill`.
+    `stream_backfill`, `gear_backfill`, `lap_backfill`, `metrics_backfill`,
+    `training_status_backfill`.
     """
     result = garmin_sync.run_sync(
         _client(), force_full=force_full, weeks_back=weeks_back,
@@ -114,6 +121,10 @@ def sync_activities(
     if backfill_activity_metrics and "error" not in result:
         result["metrics_backfill"] = garmin_sync.backfill_activity_metrics(
             _client()
+        )
+    if backfill_training_status and "error" not in result:
+        result["training_status_backfill"] = garmin_sync.backfill_training_status(
+            _client(), max_days=backfill_max
         )
     return result
 
@@ -299,7 +310,31 @@ def query_activity_cache(
                  sleep_light_s, sleep_awake_s, avg_stress,
                  body_battery_high, body_battery_low,
                  body_battery_at_wake, respiration_avg, spo2_avg,
-                 recovery_time_hours, synced_at)
+                 recovery_time_hours, training_status_code, training_status,
+                 acwr_percent, acwr_status, load_acwr, load_acute,
+                 load_chronic, load_chronic_min, load_chronic_max,
+                 load_4w_aerobic_low, load_4w_aerobic_high,
+                 load_4w_anaerobic, load_balance, training_readiness_score,
+                 training_readiness_level, training_status_fetched_at,
+                 synced_at)
+          training_status is Garmin's phrase as of that day (PRODUCTIVE_2,
+          MAINTAINING, STRAINED_4, RECOVERY, ...); load_acute = Garmin's
+          7-day load, load_chronic = 28-day, load_acwr their ratio,
+          acwr_percent/acwr_status = where that sits in Garmin's optimal
+          tunnel. load_4w_* = the monthly aerobic-low / aerobic-high /
+          anaerobic buckets behind load_balance (e.g. ANAEROBIC_SHORTAGE).
+          training_readiness_score/level = the morning reading.
+          training_status_fetched_at NULL = row predates these columns —
+          sync_activities(backfill_training_status=True).
+      lactate_threshold_daily(date, lt_hr, lt_speed_m_s, lt_pace_s_per_km,
+                 ftp_w, synced_at)
+          Garmin's running lactate-threshold estimate, SPARSE (a row only
+          on days the model rewrote a value). Model output — the LT2 in
+          the profile is the anchor; prefer the lactate_threshold_trend
+          tool, which sets the two side by side.
+      race_predictions_daily(date, time_5k_s, time_10k_s, time_half_s,
+                 time_marathon_s, synced_at)
+          Garmin's daily race-time predictions in seconds (dense).
       sync_state(key, value)
 
     Useful idioms: substr(start_date_local, 12, 5) gives 'HH:MM' start
@@ -338,6 +373,13 @@ def activity_breakdown(activity_id: int) -> dict:
     Returns:
     - Metadata: id, date, name, description, distance_m, moving_time_s,
       avg_hr, max_hr, sport_type
+    - `performance_condition`: {first, last, change, min, max, avg} —
+      Garmin's ytelseskondisjon. `first` is the value the watch showed once
+      it settled (6-20 min in): a day-form read against Garmin's RECENT
+      baseline, 0 = as expected. `last` is where the session left it and
+      `change` what it cost. Report both when summarizing a session;
+      compare like session types (intervals sag by design). None when
+      Garmin never emitted it (indoor, walk, stream not cached).
     - `laps`: list of {lap_index, type, distance_m, moving_time_s,
       pace_s_per_km, avg_hr, max_hr, form}. `form` (present when Garmin
       reported dynamics) carries cadence_spm, stride_cm, gct_ms,

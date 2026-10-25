@@ -248,7 +248,7 @@ git.
 | Tool | What it does |
 |---|---|
 | `running_form_trends` | Cadence, ground contact, ground-contact balance, vertical oscillation, vertical ratio, stride length, power and respiration trends over the whole cache — split `by_classification`, because form metrics are pace-dependent and a pooled average describes the session mix, not the runner |
-| `performance_condition` | Garmin's "ytelseskondisjon" for one session: the number that pops up 6-20 min in, its full time course, per-quarter shape, and per-lap means (where an interval session's rep-to-rep decay shows) |
+| `performance_condition` | Garmin's "ytelseskondisjon" for one session: the number that pops up 6-20 min in, its full time course, per-quarter shape, and per-lap means (where an interval session's rep-to-rep decay shows). `activity_breakdown` also carries the first/last/change summary |
 | `elevation_impact` | Grade-adjusted (flat-equivalent) pace for a hilly run |
 
 ### Wellness / readiness
@@ -259,7 +259,8 @@ git.
 | `get_wellness_history` | Multi-day wellness trends + long-baseline drift check |
 | `sleep_performance_correlation` | Pre-run-night sleep vs performance, within one session class |
 | `vo2max_trend` | Garmin's VO2max day by day, each move joined to the sessions around it and to per-session-type means |
-| `sync_vo2max` | Backfill the daily VO2max series for a date range (one API call for the whole range) |
+| `sync_vo2max` | Backfill Garmin's estimate series for a date range: VO2max, lactate threshold (HR/pace/FTP) and race predictions (one API call each for the whole range) |
+| `lactate_threshold_trend` | Garmin's lactate-threshold estimate and race predictions over time, next to the LT2 from the profile. Movement, not level; zones are never re-derived from it |
 
 ### Training load & periodization
 
