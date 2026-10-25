@@ -115,6 +115,11 @@ def validate_plan(plan_data: dict) -> dict:
                 warnings.append(
                     f"{prefix} ({d}): {t} workout has continuous/interval block — ignored on materialize"
                 )
+            tmpl = w.get("strength_template")
+            if tmpl is not None and (t != "strength" or not isinstance(tmpl, str) or not tmpl.strip()):
+                errors.append(
+                    f"{prefix} ({d}): strength_template must be a template name on a strength workout"
+                )
         elif t and t in VALID_PLAN_TYPES:
             if not (has_cont or has_int):
                 errors.append(

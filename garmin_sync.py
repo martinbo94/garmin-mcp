@@ -249,6 +249,45 @@ CREATE TABLE IF NOT EXISTS race_predictions_daily (
     synced_at TEXT NOT NULL
 );
 
+-- Garmin's strength exercise catalog (public web-data JSON + English
+-- display names), refreshed monthly by strength.load_catalog().
+CREATE TABLE IF NOT EXISTS exercise_catalog (
+    category TEXT NOT NULL,
+    exercise_name TEXT NOT NULL,
+    display_name TEXT,
+    primary_muscles TEXT,
+    PRIMARY KEY (category, exercise_name)
+);
+
+-- Reusable strength workouts by name, so materialize_plan schedules the
+-- same template every week instead of creating a new one. Kept apart from
+-- created_workouts on purpose: cleanup_workout_templates only deletes ids
+-- in that registry, and these must survive between weeks.
+CREATE TABLE IF NOT EXISTS strength_templates (
+    name TEXT PRIMARY KEY,
+    workout_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Sets Garmin recorded for a strength activity (active sets and rests).
+-- category/exercise_name are Garmin's best guess for the set (it detects
+-- the exercise, or takes it from the workout step being followed);
+-- 'UNKNOWN' when the session was not run from a structured workout.
+CREATE TABLE IF NOT EXISTS strength_sets (
+    activity_id INTEGER NOT NULL,
+    set_index INTEGER NOT NULL,
+    set_type TEXT,
+    category TEXT,
+    exercise_name TEXT,
+    reps INTEGER,
+    weight_kg REAL,
+    duration_s REAL,
+    start_time TEXT,
+    workout_step_index INTEGER,
+    PRIMARY KEY (activity_id, set_index),
+    FOREIGN KEY (activity_id) REFERENCES activities(id)
+);
+
 CREATE TABLE IF NOT EXISTS wellness_daily (
     date TEXT PRIMARY KEY,
     resting_hr INTEGER,
@@ -355,6 +394,9 @@ _ACTIVITY_MIGRATION_COLUMNS = {
     # Set whenever the detail fetch ran with the start_lat/lon fields present,
     # so backfill_coordinates skips indoor rows instead of re-asking forever.
     "coords_checked_at": "TEXT",
+    # Set once a strength activity's exercise sets were fetched (also when
+    # Garmin had none), so backfill_strength_sets terminates.
+    "strength_sets_fetched_at": "TEXT",
 }
 
 _STREAMS_MIGRATION_COLUMNS = {
@@ -2012,6 +2054,7 @@ def run_sync(
     details_count = 0
     gear_count = 0
     weather_count = 0
+    strength_sets_count = 0
     errors: list[str] = []
 
     for act in activities:
@@ -2101,6 +2144,15 @@ def run_sync(
             except Exception as e:
                 errors.append(f"weather {act_id}: {e}")
 
+        if sport_type == "WeightTraining":
+            import strength  # noqa: PLC0415  (strength imports this module)
+
+            try:
+                strength.fetch_and_store_sets(garmin_client, act_id)
+                strength_sets_count += 1
+            except Exception as e:
+                errors.append(f"strength sets {act_id}: {e}")
+
     # Refresh recent wellness so HRV/RHR/sleep stay current alongside
     # activities — activity sync alone leaves these stale, which makes the
     # recovery/readiness tools report phantom "no data". Failures here never
@@ -2187,6 +2239,7 @@ def run_sync(
         "details_fetched": details_count,
         "activity_gear_fetched": gear_count,
         "weather_fetched": weather_count,
+        "strength_sets_fetched": strength_sets_count,
         "gear_synced": gear_synced,
         "gear_refresh": gear_refresh,
         "wellness_fetched": wellness_fetched,

@@ -300,6 +300,20 @@ git.
 | `get_athlete_profile` | Parse current profile into structured fields for tools |
 | `read_coach_doc` | Read a `coach://` framework doc as a tool call |
 
+### Strength workouts
+
+| Tool | What it does |
+|---|---|
+| `list_strength_exercises` | Search Garmin's ~1,500-exercise strength catalog (English) for the category + exercise keys a step needs; cached locally, refreshed monthly |
+| `create_strength_workout` | Build a structured strength workout from blocks (single / superset / circuit × rounds; reps, rep ranges, time or until-lap; per-side steps; weight; rests) — runs step by step on the watch. Saved by name as a reusable template |
+| `update_strength_workout` | Replace a strength workout's steps, name or description in place — same workout_id, so scheduled dates follow |
+| `get_strength_activity_sets` | The sets Garmin recorded for a completed strength activity, grouped per exercise (sets, reps, weight, duration) |
+
+In `plan.json`, `{"type": "strength", "strength_template": "<name>"}` makes
+`materialize_plan` schedule that template on the date instead of creating a
+new workout each week. Strength templates are never removed by
+`cleanup_workout_templates`.
+
 ### Plan management
 
 | Tool | What it does |

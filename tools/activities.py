@@ -19,6 +19,7 @@ def sync_activities(
     backfill_weather: bool = False,
     backfill_coordinates: bool = False,
     backfill_training_status: bool = False,
+    backfill_strength_sets: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
     gear_refresh_days: int = 14,
@@ -86,6 +87,10 @@ def sync_activities(
             score on cached wellness_daily rows that predate those columns
             (two API calls per day, newest first, `backfill_max` days per
             call). New days get them automatically via the wellness refresh.
+        backfill_strength_sets: If True, fetch the exercise sets Garmin
+            recorded for cached strength activities that never got them (one
+            API call each, newest first) into strength_sets. New strength
+            activities get them automatically.
         backfill_gear: If True, fetch the gear (shoe) used for cached
             activities that never got it (one API call each). New activities
             get this automatically; this is only for history. It does NOT
@@ -109,7 +114,7 @@ def sync_activities(
     `cache_newest_activity` and `cache_newest_wellness` (the newest cached
     dates). Each requested backfill adds its own block: `backfill`,
     `stream_backfill`, `gear_backfill`, `lap_backfill`, `metrics_backfill`,
-    `weather_backfill`, `training_status_backfill`.
+    `weather_backfill`, `training_status_backfill`, `strength_sets_backfill`.
     """
     result = garmin_sync.run_sync(
         _client(), force_full=force_full, weeks_back=weeks_back,
@@ -146,6 +151,12 @@ def sync_activities(
     if backfill_training_status and "error" not in result:
         result["training_status_backfill"] = garmin_sync.backfill_training_status(
             _client(), max_days=backfill_max
+        )
+    if backfill_strength_sets and "error" not in result:
+        import strength
+
+        result["strength_sets_backfill"] = strength.backfill_sets(
+            _client(), max_activities=backfill_max
         )
     return result
 
@@ -372,6 +383,19 @@ def query_activity_cache(
       race_predictions_daily(date, time_5k_s, time_10k_s, time_half_s,
                  time_marathon_s, synced_at)
           Garmin's daily race-time predictions in seconds (dense).
+      strength_sets(activity_id, set_index, set_type, category,
+                 exercise_name, reps, weight_kg, duration_s, start_time,
+                 workout_step_index)
+          Sets Garmin recorded for strength activities; set_type 'active'
+          or 'rest'. category/exercise_name come from the workout step
+          when the session was run from a structured workout, else
+          Garmin's detection ('UNKNOWN' is common). Prefer the
+          get_strength_activity_sets tool.
+      strength_templates(name, workout_id, updated_at)
+          Reusable strength workouts by name (plan.json strength_template).
+      exercise_catalog(category, exercise_name, display_name,
+                 primary_muscles)
+          Garmin's strength exercise catalog, cached monthly.
       sync_state(key, value)
 
     Useful idioms: substr(start_date_local, 12, 5) gives 'HH:MM' start
