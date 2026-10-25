@@ -892,6 +892,59 @@ def backfill_gear(garmin_client, max_activities: int = 100) -> dict:
     }
 
 
+def refresh_activity_gear(garmin_client, days: int = 14, max_activities: int = 50) -> dict:
+    """Re-fetch gear for cardio activities in the trailing `days`, whether or
+    not they already have a value — one API call each.
+
+    `backfill_gear` only fills rows that were never fetched, so a shoe that
+    was corrected in Garmin Connect AFTER the activity was synced (Garmin
+    auto-assigns the default shoe; the user fixes it later) would otherwise
+    stay wrong in the cache forever. Newest first. Returns the rows whose
+    gear actually changed so the caller can see what was corrected.
+    """
+    _init_db()
+    if not days or days <= 0:
+        return {"gear_checked": 0, "gear_changed": 0, "changes": [], "errors": []}
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    placeholders = ",".join("?" * len(_CARDIO_TYPES))
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, start_date_local, name, gear_uuid, gear_name
+            FROM activities
+            WHERE date(start_date_local) >= ? AND sport_type IN ({placeholders})
+            ORDER BY start_date_local DESC LIMIT ?
+            """,
+            (cutoff, *sorted(_CARDIO_TYPES), max_activities),
+        ).fetchall()
+
+    checked = 0
+    changes: list[dict] = []
+    errors: list[str] = []
+    for act_id, start, name, old_uuid, old_name in rows:
+        try:
+            uuid, gear_name = _fetch_activity_gear(garmin_client, act_id)
+        except Exception as e:
+            errors.append(f"gear {act_id}: {type(e).__name__}: {e}")
+            continue
+        checked += 1
+        _store_activity_gear(act_id, uuid, gear_name)
+        if uuid != old_uuid:
+            changes.append({
+                "activity_id": act_id,
+                "date": start[:10],
+                "name": name,
+                "old_gear": old_name,
+                "new_gear": gear_name,
+            })
+    return {
+        "gear_checked": checked,
+        "gear_changed": len(changes),
+        "changes": changes,
+        "errors": errors,
+    }
+
+
 def backfill_workout_links(garmin_client, max_activities: int = 100) -> dict:
     """Fetch detail fields for cached activities that never got them.
 
@@ -958,17 +1011,25 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         ids = [r[0] for r in conn.execute(
             """
-            SELECT s.activity_id
-            FROM streams s JOIN activities a ON a.id = s.activity_id
-            WHERE s.extras_fetched_at IS NULL OR s.perf_fetched_at IS NULL
+            SELECT a.id
+            FROM activities a LEFT JOIN streams s ON s.activity_id = a.id
+            WHERE (s.activity_id IS NOT NULL
+                   AND (s.extras_fetched_at IS NULL OR s.perf_fetched_at IS NULL))
+               -- Recent cardio activity that never got a stream at all
+               -- (typically synced seconds after upload, before Garmin had
+               -- processed it). Bounded to 30 days so an activity that
+               -- genuinely has no stream isn't retried forever.
+               OR (s.activity_id IS NULL AND a.avg_hr IS NOT NULL
+                   AND a.sport_type IN ({cardio})
+                   AND a.start_date_local >= date('now', '-30 days'))
             ORDER BY a.start_date_local DESC LIMIT ?
-            """,
-            (max_activities,),
+            """.format(cardio=", ".join("?" * len(_CARDIO_TYPES))),
+            (*_CARDIO_TYPES, max_activities),
         )]
-        remaining = conn.execute(
+        remaining = max(0, conn.execute(
             "SELECT COUNT(*) FROM streams "
             "WHERE extras_fetched_at IS NULL OR perf_fetched_at IS NULL"
-        ).fetchone()[0] - len(ids)
+        ).fetchone()[0] - len(ids))
 
     updated = 0
     errors: list[str] = []
@@ -979,7 +1040,8 @@ def backfill_streams(garmin_client, max_activities: int = 100) -> dict:
             errors.append(f"stream {act_id}: {type(e).__name__}: {e}")
             continue
         if not stream:
-            # No stream available — mark processed so it isn't retried forever.
+            # No stream available — mark processed so it isn't retried forever
+            # (no-op for activities without a streams row; those age out).
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
                     "UPDATE streams SET extras_fetched_at=?, perf_fetched_at=? "
@@ -1250,6 +1312,7 @@ def run_sync(
     since: Optional[datetime] = None,
     until: Optional[datetime] = None,
     wellness_days: int = 10,
+    gear_refresh_days: int = 14,
 ) -> dict:
     """Pull new activities + streams + laps + recent wellness into the cache.
 
@@ -1265,6 +1328,10 @@ def run_sync(
             readiness tools don't see stale "no data". Default 10; set 0 to
             skip. Deeper historical wellness backfill is via
             get_wellness_history(start, end), not here.
+        gear_refresh_days: Re-check the shoe on cardio activities from the
+            trailing N days (one call each) so gear corrected in Connect
+            after the activity was first synced lands in the cache.
+            Default 14; set 0 to skip.
     """
     _init_db()
 
@@ -1411,6 +1478,16 @@ def run_sync(
     except Exception as e:
         errors.append(f"gear sync: {type(e).__name__}: {e}")
 
+    # Re-check the shoe on recent activities. Garmin auto-assigns the default
+    # shoe and the user often corrects it in Connect after the sync has run,
+    # so a fetch-once cache would keep the wrong shoe.
+    gear_refresh: dict = {}
+    try:
+        gear_refresh = refresh_activity_gear(garmin_client, days=gear_refresh_days)
+        errors.extend(gear_refresh.pop("errors", []))
+    except Exception as e:
+        errors.append(f"gear refresh: {type(e).__name__}: {e}")
+
     _set_last_sync(sync_start)
 
     # Report the newest cached dates so callers can tell "0 new" (already
@@ -1431,6 +1508,7 @@ def run_sync(
         "details_fetched": details_count,
         "activity_gear_fetched": gear_count,
         "gear_synced": gear_synced,
+        "gear_refresh": gear_refresh,
         "wellness_fetched": wellness_fetched,
         "wellness_cached": wellness_cached,
         "vo2max_days": vo2max_days,

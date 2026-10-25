@@ -1,13 +1,14 @@
 """Gear / equipment tools.
 
 All reads come from the local cache (the `gear` and `activities` tables),
-populated by `sync_activities` / `run_sync`. These tools never call Garmin
-directly — run a sync to refresh gear status and mileage.
+populated by `sync_activities` / `run_sync`. The only live call is
+`get_gear_for_activity(refresh=True)`, which re-reads one activity's gear
+from Garmin and writes it back — run a sync to refresh status and mileage.
 """
 import sqlite3
 
 import garmin_sync
-from core import mcp
+from core import _client, mcp
 
 
 def _gear_rows(active_only: bool = True) -> list[dict]:
@@ -134,13 +135,23 @@ def shoe_wear_check(
 
 
 @mcp.tool()
-def get_gear_for_activity(activity_id: int) -> dict:
+def get_gear_for_activity(activity_id: int, refresh: bool = False) -> dict:
     """Return the gear (e.g. shoe) used for a specific activity.
 
     Reads the local cache — the gear captured for the activity during sync,
-    joined to the gear library for status/mileage. Does not call Garmin.
-    Useful for reasoning about shoe wear or rotation patterns ("which shoes
-    were on yesterday's run?", "which shoe has the most threshold work?").
+    joined to the gear library for status/mileage. Useful for reasoning
+    about shoe wear or rotation patterns ("which shoes were on yesterday's
+    run?", "which shoe has the most threshold work?").
+
+    Args:
+        activity_id: Garmin activity id.
+        refresh: If True, ask Garmin for the activity's current gear first and
+            write it back to the cache. Use when the user says the shoe was
+            corrected in Garmin Connect after the activity was synced (Garmin
+            auto-assigns the default shoe). The result then carries
+            `previous_gear_name` when the value changed. Every sync also
+            re-checks the trailing 14 days (see sync_activities
+            gear_refresh_days), so this is for one-off checks.
 
     Returns a dict with the activity's gear_uuid / gear_name and, when the
     gear is in the local library, its make_model, type, status,
@@ -149,6 +160,18 @@ def get_gear_for_activity(activity_id: int) -> dict:
     True)); gear_uuid is None when the activity simply has no gear assigned.
     """
     garmin_sync._init_db()
+    refreshed = None
+    if refresh:
+        with sqlite3.connect(garmin_sync.DB_PATH) as conn:
+            prev = conn.execute(
+                "SELECT gear_uuid, gear_name FROM activities WHERE id = ?",
+                (activity_id,),
+            ).fetchone()
+        if prev is None:
+            return {"error": f"Activity {activity_id} not in cache — run sync_activities."}
+        uuid, name = garmin_sync._fetch_activity_gear(_client(), activity_id)
+        garmin_sync._store_activity_gear(activity_id, uuid, name)
+        refreshed = {"changed": uuid != prev[0], "previous_gear_name": prev[1]}
     with sqlite3.connect(garmin_sync.DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -165,6 +188,11 @@ def get_gear_for_activity(activity_id: int) -> dict:
             "gear_name": row["gear_name"],
             "gear_fetched": row["gear_fetched_at"] is not None,
         }
+        if refreshed is not None:
+            result["refreshed_from_garmin"] = True
+            result["changed"] = refreshed["changed"]
+            if refreshed["changed"]:
+                result["previous_gear_name"] = refreshed["previous_gear_name"]
         if row["gear_uuid"]:
             g = conn.execute(
                 "SELECT make_model, type, status, total_distance_km, "
