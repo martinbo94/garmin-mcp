@@ -249,6 +249,7 @@ git.
 |---|---|
 | `running_form_trends` | Cadence, ground contact, ground-contact balance, vertical oscillation, vertical ratio, stride length, power and respiration trends over the whole cache — split `by_classification`, because form metrics are pace-dependent and a pooled average describes the session mix, not the runner |
 | `performance_condition` | Garmin's "ytelseskondisjon" for one session: the number that pops up 6-20 min in, its full time course, per-quarter shape, and per-lap means (where an interval session's rep-to-rep decay shows). `activity_breakdown` also carries the first/last/change summary |
+| `weather_performance` | Conditions at each run (Open-Meteo ERA5 at the GPS start, cached on sync; `sync_activities(backfill_weather=True)` for history) vs performance condition, feel and RPE — by temperature bin, wet/dry, rank correlations. Descriptive, with the season caveat built in |
 | `elevation_impact` | Grade-adjusted (flat-equivalent) pace for a hilly run |
 
 ### Wellness / readiness

@@ -126,6 +126,8 @@ Core tools:
 - Trends: `get_wellness_history`, `weekly_summary`, `vo2max_trend`,
   `running_form_trends`
 - Single-session Garmin metrics: `performance_condition`
+- Conditions vs how sessions went: `weather_performance` (descriptive;
+  temperature and fitness both follow the calendar — read `monthly`)
 
 Skip the Bakken-specific analysis (session_category,
 sub-threshold band) — just use HR zones and lap data directly.
