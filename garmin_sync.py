@@ -2898,6 +2898,27 @@ def _wellness_day_cached(date_str: str) -> Optional[dict]:
         return dict(row) if row else None
 
 
+def _wellness_day_final(row: dict) -> bool:
+    """Whether a cached wellness row can be trusted as complete.
+
+    A row cached before its day was over misses the daily totals, and one
+    cached early in the morning often misses the night too (Garmin only
+    publishes sleep and HRV once the night is processed — rows synced at
+    00:07 and 04:31 came back without either). Such rows are refetched:
+    - synced on the date itself (or earlier): the day was not over;
+    - no sleep AND no HRV, synced less than two days after the date: the
+      night may still have been uploading. Once a sync two or more days
+      later still finds nothing, the watch was off and the row is final.
+    """
+    synced = (row.get("synced_at") or "")[:10]
+    day = row["date"]
+    if not synced or synced <= day:
+        return False
+    if row.get("sleep_seconds") is None and row.get("hrv_overnight_avg") is None:
+        return synced >= (date.fromisoformat(day) + timedelta(days=2)).isoformat()
+    return True
+
+
 def _save_wellness_day(row: dict) -> None:
     cols = [
         "date", "resting_hr", "hrv_overnight_avg", "hrv_weekly_avg",
@@ -2929,7 +2950,11 @@ def sync_wellness_range(
     end_date: str,
     force_refetch: bool = False,
 ) -> dict:
-    """Pull wellness for each date in range. Returns counts of cached/fetched/errors."""
+    """Pull wellness for each date in range. Returns counts of cached/fetched/errors.
+
+    Cached days are skipped unless they were cached before they were
+    complete (see _wellness_day_final), so a sync just after midnight
+    does not freeze a day without its sleep and HRV."""
     _init_db()
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date)
@@ -2942,7 +2967,8 @@ def sync_wellness_range(
     d = start
     while d <= end:
         ds = d.isoformat()
-        if not force_refetch and _wellness_day_cached(ds):
+        row_cached = None if force_refetch else _wellness_day_cached(ds)
+        if row_cached and _wellness_day_final(row_cached):
             cached += 1
         else:
             try:
