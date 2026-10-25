@@ -195,6 +195,30 @@ CREATE TABLE IF NOT EXISTS vo2max_daily (
     synced_at TEXT NOT NULL
 );
 
+-- Garmin's running lactate-threshold estimate (HR, speed) and running FTP,
+-- one row per day the model rewrote a value. Sparse like vo2max_daily.
+-- lt_speed_m_s is the API value ×10 (Garmin serves 0.3417 for 3.417 m/s —
+-- verified against the threshold pace the watch displays). Model output:
+-- the LT2 in the user profile stays the anchor; this is trend material.
+CREATE TABLE IF NOT EXISTS lactate_threshold_daily (
+    date TEXT PRIMARY KEY,
+    lt_hr INTEGER,
+    lt_speed_m_s REAL,
+    lt_pace_s_per_km REAL,
+    ftp_w INTEGER,
+    synced_at TEXT NOT NULL
+);
+
+-- Garmin's race-time predictions, dense (one row per day, seconds).
+CREATE TABLE IF NOT EXISTS race_predictions_daily (
+    date TEXT PRIMARY KEY,
+    time_5k_s INTEGER,
+    time_10k_s INTEGER,
+    time_half_s INTEGER,
+    time_marathon_s INTEGER,
+    synced_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS wellness_daily (
     date TEXT PRIMARY KEY,
     resting_hr INTEGER,
@@ -230,6 +254,30 @@ _WELLNESS_MIGRATION_COLUMNS = {
     "respiration_avg": "INTEGER",
     "spo2_avg": "INTEGER",
     "recovery_time_hours": "INTEGER",
+    # Garmin training status as of that day (get_training_status is
+    # date-addressable, so history backfills). Load figures are Garmin's:
+    # acute = 7-day, chronic = 28-day, acwr_percent = acute/chronic position
+    # inside Garmin's optimal tunnel (not the ratio itself — that is
+    # load_acwr). load_4w_* are the monthly focus buckets behind the
+    # "anaerobic shortage"-style balance phrase.
+    "training_status_code": "INTEGER",
+    "training_status": "TEXT",
+    "acwr_percent": "INTEGER",
+    "acwr_status": "TEXT",
+    "load_acwr": "REAL",
+    "load_acute": "INTEGER",
+    "load_chronic": "INTEGER",
+    "load_chronic_min": "REAL",
+    "load_chronic_max": "REAL",
+    "load_4w_aerobic_low": "REAL",
+    "load_4w_aerobic_high": "REAL",
+    "load_4w_anaerobic": "REAL",
+    "load_balance": "TEXT",
+    # Morning training-readiness score/level (first reading of the day).
+    "training_readiness_score": "INTEGER",
+    "training_readiness_level": "TEXT",
+    # Marker so backfill_training_status terminates on days Garmin has nothing.
+    "training_status_fetched_at": "TEXT",
 }
 
 _ACTIVITY_MIGRATION_COLUMNS = {
@@ -1205,6 +1253,234 @@ def sync_vo2max_range(garmin_client, start_date: str, end_date: str) -> dict:
     return {"vo2max_days": len(rows), "errors": []}
 
 
+# ─── Lactate threshold + race predictions (Garmin estimates) ──────────
+def sync_lactate_threshold_range(garmin_client, start_date: str, end_date: str) -> dict:
+    """Pull Garmin's running lactate-threshold estimate (HR + speed) and
+    running FTP for a date range into lactate_threshold_daily. One API call;
+    the series is sparse (a row only on days the model rewrote a value). The
+    three series arrive separately and are merged per date with COALESCE so a
+    speed-only day does not null out an HR-only day.
+    """
+    _init_db()
+    try:
+        raw = garmin_client.get_lactate_threshold(
+            latest=False, start_date=start_date, end_date=end_date, aggregation="daily"
+        ) or {}
+    except Exception as e:
+        return {"lt_days": 0, "errors": [f"lactate_threshold: {type(e).__name__}: {e}"]}
+
+    per_day: dict[str, dict] = {}
+    for key, col in (("heart_rate", "lt_hr"), ("speed", "lt_speed_m_s"), ("power", "ftp_w")):
+        for e in raw.get(key) or []:
+            day = (e or {}).get("from") or (e or {}).get("updatedDate")
+            val = (e or {}).get("value")
+            if not day or val is None:
+                continue
+            if col == "lt_speed_m_s":
+                val = round(val * 10, 4)  # API unit is 10 m/s
+            per_day.setdefault(day, {})[col] = val
+
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        for day, f in per_day.items():
+            spd = f.get("lt_speed_m_s")
+            pace = round(1000 / spd, 1) if spd else None
+            conn.execute(
+                """
+                INSERT INTO lactate_threshold_daily
+                    (date, lt_hr, lt_speed_m_s, lt_pace_s_per_km, ftp_w, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    lt_hr = COALESCE(excluded.lt_hr, lt_hr),
+                    lt_speed_m_s = COALESCE(excluded.lt_speed_m_s, lt_speed_m_s),
+                    lt_pace_s_per_km = COALESCE(excluded.lt_pace_s_per_km, lt_pace_s_per_km),
+                    ftp_w = COALESCE(excluded.ftp_w, ftp_w),
+                    synced_at = excluded.synced_at
+                """,
+                (day, f.get("lt_hr"), spd, pace, f.get("ftp_w"), now),
+            )
+    return {"lt_days": len(per_day), "errors": []}
+
+
+def sync_race_predictions_range(garmin_client, start_date: str, end_date: str) -> dict:
+    """Pull Garmin's daily 5k/10k/half/marathon predictions (seconds) for a
+    date range into race_predictions_daily. One API call, dense series."""
+    _init_db()
+    try:
+        raw = garmin_client.get_race_predictions(
+            startdate=start_date, enddate=end_date, _type="daily"
+        ) or []
+    except Exception as e:
+        return {"race_prediction_days": 0,
+                "errors": [f"race_predictions: {type(e).__name__}: {e}"]}
+    if isinstance(raw, dict):
+        raw = [raw]
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (e["calendarDate"], e.get("time5K"), e.get("time10K"),
+         e.get("timeHalfMarathon"), e.get("timeMarathon"), now)
+        for e in raw if isinstance(e, dict) and e.get("calendarDate")
+    ]
+    if rows:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO race_predictions_daily "
+                "(date, time_5k_s, time_10k_s, time_half_s, time_marathon_s, synced_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)", rows)
+    return {"race_prediction_days": len(rows), "errors": []}
+
+
+def _fmt_time(secs: Optional[float]) -> Optional[str]:
+    if secs is None:
+        return None
+    secs = int(round(secs))
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _fmt_pace(sec_per_km: Optional[float]) -> Optional[str]:
+    if sec_per_km is None:
+        return None
+    return f"{int(sec_per_km // 60)}:{int(round(sec_per_km % 60)):02d}"
+
+
+def lactate_threshold_trend(weeks_back: int = 52) -> dict:
+    """Garmin's lactate-threshold estimate (HR, pace), running FTP and race
+    predictions over time, next to the LT2 from the user profile.
+    Descriptive: the series and their changes, no re-derivation of zones.
+    """
+    _init_db()
+    since = (datetime.now(timezone.utc) - timedelta(weeks=weeks_back)).date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        lt_rows = conn.execute(
+            "SELECT * FROM lactate_threshold_daily WHERE date >= ? ORDER BY date", (since,)
+        ).fetchall()
+        rp_rows = conn.execute(
+            "SELECT * FROM race_predictions_daily WHERE date >= ? ORDER BY date", (since,)
+        ).fetchall()
+        extent = conn.execute(
+            "SELECT MIN(date) o, MAX(date) n FROM lactate_threshold_daily").fetchone()
+
+    if not lt_rows and not rp_rows:
+        return {
+            "error": "No Garmin threshold / race-prediction data cached for that window.",
+            "next_steps": ["sync_activities() keeps the trailing 30 days current; "
+                           "sync_vo2max(start_date, end_date) backfills all three "
+                           "estimate series for a range."],
+        }
+
+    try:
+        anchors = _parse_intensity_anchors(_parse_zones())
+        profile_lt2 = anchors.get("lt2_hr")
+        profile_source = anchors.get("source")
+    except Exception:
+        profile_lt2, profile_source = None, None
+
+    series = []
+    prev_hr = prev_pace = None
+    for r in lt_rows:
+        series.append({
+            "date": r["date"],
+            "lt_hr": r["lt_hr"],
+            "lt_hr_delta": (r["lt_hr"] - prev_hr) if r["lt_hr"] is not None and prev_hr is not None else None,
+            "lt_pace": _fmt_pace(r["lt_pace_s_per_km"]),
+            "lt_pace_s_per_km": r["lt_pace_s_per_km"],
+            "lt_pace_delta_s": round(r["lt_pace_s_per_km"] - prev_pace, 1)
+                if r["lt_pace_s_per_km"] is not None and prev_pace is not None else None,
+            "ftp_w": r["ftp_w"],
+        })
+        if r["lt_hr"] is not None:
+            prev_hr = r["lt_hr"]
+        if r["lt_pace_s_per_km"] is not None:
+            prev_pace = r["lt_pace_s_per_km"]
+
+    hr_pts = [(r["date"], r["lt_hr"]) for r in lt_rows if r["lt_hr"] is not None]
+    pace_pts = [(r["date"], r["lt_pace_s_per_km"]) for r in lt_rows if r["lt_pace_s_per_km"] is not None]
+    ftp_pts = [(r["date"], r["ftp_w"]) for r in lt_rows if r["ftp_w"] is not None]
+
+    def _summ(pts, fmt=lambda v: v):
+        if not pts:
+            return None
+        vals = [v for _, v in pts]
+        return {"first": {"date": pts[0][0], "value": fmt(pts[0][1])},
+                "latest": {"date": pts[-1][0], "value": fmt(pts[-1][1])},
+                "min": fmt(min(vals)), "max": fmt(max(vals)),
+                "n_updates": len(pts)}
+
+    lt_summary = {
+        "lt_hr": _summ(hr_pts),
+        "lt_pace": _summ(pace_pts, _fmt_pace),
+        "ftp_w": _summ(ftp_pts),
+        "profile_lt2_hr": profile_lt2,
+        "profile_lt2_source": profile_source,
+        "garmin_minus_profile_bpm": (hr_pts[-1][1] - profile_lt2) if hr_pts and profile_lt2 else None,
+    }
+
+    def _at_or_before(rows, target):
+        best = None
+        for r in rows:
+            if r["date"] <= target:
+                best = r
+        return best
+
+    rp = None
+    if rp_rows:
+        latest = rp_rows[-1]
+        today = date.fromisoformat(latest["date"])
+        deltas = {}
+        for label, days in (("4w", 28), ("12w", 84), ("52w", 364)):
+            ref = _at_or_before(rp_rows, (today - timedelta(days=days)).isoformat())
+            if ref:
+                deltas[label] = {
+                    "from_date": ref["date"],
+                    "d5k_s": latest["time_5k_s"] - ref["time_5k_s"] if latest["time_5k_s"] and ref["time_5k_s"] else None,
+                    "d10k_s": latest["time_10k_s"] - ref["time_10k_s"] if latest["time_10k_s"] and ref["time_10k_s"] else None,
+                    "dhalf_s": latest["time_half_s"] - ref["time_half_s"] if latest["time_half_s"] and ref["time_half_s"] else None,
+                }
+        # Sampled every 28 days (plus the latest) to keep the payload small;
+        # the daily rows are in race_predictions_daily for SQL.
+        step = 28
+        sampled = [{"date": r["date"], "5k": _fmt_time(r["time_5k_s"]),
+                    "10k": _fmt_time(r["time_10k_s"]), "half": _fmt_time(r["time_half_s"]),
+                    "marathon": _fmt_time(r["time_marathon_s"])}
+                   for i, r in enumerate(rp_rows)
+                   if (i % step == (len(rp_rows) - 1) % step)
+                   and r["time_10k_s"] is not None]
+        rp = {
+            "latest": {"date": latest["date"], "5k": _fmt_time(latest["time_5k_s"]),
+                       "10k": _fmt_time(latest["time_10k_s"]),
+                       "half": _fmt_time(latest["time_half_s"]),
+                       "marathon": _fmt_time(latest["time_marathon_s"])},
+            "change": deltas,
+            "every_4_weeks": sampled,
+        }
+
+    return {
+        "window": {"since": since, "weeks_back": weeks_back,
+                   "lt_cache_oldest": extent["o"], "lt_cache_newest": extent["n"]},
+        "lactate_threshold": {"summary": lt_summary, "updates": series},
+        "race_predictions": rp,
+        "caveats": [
+            "Garmin's LT is a model estimate from the pace/HR relationship in "
+            "hard running; the LT2 in the profile (a lab test when the athlete "
+            "has one, else an estimate from their zones — see "
+            "profile_lt2_source) stays the anchor for zones and the "
+            "sub-threshold band. Read the "
+            "MOVEMENT here (up 4 bpm over 3 weeks), not the level.",
+            "Updates land only after qualifying hard efforts (races, long "
+            "threshold reps), so a flat series usually means 'no qualifying "
+            "session', not 'no change'.",
+            "Cool, rainy days flatter the model exactly like they flatter "
+            "performance condition (same pace/HR input) — check weather on the "
+            "update day before reading a jump as fitness.",
+            "Race predictions are Garmin's VO2max-driven extrapolation; chip "
+            "times outrank them. Use them as a trend, and remember they shift "
+            "day to day with the VO2max estimate.",
+        ],
+    }
+
+
 # ─── Location + weather (Open-Meteo) ──────────────────────────────────
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -1469,6 +1745,23 @@ def run_sync(
         except Exception as e:
             errors.append(f"vo2max: {type(e).__name__}: {e}")
 
+    # Same trailing window for Garmin's lactate-threshold estimate and race
+    # predictions — one call each, so nearly free. Failures never break sync.
+    lt_days = 0
+    race_prediction_days = 0
+    if wellness_days and wellness_days > 0:
+        try:
+            today = datetime.now(timezone.utc).date()
+            e_start = (today - timedelta(days=max(wellness_days, 30) - 1)).isoformat()
+            lt = sync_lactate_threshold_range(garmin_client, e_start, today.isoformat())
+            lt_days = lt.get("lt_days", 0)
+            errors.extend(lt.get("errors", []))
+            rp = sync_race_predictions_range(garmin_client, e_start, today.isoformat())
+            race_prediction_days = rp.get("race_prediction_days", 0)
+            errors.extend(rp.get("errors", []))
+        except Exception as e:
+            errors.append(f"garmin estimates: {type(e).__name__}: {e}")
+
     # Refresh the gear library (status + mileage) so the gear tools read
     # locally. Cheap (one list + one stats call per gear item) and failures
     # never break activity sync.
@@ -1512,6 +1805,8 @@ def run_sync(
         "wellness_fetched": wellness_fetched,
         "wellness_cached": wellness_cached,
         "vo2max_days": vo2max_days,
+        "lactate_threshold_days": lt_days,
+        "race_prediction_days": race_prediction_days,
         "errors": errors,
         "last_sync": sync_start.isoformat(),
         "since": after.isoformat(),
@@ -2064,10 +2359,94 @@ def _fetch_wellness_day(garmin_client, date_str: str) -> dict:
                 raw_minutes = peak.get("recoveryTime")
                 if raw_minutes is not None:
                     out["recovery_time_hours"] = round(raw_minutes / 60)
+                first = min(same_day, key=lambda e: e.get("timestamp") or "")
+                out["training_readiness_score"] = first.get("score")
+                out["training_readiness_level"] = first.get("level")
     except Exception:
         pass
 
+    out.update(_fetch_training_status_day(garmin_client, date_str))
     return out
+
+
+_TRAINING_STATUS_KEYS = (
+    "training_status_code", "training_status", "acwr_percent", "acwr_status",
+    "load_acwr", "load_acute", "load_chronic", "load_chronic_min",
+    "load_chronic_max", "load_4w_aerobic_low", "load_4w_aerobic_high",
+    "load_4w_anaerobic", "load_balance",
+)
+
+
+def _fetch_training_status_day(garmin_client, date_str: str) -> dict:
+    """Garmin training status / acute-chronic load / 4-week load balance as
+    of one date. The endpoint is date-addressable (a past date returns that
+    day's figures), so this backfills history. Always sets
+    training_status_fetched_at so the backfill terminates."""
+    out: dict = {"training_status_fetched_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        ts = garmin_client.get_training_status(date_str) or {}
+    except Exception:
+        return out
+    latest = (ts.get("mostRecentTrainingStatus") or {}).get("latestTrainingStatusData") or {}
+    dev = next(iter(latest.values()), {}) if isinstance(latest, dict) else {}
+    if dev and dev.get("calendarDate") == date_str:
+        out["training_status_code"] = dev.get("trainingStatus")
+        out["training_status"] = dev.get("trainingStatusFeedbackPhrase")
+        acute = dev.get("acuteTrainingLoadDTO") or {}
+        out["acwr_percent"] = acute.get("acwrPercent")
+        out["acwr_status"] = acute.get("acwrStatus")
+        out["load_acwr"] = acute.get("dailyAcuteChronicWorkloadRatio")
+        out["load_acute"] = acute.get("dailyTrainingLoadAcute")
+        out["load_chronic"] = acute.get("dailyTrainingLoadChronic")
+        out["load_chronic_min"] = acute.get("minTrainingLoadChronic")
+        out["load_chronic_max"] = acute.get("maxTrainingLoadChronic")
+    bal_map = (ts.get("mostRecentTrainingLoadBalance") or {}).get("metricsTrainingLoadBalanceDTOMap") or {}
+    bal = next(iter(bal_map.values()), {}) if isinstance(bal_map, dict) else {}
+    if bal and bal.get("calendarDate") == date_str:
+        out["load_4w_aerobic_low"] = bal.get("monthlyLoadAerobicLow")
+        out["load_4w_aerobic_high"] = bal.get("monthlyLoadAerobicHigh")
+        out["load_4w_anaerobic"] = bal.get("monthlyLoadAnaerobic")
+        out["load_balance"] = bal.get("trainingBalanceFeedbackPhrase")
+    return out
+
+
+def backfill_training_status(garmin_client, max_days: int = 200) -> dict:
+    """Fill the training-status / load / readiness columns on wellness_daily
+    rows cached before they existed (two API calls per day, newest first)."""
+    _init_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        days = [r[0] for r in conn.execute(
+            "SELECT date FROM wellness_daily WHERE training_status_fetched_at IS NULL "
+            "ORDER BY date DESC LIMIT ?", (max_days,))]
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM wellness_daily WHERE training_status_fetched_at IS NULL"
+        ).fetchone()[0] - len(days)
+    updated = 0
+    with_status = 0
+    errors: list[str] = []
+    for ds in days:
+        try:
+            fields = _fetch_training_status_day(garmin_client, ds)
+            tr = garmin_client.get_training_readiness(ds)
+            same_day = [e for e in (tr or []) if isinstance(e, dict)
+                        and str(e.get("timestamp", "")).startswith(ds)]
+            if same_day:
+                first = min(same_day, key=lambda e: e.get("timestamp") or "")
+                fields["training_readiness_score"] = first.get("score")
+                fields["training_readiness_level"] = first.get("level")
+            time.sleep(0.1)
+        except Exception as e:
+            errors.append(f"{ds}: {type(e).__name__}: {e}")
+            continue
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(f"UPDATE wellness_daily SET {sets} WHERE date = ?",
+                         [*fields.values(), ds])
+        updated += 1
+        if fields.get("training_status") is not None:
+            with_status += 1
+    return {"days_updated": updated, "days_with_status": with_status,
+            "remaining": remaining, "errors": errors}
 
 
 def _wellness_day_cached(date_str: str) -> Optional[dict]:
@@ -2089,6 +2468,9 @@ def _save_wellness_day(row: dict) -> None:
         "body_battery_high", "body_battery_low", "body_battery_at_wake",
         "respiration_avg", "spo2_avg",
         "recovery_time_hours",
+        *_TRAINING_STATUS_KEYS,
+        "training_readiness_score", "training_readiness_level",
+        "training_status_fetched_at",
         "synced_at",
     ]
     vals = [row.get(c) for c in cols[:-1]] + [datetime.now(timezone.utc).isoformat()]
@@ -3367,6 +3749,7 @@ def activity_breakdown(activity_id: int) -> dict:
         "lap_count": len(lap_summary),
         "has_stream_data": row["time_json"] is not None,
         "lap_fetch_error": lap_fetch_error,
+        "performance_condition": _perf_cond_block(row),
     }
     # Race detection: name patterns rarely help (Garmin default-names races
     # like any other run, e.g. "<City> Løping"), so also flag on effort —
@@ -3397,6 +3780,32 @@ def activity_breakdown(activity_id: int) -> dict:
 
 
 # ─── Performance condition ("ytelseskondisjon") ───────────────────────
+def _perf_cond_block(row) -> Optional[dict]:
+    """Session-level performance-condition summary from the perf_cond_*
+    columns: the first value the watch showed (day-form read, 6-20 min
+    in) and the last (where the session left it). None when Garmin never
+    emitted the metric (indoor, walk, or stream not yet cached)."""
+    first = row["perf_cond_first"]
+    if first is None:
+        return None
+    last = row["perf_cond_last"]
+    return {
+        "first": first,
+        "last": last,
+        "change": round(last - first, 1) if last is not None else None,
+        "min": row["perf_cond_min"],
+        "max": row["perf_cond_max"],
+        "avg": row["perf_cond_avg"],
+        "how_to_read": (
+            "first = today's pace/HR vs Garmin's RECENT baseline once the "
+            "estimate settles (a day-form read, 0 = as expected); last = "
+            "where the session left it; change = what the session cost. "
+            "Intervals sag more than easy runs by design — compare like "
+            "with like. Descriptive only, never a gate."
+        ),
+    }
+
+
 def performance_condition(activity_id: int) -> dict:
     """Performance-condition time course for one cached activity.
 

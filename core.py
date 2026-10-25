@@ -71,7 +71,8 @@ If the profile exists and is filled in, proceed normally.
 4. WEEKLY VOLUME / ZONE TIME: `weekly_summary`.
 
 5. GARMIN'S DERIVED METRICS — `vo2max_trend`, `performance_condition`,
-   `running_form_trends`. All three are DESCRIPTIVE ONLY. Report them,
+   `running_form_trends`, `lactate_threshold_trend`. All are DESCRIPTIVE
+   ONLY. Report them,
    trend them, use them to raise a question — but they never gate a
    session and they never override the athlete's own read of the day or
    a race result. Specifically:
@@ -82,6 +83,10 @@ If the profile exists and is filled in, proceed normally.
    - Performance condition is measured against Garmin's model of RECENT
      performance, so 0 means "as expected", not "average". Read the
      within-session shape (holds vs. sags), not the absolute level.
+   - Garmin's lactate threshold / race predictions are model estimates
+     that update after hard efforts. The LT2 in the profile stays
+     the anchor — never re-derive zones or the sub-threshold band from
+     the watch's value; report its movement as one more form signal.
    - Running-dynamics numbers are pace-dependent. Compare like session
      type with like session type (`by_classification`), never a pooled
      average across easy runs and intervals.
