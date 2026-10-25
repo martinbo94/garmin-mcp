@@ -128,6 +128,10 @@ Core tools:
 - Single-session Garmin metrics: `performance_condition`
 - Conditions vs how sessions went: `weather_performance` (descriptive;
   temperature and fitness both follow the calendar — read `monthly`)
+- Strength: `list_strength_exercises` (English search) →
+  `create_strength_workout` / `update_strength_workout`; plan.json can
+  reuse a template by name (`strength_template`), and
+  `get_strength_activity_sets` shows what was done
 
 Skip the Bakken-specific analysis (session_category,
 sub-threshold band) — just use HR zones and lap data directly.
@@ -223,4 +227,66 @@ class IntervalSet(BaseModel):
     repeats: int = Field(ge=1)
     work: Step
     recovery: Step
+
+
+class StrengthExercise(BaseModel):
+    """One exercise inside a strength block. Give exactly one of reps,
+    duration_s or until_lap."""
+
+    category: str = Field(description="Garmin exercise category, e.g. 'LUNGE' (see list_strength_exercises).")
+    exercise_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Garmin exercise key within the category, e.g. 'DUMBBELL_BULGARIAN_SPLIT_SQUAT'. "
+            "Omit for an exercise the catalog lacks: the step then shows the category, "
+            "and `note` should name the real exercise."
+        ),
+    )
+    reps: Optional[int | str] = Field(
+        default=None,
+        description="Reps per set, or a range like '6-10' (the watch counts to the top; the range goes in the step note).",
+    )
+    duration_s: Optional[float] = Field(default=None, description="Timed exercise, seconds per set (per side if per_side).")
+    until_lap: bool = Field(default=False, description="Open-ended set: ends when you press lap.")
+    per_side: bool = Field(
+        default=False,
+        description="Two steps per round, one per side (labels from side_labels), each with the full reps/duration.",
+    )
+    weight_kg: Optional[float] = Field(default=None, description="Planned load in kg (shown on the watch).")
+    note: Optional[str] = Field(default=None, description="Shown on the watch step, e.g. 'Dumbbells' or 'Pallof press, band'.")
+
+    @model_validator(mode="after")
+    def _one_length(self):
+        given = [self.reps is not None, self.duration_s is not None, self.until_lap]
+        if sum(given) != 1:
+            raise ValueError("Give exactly one of reps, duration_s or until_lap.")
+        return self
+
+
+class StrengthBlock(BaseModel):
+    """A group of exercises done for N rounds: one exercise for N sets
+    ('single'), two back to back ('superset') or several ('circuit')."""
+
+    type: Literal["single", "superset", "circuit"] = "single"
+    kind: Literal["main", "warmup", "cooldown"] = Field(
+        default="main", description="Step type on the watch; warmup/cooldown blocks are labelled as such.")
+    rounds: int = Field(default=1, ge=1, description="Rounds (sets of the whole block).")
+    exercises: list[StrengthExercise] = Field(min_length=1)
+    rest_between_exercises_s: float = Field(
+        default=0, ge=0, description="Rest between exercises inside a round (0 = straight on).")
+    rest_after_round_s: Optional[float | Literal["lap"]] = Field(
+        default=None,
+        description="Rest after each round: seconds, 'lap' (open rest until you press lap) or omit for none.",
+    )
+
+    @model_validator(mode="after")
+    def _shape(self):
+        n = len(self.exercises)
+        if self.type == "single" and n != 1:
+            raise ValueError("A 'single' block has exactly one exercise.")
+        if self.type == "superset" and n != 2:
+            raise ValueError("A 'superset' block has exactly two exercises (use 'circuit' for more).")
+        if self.type == "circuit" and n < 2:
+            raise ValueError("A 'circuit' block has two or more exercises.")
+        return self
 
