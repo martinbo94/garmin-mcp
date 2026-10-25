@@ -56,39 +56,47 @@ doesn't re-hit the API on every query.
 
 ### Requirements
 
-- Python 3.10+ ([download](https://www.python.org/downloads/))
 - Garmin Connect account (MFA supported)
 - Claude Desktop ([download](https://claude.ai/download)) **or** Claude Code CLI
 
-### Quick setup (Mac)
+Nothing else: the setup script installs git, Python and the dependencies.
 
-Open **Terminal** (search "Terminal" in Spotlight) and run these three commands,
-replacing the path in the last one with wherever you cloned the repo:
+### Quick setup
+
+**Mac** — open **Terminal** (search "Terminal" in Spotlight) and paste:
 
 ```bash
-# 1. Install Git if you don't have it (opens Xcode tools installer)
-git --version
-
-# 2. Clone the repo
-git clone https://github.com/martinbo94/garmin-mcp.git
-cd garmin-mcp
-
-# 3. Run the setup script
-bash setup.sh
+curl -fsSL https://raw.githubusercontent.com/martinbo94/garmin-mcp/main/setup.sh | bash
 ```
 
-The script installs dependencies, creates `.env`, authenticates with Garmin
-(including MFA if enabled), and registers the server with Claude Desktop.
+**Windows** — open **PowerShell** (search "PowerShell" in the Start menu) and paste:
 
-**First run:** the script will stop after creating `.env` and ask you to fill
-in your Garmin email and password. Do that, then run `bash setup.sh` again —
-it will authenticate and complete setup.
+```powershell
+irm https://raw.githubusercontent.com/martinbo94/garmin-mcp/main/setup.ps1 | iex
+```
+
+The script:
+
+1. Installs git if it is missing (Mac: Apple's Command Line Tools, a dialog
+   asks you to click Install; Windows: via winget) and downloads the repo to
+   `garmin-mcp` in your home folder.
+2. Installs [uv](https://docs.astral.sh/uv/), which downloads Python 3.12 into
+   the project's `.venv` along with the dependencies. No admin rights, and it
+   leaves any other Python on the machine alone.
+3. Asks for your Garmin email and password (the password is hidden while you
+   type) and saves them to `.env` in the repo folder, readable only by you.
+4. Logs in to Garmin (asking for an MFA code if enabled) and caches the tokens.
+5. Registers the server with Claude Desktop, and with Claude Code if it is installed.
+
+Every step skips what is already done, so the same command also updates an
+existing install. From inside a clone you can run `bash setup.sh` (Mac) or
+`powershell -ExecutionPolicy Bypass -File setup.ps1` (Windows) instead.
 
 After setup finishes:
-1. Restart Claude Desktop
+1. Quit Claude Desktop completely and open it again
 2. Start a new chat and say **"Let's set up my profile"**
 
-### Manual setup (Claude Code or Windows)
+### Manual setup
 
 ```bash
 python3 -m venv .venv
@@ -154,13 +162,13 @@ gitignored — they hold personal data and never leave your machine.
 
 ### Garmin auth
 
-`setup.sh` handles authentication interactively and caches tokens to
+The setup script handles authentication interactively and caches tokens to
 `~/.garminconnect`. After the first run, the MCP logs in automatically
 from the token cache — no password or MFA code needed again until the
 refresh token expires (typically several months).
 
 **MFA is supported.** If your Garmin account has two-factor
-authentication enabled, `setup.sh` will prompt you to enter the code
+authentication enabled, the setup script will prompt you to enter the code
 once. Subsequent logins use the cached token automatically.
 
 Garmin rate-limits login attempts aggressively. You may see `429`
@@ -175,6 +183,8 @@ garmin_sync.py                  # Garmin cache (SQLite), sync, weekly_summary, w
 plan.py                         # plan.json I/O + compliance comparison
 gpx_analysis.py                 # GPX course parsing + grade-adjusted race pacing
 requirements.txt
+setup.sh / setup.ps1            # one-command install (Mac / Windows)
+setup_helper.py                 # setup's second half: .env, Garmin login, Claude registration
 .env.example                    # credential template
 .env                            # your secrets (gitignored)
 coach_data/

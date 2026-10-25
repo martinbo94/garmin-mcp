@@ -17,7 +17,7 @@ from garminconnect import Garmin
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, model_validator
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env", interpolate=False)
 
 import garmin_sync  # noqa: E402  (must load after dotenv so token refresh works)
 import plan as plan_mod  # noqa: E402

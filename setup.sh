@@ -1,143 +1,88 @@
 #!/bin/bash
-# One-time setup for garmin-mcp.
-# Run once from the repo root: bash setup.sh
+# Setup for garmin-mcp on Mac (and Linux). Installs what is missing, then
+# logs in to Garmin and registers the server with Claude.
+#
+# From a fresh Mac, in Terminal:
+#   curl -fsSL https://raw.githubusercontent.com/martinbo94/garmin-mcp/main/setup.sh | bash
+# Or from inside a clone:
+#   bash setup.sh
+# Safe to re-run: every step skips what is already done.
 
 set -e
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
-
-# Python binary path (same on Mac and Linux; Windows uses Scripts/python.exe)
-if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OS" == "Windows_NT" ]]; then
-    PYTHON="$REPO/.venv/Scripts/python.exe"
-else
-    PYTHON="$REPO/.venv/bin/python"
-fi
-
-# Claude Desktop config location varies by OS
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    CONFIG_DIR="$HOME/Library/Application Support/Claude"
-elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OS" == "Windows_NT" ]]; then
-    CONFIG_DIR="$APPDATA/Claude"
-else
-    # Linux
-    CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/Claude"
-fi
-CONFIG_FILE="$CONFIG_DIR/claude_desktop_config.json"
+REPO_URL="https://github.com/martinbo94/garmin-mcp.git"
+PYTHON_VERSION="3.12"
 
 echo ""
 echo "=== garmin-mcp setup ==="
 echo ""
 
-# 1. Create virtual environment and install dependencies
-echo "Installing Python dependencies..."
-python3 -m venv "$REPO/.venv"
-"$PYTHON" -m pip install -q -r "$REPO/requirements.txt"
+# 1. Git (Mac: the Command Line Tools). Only checked when we have to clone,
+#    and on a fresh Mac always, since /usr/bin/git is a stub until they exist.
+ensure_git() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        if ! xcode-select -p >/dev/null 2>&1; then
+            echo "Installing Apple's Command Line Tools (includes git)."
+            echo "  A dialog opens: click 'Install' and wait for it to finish."
+            xcode-select --install >/dev/null 2>&1 || true
+            until xcode-select -p >/dev/null 2>&1; do sleep 5; done
+            echo "  Done."
+            echo ""
+        fi
+    elif ! command -v git >/dev/null 2>&1; then
+        echo "git is missing. Install it with your package manager (e.g. 'sudo apt install git') and run this again."
+        exit 1
+    fi
+}
+
+# 2. Find the repo, or clone it when this script was piped in from curl
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" && pwd)"
+if [ -f "$SCRIPT_DIR/server.py" ]; then
+    REPO="$SCRIPT_DIR"
+else
+    REPO="$HOME/garmin-mcp"
+    ensure_git
+    if [ -d "$REPO/.git" ]; then
+        echo "Updating $REPO..."
+        git -C "$REPO" pull --ff-only
+    else
+        echo "Downloading garmin-mcp to $REPO..."
+        git clone "$REPO_URL" "$REPO"
+    fi
+    echo ""
+    # Re-run from the clone, with the keyboard as input (stdin is this script under curl | bash)
+    exec bash "$REPO/setup.sh" < /dev/tty
+fi
+
+# 3. uv, which downloads Python itself — no Homebrew or python.org installer needed
+UV="$(command -v uv || true)"
+if [ -z "$UV" ]; then
+    UV="$HOME/.local/bin/uv"
+    if [ ! -x "$UV" ]; then
+        echo "Installing uv (Python installer)..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
+        echo "  Done."
+        echo ""
+    fi
+fi
+
+# 4. Python + dependencies in .venv
+PYTHON="$REPO/.venv/bin/python"
+echo "Installing Python $PYTHON_VERSION and dependencies..."
+if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+    "$UV" venv --quiet --clear --python "$PYTHON_VERSION" "$REPO/.venv"
+fi
+"$UV" pip install --quiet --python "$PYTHON" -r "$REPO/requirements.txt"
 echo "  Done."
 echo ""
 
-# 2. Create .env if it doesn't exist
-if [ ! -f "$REPO/.env" ]; then
-    cp "$REPO/.env.example" "$REPO/.env"
-    echo "Created .env — fill in your Garmin email and password, then re-run:"
-    echo "  $REPO/.env"
-    echo ""
-    echo "=== Stopped: fill in .env first, then run 'bash setup.sh' again ==="
-    exit 0
-fi
-
-# 3. Authenticate with Garmin and cache tokens
-echo "Authenticating with Garmin Connect..."
-REPO="$REPO" "$PYTHON" <<'PYEOF'
-import os, sys
-from pathlib import Path
-from dotenv import load_dotenv
-
-load_dotenv(Path(os.environ["REPO"]) / ".env")
-
-email    = os.environ.get("GARMIN_EMAIL", "").strip()
-password = os.environ.get("GARMIN_PASSWORD", "").strip()
-
-if not email or not password:
-    print("  Fill in GARMIN_EMAIL and GARMIN_PASSWORD in .env first.")
-    sys.exit(1)
-
-token_store = str(Path.home() / ".garminconnect")
-
-# Re-use existing tokens if they are still valid
-if Path(token_store).exists():
-    try:
-        from garminconnect import Garmin
-        g = Garmin()
-        g.login(tokenstore=token_store)
-        print(f"  Existing tokens still valid — logged in as {email}")
-        sys.exit(0)
-    except Exception:
-        print("  Cached tokens expired, re-authenticating...")
-
-from garminconnect import Garmin
-
-def prompt_mfa():
-    # stdin is the heredoc that delivered this script, so input() would hit
-    # EOF — read the code from the controlling terminal instead.
-    print("  MFA required. Open your authenticator app.")
-    print("  MFA code: ", end="", flush=True)
-    try:
-        with open("/dev/tty") as tty:
-            code = tty.readline()
-    except OSError:
-        try:
-            code = input()
-        except EOFError:
-            code = ""
-    if not code:
-        sys.exit("  No MFA code entered (no interactive terminal available).")
-    return code.strip()
-
-g = Garmin(email, password, prompt_mfa=prompt_mfa)
-g.login(tokenstore=token_store)
-print(f"  Authenticated as {email}")
-print(f"  Tokens cached to ~/.garminconnect")
-print("  (Future logins are automatic — no password or MFA code needed)")
-PYEOF
-echo ""
-
-# 4. Register in Claude Desktop config
-mkdir -p "$CONFIG_DIR"
-
-if [ ! -f "$CONFIG_FILE" ]; then
-    cat > "$CONFIG_FILE" <<EOF
-{
-  "mcpServers": {
-    "garmin-mcp": {
-      "command": "$PYTHON",
-      "args": ["$REPO/server.py"]
-    }
-  }
-}
-EOF
-    echo "Created Claude Desktop config."
-else
-    if grep -q "garmin-mcp" "$CONFIG_FILE"; then
-        echo "garmin-mcp already in Claude Desktop config, skipping."
-    else
-        REPO="$REPO" PYTHON="$PYTHON" python3 <<PYEOF
-import json, pathlib, os
-path = pathlib.Path(os.environ["HOME"] + "/Library/Application Support/Claude/claude_desktop_config.json")
-cfg = json.loads(path.read_text())
-cfg.setdefault("mcpServers", {})["garmin-mcp"] = {
-    "command": os.environ["PYTHON"],
-    "args": [os.environ["REPO"] + "/server.py"]
-}
-path.write_text(json.dumps(cfg, indent=2))
-print("  Added garmin-mcp to existing Claude Desktop config.")
-PYEOF
-    fi
-fi
+# 5. Garmin login, .env and Claude registration
+"$PYTHON" "$REPO/setup_helper.py" < /dev/tty
 
 echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. Restart Claude Desktop"
+echo "  1. Quit Claude Desktop completely (Cmd+Q) and open it again"
 echo "  2. Start a new conversation and say: 'Let's set up my profile'"
 echo ""
