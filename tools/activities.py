@@ -18,6 +18,7 @@ def sync_activities(
     backfill_activity_metrics: bool = False,
     backfill_max: int = 100,
     wellness_days: int = 10,
+    gear_refresh_days: int = 14,
 ) -> dict:
     """Pull new activities + HR streams + laps + recent wellness into the cache.
 
@@ -68,13 +69,20 @@ def sync_activities(
             batches rather than calling per activity.
         backfill_gear: If True, fetch the gear (shoe) used for cached
             activities that never got it (one API call each). New activities
-            get this automatically; this is only for history.
+            get this automatically; this is only for history. It does NOT
+            re-check activities that already have a shoe — that is
+            `gear_refresh_days`.
         backfill_max: Max activities to backfill per call (default 100),
             shared by the backfills. The `remaining_*` field in each
             backfill result tells you whether another round is needed.
         wellness_days: Trailing days of wellness to refresh (default 10;
             0 to skip). Historical wellness backfill is via
             get_wellness_history.
+        gear_refresh_days: Re-check the shoe on cardio activities from the
+            trailing N days on every sync (default 14; 0 to skip), so a shoe
+            corrected in Garmin Connect after the activity was synced
+            overwrites the auto-assigned one in the cache. The `gear_refresh`
+            block lists every activity whose shoe changed.
 
     Returns dict with new_activities, streams_fetched, laps_fetched,
     details_fetched, wellness_fetched/wellness_cached, vo2max_days,
@@ -85,7 +93,7 @@ def sync_activities(
     """
     result = garmin_sync.run_sync(
         _client(), force_full=force_full, weeks_back=weeks_back,
-        wellness_days=wellness_days,
+        wellness_days=wellness_days, gear_refresh_days=gear_refresh_days,
     )
     if backfill_links and "error" not in result:
         result["backfill"] = garmin_sync.backfill_workout_links(
