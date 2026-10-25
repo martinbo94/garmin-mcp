@@ -1,4 +1,4 @@
-"""Workout templates: connection test, read, create, delete."""
+"""Workout templates: connection test, read, create, update, delete."""
 from datetime import date
 from typing import Optional
 
@@ -98,6 +98,44 @@ def _executable_step(step_order: int, step_type: dict, ec: EndCondition,
     return step
 
 
+def _continuous_steps(distance_meters: Optional[float], duration_seconds: Optional[float],
+                      description: Optional[str]) -> list:
+    if (distance_meters is None) == (duration_seconds is None):
+        raise ValueError("Provide exactly one of distance_meters or duration_seconds.")
+    ec = EndCondition(
+        type="distance" if distance_meters is not None else "time",
+        value=distance_meters if distance_meters is not None else duration_seconds,
+    )
+    return [_executable_step(1, _ST_INTERVAL, ec, description)]
+
+
+def _interval_steps(warmup: Step, sets: list[IntervalSet], cooldown: Step) -> list:
+    all_steps: list = [_executable_step(1, _ST_WARMUP, warmup.end_condition, warmup.description)]
+    step_order = 2
+
+    for child_id, iset in enumerate(sets, start=1):
+        repeat_group = {
+            "type": "RepeatGroupDTO",
+            "stepOrder": step_order,
+            "childStepId": child_id,
+            "stepType": _ST_REPEAT,
+            "numberOfIterations": iset.repeats,
+            "smartRepeat": False,
+            "workoutSteps": [
+                _executable_step(step_order + 1, _ST_INTERVAL, iset.work.end_condition,
+                                 iset.work.description, child_step_id=child_id),
+                _executable_step(step_order + 2, _ST_RECOVERY, iset.recovery.end_condition,
+                                 iset.recovery.description, child_step_id=child_id),
+            ],
+        }
+        all_steps.append(repeat_group)
+        step_order += 3
+
+    all_steps.append(_executable_step(step_order, _ST_COOLDOWN, cooldown.end_condition,
+                                       cooldown.description))
+    return all_steps
+
+
 def _wrap_workout(name: str, all_steps: list, description: Optional[str]) -> dict:
     workout = {
         "workoutName": name,
@@ -167,14 +205,8 @@ def create_continuous_run(
 
     Returns the new workout_id — pass it to schedule_workout to put it on a date.
     """
-    if (distance_meters is None) == (duration_seconds is None):
-        raise ValueError("Provide exactly one of distance_meters or duration_seconds.")
-    ec = EndCondition(
-        type="distance" if distance_meters is not None else "time",
-        value=distance_meters if distance_meters is not None else duration_seconds,
-    )
-    step = _executable_step(1, _ST_INTERVAL, ec, description)
-    return _upload(_wrap_workout(name, [step], description))
+    steps = _continuous_steps(distance_meters, duration_seconds, description)
+    return _upload(_wrap_workout(name, steps, description))
 
 
 @mcp.tool()
@@ -216,32 +248,129 @@ def create_interval_workout(
 
     Returns the new workout_id.
     """
-    all_steps: list = [_executable_step(1, _ST_WARMUP, warmup.end_condition, warmup.description)]
-    step_order = 2
-
-    for child_id, iset in enumerate(sets, start=1):
-        repeat_group = {
-            "type": "RepeatGroupDTO",
-            "stepOrder": step_order,
-            "childStepId": child_id,
-            "stepType": _ST_REPEAT,
-            "numberOfIterations": iset.repeats,
-            "smartRepeat": False,
-            "workoutSteps": [
-                _executable_step(step_order + 1, _ST_INTERVAL, iset.work.end_condition,
-                                 iset.work.description, child_step_id=child_id),
-                _executable_step(step_order + 2, _ST_RECOVERY, iset.recovery.end_condition,
-                                 iset.recovery.description, child_step_id=child_id),
-            ],
-        }
-        all_steps.append(repeat_group)
-        step_order += 3
-
-    all_steps.append(_executable_step(step_order, _ST_COOLDOWN, cooldown.end_condition,
-                                       cooldown.description))
-    return _upload(_wrap_workout(name, all_steps, description))
+    steps = _interval_steps(warmup, sets, cooldown)
+    return _upload(_wrap_workout(name, steps, description))
 
 
+@mcp.tool()
+def update_workout(
+    workout_id: int,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    warmup: Optional[Step] = None,
+    sets: Optional[list[IntervalSet]] = None,
+    cooldown: Optional[Step] = None,
+    distance_meters: Optional[float] = None,
+    duration_seconds: Optional[float] = None,
+    step_descriptions: Optional[dict[str, str]] = None,
+) -> dict:
+    """Edit an existing workout template IN PLACE — same workout_id, so every
+    scheduled instance and plan reference keeps pointing at it. Prefer this
+    over create + schedule/unschedule when tweaking a session that is already
+    on the calendar.
+
+    Four modes, chosen by which args you pass:
+    - Only `name` and/or `description`: steps are left exactly as they are.
+    - `step_descriptions`: {"<stepOrder>": "new text"} patches the on-watch
+      text of individual steps and leaves the structure alone. stepOrder
+      values come from get_workout_template (warmup is 1, and steps inside
+      a repeat group have their own orders). The cheapest way to fix a
+      pacing note. Pass "" to clear a description.
+    - `warmup` + `sets` + `cooldown` (all three): steps are REPLACED with a
+      new interval structure — same shapes as create_interval_workout.
+    - `distance_meters` or `duration_seconds`: steps are replaced with a
+      single continuous step — same as create_continuous_run.
+
+    Anything not passed keeps its current value. `step_descriptions` cannot
+    be combined with a structural replacement (the new steps carry their own
+    text).
+
+    Returns {workout_id, name, steps_replaced, scheduled_dates} — the dates
+    are the calendar instances that now carry the updated content. The watch
+    picks up the change on its next Connect sync.
+    """
+    g = _client()
+    existing = g.get_workout_by_id(workout_id)
+    if not isinstance(existing, dict) or not existing.get("workoutId"):
+        raise RuntimeError(f"Workout {workout_id} not found: {existing!r}")
+
+    interval_args = (warmup, sets, cooldown)
+    continuous_args = (distance_meters, duration_seconds)
+    if any(a is not None for a in interval_args) and any(a is not None for a in continuous_args):
+        raise ValueError("Pass either interval args (warmup/sets/cooldown) or a continuous "
+                         "length (distance_meters/duration_seconds), not both.")
+
+    if step_descriptions and (any(a is not None for a in interval_args)
+                              or any(a is not None for a in continuous_args)):
+        raise ValueError("step_descriptions cannot be combined with replacing the steps — "
+                         "put the text on the new steps instead.")
+
+    steps_replaced = False
+    if any(a is not None for a in interval_args):
+        if not all(a is not None for a in interval_args):
+            raise ValueError("Replacing interval steps requires warmup, sets AND cooldown.")
+        new_steps = _interval_steps(warmup, sets, cooldown)
+        steps_replaced = True
+    elif any(a is not None for a in continuous_args):
+        new_steps = _continuous_steps(
+            distance_meters, duration_seconds,
+            description if description is not None else existing.get("description"),
+        )
+        steps_replaced = True
+
+    payload = dict(existing)
+    if name is not None:
+        payload["workoutName"] = name
+    if description is not None:
+        payload["description"] = description
+    steps_patched: list[int] = []
+    if step_descriptions:
+        wanted = {int(k): v for k, v in step_descriptions.items()}
+
+        def _patch(steps: list) -> None:
+            for st in steps:
+                order = st.get("stepOrder")
+                if order in wanted:
+                    st["description"] = wanted[order] or None
+                    steps_patched.append(order)
+                if st.get("workoutSteps"):
+                    _patch(st["workoutSteps"])
+
+        for seg in payload.get("workoutSegments") or []:
+            _patch(seg.get("workoutSteps") or [])
+        missing = sorted(set(wanted) - set(steps_patched))
+        if missing:
+            raise ValueError(f"No step with stepOrder {missing} in workout {workout_id}; "
+                             "check get_workout_template.")
+    if steps_replaced:
+        payload["sportType"] = _RUNNING_SPORT
+        payload["workoutSegments"] = [{
+            "segmentOrder": 1,
+            "sportType": _RUNNING_SPORT,
+            "workoutSteps": new_steps,
+        }]
+
+    g.client.put("connectapi", f"/workout-service/workout/{workout_id}",
+                 json=payload, api=True)
+    _register_created_workout(int(workout_id), payload.get("workoutName") or "")
+
+    # Report which calendar instances now carry the new content.
+    from datetime import date as _date, timedelta as _td
+
+    from tools.scheduling import list_scheduled_workouts as _lsw
+
+    today = _date.today()
+    scheduled = [
+        w["date"] for w in _lsw(today.isoformat(), (today + _td(days=365)).isoformat())
+        if w.get("workout_id") == int(workout_id)
+    ]
+    return {
+        "workout_id": int(workout_id),
+        "name": payload.get("workoutName"),
+        "steps_replaced": steps_replaced,
+        "steps_patched": sorted(steps_patched),
+        "scheduled_dates": scheduled,
+    }
 
 
 @mcp.tool()
